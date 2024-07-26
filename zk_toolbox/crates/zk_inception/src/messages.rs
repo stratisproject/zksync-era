@@ -36,13 +36,6 @@ pub(super) const MSG_ECOSYSTEM_ALREADY_EXISTS_ERR: &str = "Ecosystem already exi
 pub(super) const MSG_ECOSYSTEM_CONFIG_INVALID_ERR: &str = "Invalid ecosystem configuration";
 pub(super) const MSG_LINK_TO_CODE_SELECTION_CLONE: &str = "Clone for me (recommended)";
 pub(super) const MSG_LINK_TO_CODE_SELECTION_PATH: &str = "I have the code already";
-pub(super) const MSG_NOT_MAIN_REPO_OR_FORK_ERR: &str =
-    "It's not a zkSync Era main repository or fork";
-pub(super) const MSG_CONFIRM_STILL_USE_FOLDER: &str = "Do you still want to use this folder?";
-
-pub(super) fn msg_path_to_zksync_does_not_exist_err(path: &str) -> String {
-    format!("Path to zkSync Era repo does not exist: {path:?}")
-}
 
 /// Ecosystem and chain init related messages
 pub(super) const MSG_L1_RPC_URL_HELP: &str = "L1 RPC URL";
@@ -291,11 +284,14 @@ pub(super) const MSG_RUNNING_CONTRACT_VERIFIER: &str = "Running contract verifie
 pub(super) const MSG_FAILED_TO_RUN_CONTRACT_VERIFIER_ERR: &str = "Failed to run contract verifier";
 pub(super) const MSG_INVALID_ARCH_ERR: &str = "Invalid arch";
 pub(super) const MSG_GET_ZKSOLC_RELEASES_ERR: &str = "Failed to get zksolc releases";
+pub(super) const MSG_GET_ZKVMSOLC_RELEASES_ERR: &str = "Failed to get zkVM solc releases";
 pub(super) const MSG_FETCHING_ZKSOLC_RELEASES_SPINNER: &str = "Fetching zksolc releases...";
+pub(super) const MSG_FETCHING_ZKVMSOLC_RELEASES_SPINNER: &str = "Fetching zkVM solc releases...";
 pub(super) const MSG_FETCHING_ZKVYPER_RELEASES_SPINNER: &str = "Fetching zkvyper releases...";
 pub(super) const MSG_FETCH_SOLC_RELEASES_SPINNER: &str = "Fetching solc releases...";
 pub(super) const MSG_FETCHING_VYPER_RELEASES_SPINNER: &str = "Fetching vyper releases...";
 pub(super) const MSG_ZKSOLC_VERSION_PROMPT: &str = "Select the minimal zksolc version:";
+pub(super) const MSG_ZKVMSOLC_VERSION_PROMPT: &str = "Select the minimal zkVM solc version:";
 pub(super) const MSG_ZKVYPER_VERSION_PROMPT: &str = "Select the minimal zkvyper version:";
 pub(super) const MSG_SOLC_VERSION_PROMPT: &str = "Select the minimal solc version:";
 pub(super) const MSG_VYPER_VERSION_PROMPT: &str = "Select the minimal vyper version:";
