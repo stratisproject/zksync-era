@@ -17,7 +17,7 @@ pub(crate) async fn run(shell: &Shell) -> anyhow::Result<()> {
     let cmd = Cmd::new(cmd!(
         shell,
         "cargo run --release --bin key_generator -- 
-            generate-sk all --recompute-if-missing 
+            generate-sk-gpu all --recompute-if-missing 
             --setup-path=vk_setup_data_generator_server_fri/data 
             --path={link_to_prover}/vk_setup_data_generator_server_fri/data"
     ));

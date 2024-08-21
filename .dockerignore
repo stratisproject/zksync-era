@@ -10,7 +10,7 @@
 !etc/env/configs
 !etc/tokens
 !etc/ERC20
-!artifacts
+artifacts
 !keys
 keys/setup
 !bin/
