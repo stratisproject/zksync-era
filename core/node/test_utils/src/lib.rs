@@ -1,32 +1,74 @@
 //! Test utils.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, ops};
 
-use zksync_contracts::BaseSystemContractsHashes;
+use zksync_contracts::{BaseSystemContracts, BaseSystemContractsHashes};
 use zksync_dal::{Connection, Core, CoreDal};
 use zksync_merkle_tree::{domain::ZkSyncTree, TreeInstruction};
-use zksync_multivm::{
-    interface::{TransactionExecutionResult, TxExecutionStatus, VmExecutionMetrics},
-    utils::get_max_gas_per_pubdata_byte,
-};
-use zksync_node_genesis::GenesisParams;
 use zksync_system_constants::{get_intrinsic_constants, ZKPORTER_IS_AVAILABLE};
 use zksync_types::{
-    block::{L1BatchHeader, L2BlockHeader},
+    block::{L1BatchHeader, L2BlockHasher, L2BlockHeader},
     commitment::{
         AuxCommitments, L1BatchCommitmentArtifacts, L1BatchCommitmentHash, L1BatchMetaParameters,
         L1BatchMetadata,
     },
     fee::Fee,
-    fee_model::BatchFeeInput,
+    fee_model::{BatchFeeInput, PubdataIndependentBatchFeeModelInput},
     l2::L2Tx,
     l2_to_l1_log::{L2ToL1Log, UserL2ToL1Log},
     protocol_version::ProtocolSemanticVersion,
     snapshots::{SnapshotRecoveryStatus, SnapshotStorageLog},
     transaction_request::PaymasterParams,
-    Address, K256PrivateKey, L1BatchNumber, L2BlockNumber, L2ChainId, Nonce, ProtocolVersion,
-    ProtocolVersionId, StorageLog, H256, U256,
+    AccountTreeId, Address, K256PrivateKey, L1BatchNumber, L2BlockNumber, L2ChainId, Nonce,
+    ProtocolVersion, ProtocolVersionId, StorageKey, StorageLog, H256, U256,
 };
+use zksync_vm_interface::{
+    L1BatchEnv, L2BlockEnv, SystemEnv, TransactionExecutionResult, TxExecutionMode,
+    TxExecutionStatus, VmExecutionMetrics,
+};
+
+/// Value for recent protocol versions.
+const MAX_GAS_PER_PUBDATA_BYTE: u64 = 50_000;
+
+/// Creates a mock system env with reasonable params.
+pub fn default_system_env() -> SystemEnv {
+    SystemEnv {
+        zk_porter_available: ZKPORTER_IS_AVAILABLE,
+        version: ProtocolVersionId::latest(),
+        base_system_smart_contracts: BaseSystemContracts::load_from_disk(),
+        bootloader_gas_limit: u32::MAX,
+        execution_mode: TxExecutionMode::VerifyExecute,
+        default_validation_computational_gas_limit: u32::MAX,
+        chain_id: L2ChainId::from(270),
+    }
+}
+
+/// Creates a mock L1 batch env with reasonable params.
+pub fn default_l1_batch_env(number: u32, timestamp: u64, fee_account: Address) -> L1BatchEnv {
+    L1BatchEnv {
+        previous_batch_hash: None,
+        number: L1BatchNumber(number),
+        timestamp,
+        fee_account,
+        enforced_base_fee: None,
+        first_l2_block: L2BlockEnv {
+            number,
+            timestamp,
+            prev_block_hash: L2BlockHasher::legacy_hash(L2BlockNumber(number - 1)),
+            max_virtual_blocks_to_create: 1,
+            interop_roots: vec![],
+        },
+        fee_input: BatchFeeInput::PubdataIndependent(PubdataIndependentBatchFeeModelInput {
+            fair_l2_gas_price: 1,
+            fair_pubdata_price: 1,
+            l1_gas_price: 1,
+        }),
+    }
+}
+
+pub fn fake_rolling_txs_hash_for_block(number: u32) -> H256 {
+    H256::from_low_u64_be(number.into())
+}
 
 /// Creates an L2 block header with the specified number and deterministic contents.
 pub fn create_l2_block(number: u32) -> L2BlockHeader {
@@ -39,12 +81,14 @@ pub fn create_l2_block(number: u32) -> L2BlockHeader {
         base_fee_per_gas: 100,
         batch_fee_input: BatchFeeInput::l1_pegged(100, 100),
         fee_account_address: Address::zero(),
-        gas_per_pubdata_limit: get_max_gas_per_pubdata_byte(ProtocolVersionId::latest().into()),
+        gas_per_pubdata_limit: MAX_GAS_PER_PUBDATA_BYTE,
         base_system_contracts_hashes: BaseSystemContractsHashes::default(),
         protocol_version: Some(ProtocolVersionId::latest()),
         virtual_blocks: 1,
         gas_limit: 0,
         logs_bloom: Default::default(),
+        pubdata_params: Default::default(),
+        rolling_txs_hash: Some(fake_rolling_txs_hash_for_block(number)),
     }
 }
 
@@ -56,6 +100,7 @@ pub fn create_l1_batch(number: u32) -> L1BatchHeader {
         BaseSystemContractsHashes {
             bootloader: H256::repeat_byte(1),
             default_aa: H256::repeat_byte(42),
+            evm_emulator: None,
         },
         ProtocolVersionId::latest(),
     );
@@ -88,6 +133,7 @@ pub fn create_l1_batch_metadata(number: u32) -> L1BatchMetadata {
             zkporter_is_available: ZKPORTER_IS_AVAILABLE,
             bootloader_code_hash: BaseSystemContractsHashes::default().bootloader,
             default_aa_code_hash: BaseSystemContractsHashes::default().default_aa,
+            evm_emulator_code_hash: BaseSystemContractsHashes::default().evm_emulator,
             protocol_version: Some(ProtocolVersionId::latest()),
         },
         aux_data_hash: H256::zero(),
@@ -96,6 +142,10 @@ pub fn create_l1_batch_metadata(number: u32) -> L1BatchMetadata {
         events_queue_commitment: Some(H256::zero()),
         bootloader_initial_content_commitment: Some(H256::zero()),
         state_diffs_compressed: vec![],
+        state_diff_hash: Some(H256::zero()),
+        local_root: Some(H256::zero()),
+        aggregation_root: Some(H256::zero()),
+        da_inclusion_data: Some(vec![]),
     }
 }
 
@@ -126,6 +176,9 @@ pub fn l1_batch_metadata_to_commitment_artifacts(
             }
             _ => None,
         },
+        local_root: metadata.local_root.unwrap(),
+        aggregation_root: metadata.aggregation_root.unwrap(),
+        state_diff_hash: metadata.state_diff_hash.unwrap(),
     }
 }
 
@@ -138,7 +191,7 @@ pub fn create_l2_transaction(fee_per_gas: u64, gas_per_pubdata: u64) -> L2Tx {
         gas_per_pubdata_limit: gas_per_pubdata.into(),
     };
     let mut tx = L2Tx::new_signed(
-        Address::random(),
+        Some(Address::random()),
         vec![],
         Nonce(0),
         fee,
@@ -163,8 +216,6 @@ pub fn execute_l2_transaction(transaction: L2Tx) -> TransactionExecutionResult {
         execution_info: VmExecutionMetrics::default(),
         execution_status: TxExecutionStatus::Success,
         refunded_gas: 0,
-        operator_suggested_refund: 0,
-        compressed_bytecodes: vec![],
         call_traces: vec![],
         revert_reason: None,
     }
@@ -185,14 +236,14 @@ impl Snapshot {
         l1_batch: L1BatchNumber,
         l2_block: L2BlockNumber,
         storage_logs: Vec<SnapshotStorageLog>,
-        genesis_params: GenesisParams,
+        contracts: &BaseSystemContracts,
+        protocol_version: ProtocolVersionId,
     ) -> Self {
-        let contracts = genesis_params.base_system_contracts();
         let l1_batch = L1BatchHeader::new(
             l1_batch,
             l1_batch.0.into(),
             contracts.hashes(),
-            genesis_params.minor_protocol_version(),
+            protocol_version,
         );
         let l2_block = L2BlockHeader {
             number: l2_block,
@@ -203,21 +254,22 @@ impl Snapshot {
             base_fee_per_gas: 100,
             batch_fee_input: BatchFeeInput::l1_pegged(100, 100),
             fee_account_address: Address::zero(),
-            gas_per_pubdata_limit: get_max_gas_per_pubdata_byte(
-                genesis_params.minor_protocol_version().into(),
-            ),
+            gas_per_pubdata_limit: MAX_GAS_PER_PUBDATA_BYTE,
             base_system_contracts_hashes: contracts.hashes(),
-            protocol_version: Some(genesis_params.minor_protocol_version()),
+            protocol_version: Some(protocol_version),
             virtual_blocks: 1,
             gas_limit: 0,
             logs_bloom: Default::default(),
+            pubdata_params: Default::default(),
+            rolling_txs_hash: Some(H256::zero()),
         };
         Snapshot {
             l1_batch,
             l2_block,
             factory_deps: [&contracts.bootloader, &contracts.default_aa]
                 .into_iter()
-                .map(|c| (c.hash, zksync_utils::be_words_to_bytes(&c.code)))
+                .chain(contracts.evm_emulator.as_ref())
+                .map(|c| (c.hash, c.code.clone()))
                 .collect(),
             storage_logs,
         }
@@ -241,7 +293,13 @@ pub async fn prepare_recovery_snapshot(
             enumeration_index: i as u64 + 1,
         })
         .collect();
-    let snapshot = Snapshot::new(l1_batch, l2_block, storage_logs, GenesisParams::mock());
+    let snapshot = Snapshot::new(
+        l1_batch,
+        l2_block,
+        storage_logs,
+        &BaseSystemContracts::load_from_disk(),
+        ProtocolVersionId::latest(),
+    );
     recover(storage, snapshot).await
 }
 
@@ -367,16 +425,87 @@ pub async fn recover(
 
     storage
         .pruning_dal()
-        .soft_prune_batches_range(snapshot.l1_batch.number, snapshot.l2_block.number)
+        .insert_soft_pruning_log(snapshot.l1_batch.number, snapshot.l2_block.number)
         .await
         .unwrap();
-
     storage
         .pruning_dal()
-        .hard_prune_batches_range(snapshot.l1_batch.number, snapshot.l2_block.number)
+        .insert_hard_pruning_log(
+            snapshot.l1_batch.number,
+            snapshot.l2_block.number,
+            snapshot_recovery.l1_batch_root_hash,
+        )
+        .await
+        .unwrap();
+    storage.commit().await.unwrap();
+    snapshot_recovery
+}
+
+/// Inserts initial writes for the specified L1 batch based on storage logs.
+pub async fn insert_initial_writes_for_batch(
+    connection: &mut Connection<'_, Core>,
+    l1_batch_number: L1BatchNumber,
+) {
+    let mut written_non_zero_slots: Vec<_> = connection
+        .storage_logs_dal()
+        .get_touched_slots_for_executed_l1_batch(l1_batch_number)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|(key, value)| (!value.is_zero()).then_some(key))
+        .collect();
+    written_non_zero_slots.sort_unstable();
+
+    let hashed_keys: Vec<_> = written_non_zero_slots
+        .iter()
+        .map(|key| key.hashed_key())
+        .collect();
+    let pre_written_slots = connection
+        .storage_logs_dedup_dal()
+        .filter_written_slots(&hashed_keys)
         .await
         .unwrap();
 
-    storage.commit().await.unwrap();
-    snapshot_recovery
+    let keys_to_insert: Vec<_> = written_non_zero_slots
+        .into_iter()
+        .filter(|key| !pre_written_slots.contains(&key.hashed_key()))
+        .map(|key| key.hashed_key())
+        .collect();
+    connection
+        .storage_logs_dedup_dal()
+        .insert_initial_writes(l1_batch_number, &keys_to_insert)
+        .await
+        .unwrap();
+}
+
+/// Generates storage logs using provided indices as seeds.
+pub fn generate_storage_logs(indices: ops::Range<u32>) -> Vec<StorageLog> {
+    // Addresses and keys of storage logs must be sorted for the `multi_block_workflow` test.
+    let mut accounts = [
+        "4b3af74f66ab1f0da3f2e4ec7a3cb99baf1af7b2",
+        "ef4bb7b21c5fe7432a7d63876cc59ecc23b46636",
+        "89b8988a018f5348f52eeac77155a793adf03ecc",
+        "782806db027c08d36b2bed376b4271d1237626b3",
+        "b2b57b76717ee02ae1327cc3cf1f40e76f692311",
+    ]
+    .map(|s| AccountTreeId::new(s.parse::<Address>().unwrap()));
+    accounts.sort_unstable();
+
+    let account_keys = (indices.start / 5)..(indices.end / 5);
+    let proof_keys = accounts.iter().flat_map(|&account| {
+        account_keys
+            .clone()
+            .map(move |i| StorageKey::new(account, H256::from_low_u64_be(i.into())))
+    });
+    let proof_values = indices.map(|i| H256::from_low_u64_be(i.into()));
+
+    let logs: Vec<_> = proof_keys
+        .zip(proof_values)
+        .map(|(proof_key, proof_value)| StorageLog::new_write_log(proof_key, proof_value))
+        .collect();
+    for window in logs.windows(2) {
+        let [prev, next] = window else { unreachable!() };
+        assert!(prev.key < next.key);
+    }
+    logs
 }

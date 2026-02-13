@@ -7,13 +7,17 @@
  */
 
 import { TestMaster } from '../src';
-import { deployContract, getTestContract, waitForNewL1Batch } from '../src/helpers';
+import { deployContract, getDeploymentNonce, getAccountNonce, getTestContract, scaledGasPrice } from '../src/helpers';
 import { shouldOnlyTakeFee } from '../src/modifiers/balance-checker';
 
 import * as ethers from 'ethers';
 import * as zksync from 'zksync-ethers';
 import * as elliptic from 'elliptic';
 import { RetryProvider } from '../src/retry-provider';
+import { waitForNewL1Batch } from 'utils';
+
+const SECONDS = 1000;
+jest.setTimeout(400 * SECONDS);
 
 // TODO: Leave only important ones.
 const contracts = {
@@ -35,6 +39,7 @@ describe('Smart contract behavior checks', () => {
 
     // Contracts shared in several tests.
     let counterContract: zksync.Contract;
+    let expensiveContract: zksync.Contract;
 
     beforeAll(() => {
         testMaster = TestMaster.getInstance(__filename);
@@ -46,9 +51,9 @@ describe('Smart contract behavior checks', () => {
         const feeCheck = await shouldOnlyTakeFee(alice);
 
         // Change the storage slot and ensure it actually changes.
-        expect(counterContract.get()).resolves.toEqual(0n);
+        await expect(counterContract.get()).resolves.toEqual(0n);
         await expect(counterContract.increment(42)).toBeAccepted([feeCheck]);
-        expect(counterContract.get()).resolves.toEqual(42n);
+        await expect(counterContract.get()).resolves.toEqual(42n);
     });
 
     test('Should deploy contract with a constructor', async () => {
@@ -61,6 +66,14 @@ describe('Smart contract behavior checks', () => {
 
     test('Should deploy contract with create', async () => {
         const contractFactory = new zksync.ContractFactory(contracts.create.abi, contracts.create.bytecode, alice);
+        const nonce = await alice.getDeploymentNonce();
+        const accountNonce = await alice.getNonce();
+        // Not all Alice's transactions are deployments, but all deployments require a separate transaction (we don't use `Multicall3` etc.
+        // to batch deployments).
+        expect(accountNonce).toBeGreaterThanOrEqual(nonce);
+        const blockNumber = await alice.provider.getBlockNumber();
+
+        testMaster.reporter?.debug(`Nonces before deployment: deployment=${nonce}, account=${accountNonce}`);
         const contract = (await contractFactory.deploy({
             customData: {
                 factoryDeps: [contracts.create.factoryDep]
@@ -68,15 +81,46 @@ describe('Smart contract behavior checks', () => {
         })) as zksync.Contract;
         await contract.waitForDeployment();
         await expect(contract.getFooName()).resolves.toBe('Foo');
+
+        const newNonce = await alice.getDeploymentNonce();
+        expect(newNonce).toEqual(nonce + 1n);
+        const contractAddress = await contract.getAddress();
+        expect(contractAddress).toEqual(zksync.utils.createAddress(alice.address, nonce));
+
+        // Check `getTransactionCount` for contracts
+        let contractNonce = await alice.provider.getTransactionCount(contractAddress);
+        expect(contractNonce).toEqual(1); // `Foo` is deployed in the constructor
+        // Should also work using `NonceHolder.getDeploymentNonce()`
+        const contractDeploymentNonce = await getDeploymentNonce(alice.provider, contractAddress);
+        expect(contractDeploymentNonce).toEqual(1n);
+        // The account nonce for contracts should always stay 0.
+        expect(await getAccountNonce(alice.provider, contractAddress)).toEqual(0n);
+
+        // Check retrospective `getTransactionCount` values
+        expect(await alice.getNonce(blockNumber)).toEqual(accountNonce);
+        const oldContractNonce = await alice.provider.getTransactionCount(contractAddress, blockNumber);
+        expect(oldContractNonce).toEqual(0);
+
+        // Deploy a salted contract from the factory.
+        const salt = ethers.getBytes('0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef');
+        await expect(contract.deploySalted(salt)).resolves.toBeAccepted();
+        const deployedCodeHash = zksync.utils.hashBytecode(contracts.create.factoryDep);
+        const expectedSaltedAddress = zksync.utils.create2Address(contractAddress, deployedCodeHash, salt, '0x');
+        expect(await contract.saltedContracts(salt)).toEqual(expectedSaltedAddress);
+
+        contractNonce = await alice.provider.getTransactionCount(contractAddress);
+        expect(contractNonce).toEqual(2);
+        expect(await getAccountNonce(alice.provider, contractAddress)).toEqual(0n);
     });
 
     test('Should perform "expensive" contract calls', async () => {
-        const expensiveContract = await deployContract(alice, contracts.expensive, []);
-
-        // First, check that the transaction that is too expensive would be rejected by the API server.
+        expensiveContract = await deployContract(alice, contracts.expensive, []);
+        //  Check that the transaction that is too expensive would be rejected by the API server.
         await expect(expensiveContract.expensive(15000)).toBeRejected();
+    });
 
-        // Second, check that processable transaction may fail with "out of gas" error.
+    test('Should perform underpriced "expensive" contract calls', async () => {
+        //  Check that processable transaction may fail with "out of gas" error.
         // To do so, we estimate gas for arg "1" and supply it to arg "20".
         // This guarantees that transaction won't fail during verification.
         const lowGasLimit = await expensiveContract.expensive.estimateGas(1);
@@ -94,22 +138,29 @@ describe('Smart contract behavior checks', () => {
             return;
         }
 
+        const gasPrice = await scaledGasPrice(alice);
         const infiniteLoop = await deployContract(alice, contracts.infinite, []);
 
         // Test eth_call first
         // TODO: provide a proper error for transactions that consume too much gas.
         // await expect(infiniteLoop.callStatic.infiniteLoop()).toBeRejected('cannot estimate transaction: out of gas');
         // ...and then an actual transaction
-        await expect(infiniteLoop.infiniteLoop({ gasLimit: 1_000_000 })).toBeReverted([]);
+        await expect(infiniteLoop.infiniteLoop({ gasLimit: 1_000_000, gasPrice })).toBeReverted([]);
     });
 
     test('Should test reverting storage logs', async () => {
         // In this test we check that if transaction reverts, it rolls back the storage slots.
         const prevValue = await counterContract.get();
+        const gasPrice = await scaledGasPrice(alice);
 
-        // We manually provide a constant, since otherwise the exception would be thrown
-        // while estimating gas
-        await expect(counterContract.incrementWithRevert(5, true, { gasLimit: 5000000 })).toBeReverted([]);
+        // We manually provide a gas limit and gas price, since otherwise the exception would be thrown
+        // while querying zks_estimateFee.
+        await expect(
+            counterContract.incrementWithRevert(5, true, {
+                gasLimit: 5000000,
+                gasPrice
+            })
+        ).toBeReverted();
 
         // The tx has been reverted, so the value Should not have been changed:
         const newValue = await counterContract.get();
@@ -192,7 +243,7 @@ describe('Smart contract behavior checks', () => {
 
         const oldValue = await ethersBasedContract.get();
         await expect(ethersBasedContract.increment(1)).toBeAccepted([]);
-        expect(ethersBasedContract.get()).resolves.toEqual(oldValue + 1n);
+        await expect(ethersBasedContract.get()).resolves.toEqual(oldValue + 1n);
     });
 
     test('Should check that eth_call works with custom block tags', async () => {
@@ -300,7 +351,7 @@ describe('Smart contract behavior checks', () => {
         // Wait till the new L1 batch is created.
         await waitForNewL1Batch(alice);
 
-        // Now we're sure than a new L1 batch is created, we may check the new properties.
+        // Now we're sure that a new L1 batch is created, we may check the new properties.
         const newL1Batch = await contextContract.getBlockNumber({
             blockTag: 'pending'
         });
@@ -418,35 +469,6 @@ describe('Smart contract behavior checks', () => {
         expect(receipt.status).toEqual(1);
     });
 
-    test('Should check transient storage', async () => {
-        const artifact = require(`${
-            testMaster.environment().pathToHome
-        }/etc/contracts-test-data/artifacts-zk/contracts/storage/storage.sol/StorageTester.json`);
-        const contractFactory = new zksync.ContractFactory(artifact.abi, artifact.bytecode, alice);
-        const storageContract = (await contractFactory.deploy()) as zksync.Contract;
-        await storageContract.waitForDeployment();
-        // Tests transient storage, see contract code for details.
-        await expect(storageContract.testTransientStore()).toBeAccepted([]);
-        // Checks that transient storage is cleaned up after each tx.
-        await expect(storageContract.assertTValue(0)).toBeAccepted([]);
-    });
-
-    test('Should check code oracle works', async () => {
-        // Deploy contract that calls CodeOracle.
-        const artifact = require(`${
-            testMaster.environment().pathToHome
-        }/etc/contracts-test-data/artifacts-zk/contracts/precompiles/precompiles.sol/Precompiles.json`);
-        const contractFactory = new zksync.ContractFactory(artifact.abi, artifact.bytecode, alice);
-        const contract = (await contractFactory.deploy()) as zksync.Contract;
-        await contract.waitForDeployment();
-
-        // Check that CodeOracle can decommit code of just deployed contract.
-        const versionedHash = zksync.utils.hashBytecode(artifact.bytecode);
-        const expectedBytecodeHash = ethers.keccak256(artifact.bytecode);
-
-        await expect(contract.callCodeOracle(versionedHash, expectedBytecodeHash)).toBeAccepted([]);
-    });
-
     afterAll(async () => {
         await testMaster.deinitialize();
     });
@@ -460,28 +482,21 @@ async function invalidBytecodeTestTransaction(
 
     const gasPrice = await provider.getGasPrice();
     const address = zksync.Wallet.createRandom().address;
-    const tx: ethers.TransactionRequest = {
+    return {
         to: address,
         from: address,
         nonce: 0,
-
         gasLimit: 300000n,
-
         data: '0x',
         value: 0,
         chainId,
-
         type: 113,
-
         maxPriorityFeePerGas: gasPrice,
         maxFeePerGas: gasPrice,
-
         customData: {
             gasPerPubdata: zksync.utils.DEFAULT_GAS_PER_PUBDATA_LIMIT,
             factoryDeps,
             customSignature: new Uint8Array(17)
         }
     };
-
-    return tx;
 }

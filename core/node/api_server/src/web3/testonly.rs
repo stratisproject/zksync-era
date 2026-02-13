@@ -1,19 +1,24 @@
 //! Test utilities useful for writing unit tests outside of this crate.
 
-use std::{pin::Pin, time::Instant};
+use std::time::Instant;
 
 use tokio::sync::watch;
-use zksync_config::configs::{api::Web3JsonRpcConfig, chain::StateKeeperConfig, wallets::Wallets};
+use zksync_config::configs::{
+    api::{Namespace, Web3JsonRpcConfig},
+    chain::StateKeeperConfig,
+    wallets::Wallets,
+};
 use zksync_dal::ConnectionPool;
 use zksync_health_check::CheckHealth;
 use zksync_node_fee_model::MockBatchFeeParamsProvider;
 use zksync_state::PostgresStorageCaches;
 use zksync_types::L2ChainId;
+use zksync_vm_executor::oneshot::MockOneshotExecutor;
 
 use super::{metrics::ApiTransportLabel, *};
 use crate::{
-    execution_sandbox::{testonly::MockTransactionExecutor, TransactionExecutor},
-    tx_sender::TxSenderConfig,
+    execution_sandbox::SandboxExecutor,
+    tx_sender::{SandboxExecutorOptions, TxSenderConfig},
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(90);
@@ -22,7 +27,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) async fn create_test_tx_sender(
     pool: ConnectionPool<Core>,
     l2_chain_id: L2ChainId,
-    tx_executor: TransactionExecutor,
+    tx_executor: SandboxExecutor,
 ) -> (TxSender, VmConcurrencyBarrier) {
     let web3_config = Web3JsonRpcConfig::for_tests();
     let state_keeper_config = StateKeeperConfig::for_tests();
@@ -30,16 +35,15 @@ pub(crate) async fn create_test_tx_sender(
     let tx_sender_config = TxSenderConfig::new(
         &state_keeper_config,
         &web3_config,
-        wallets.state_keeper.unwrap().fee_account.address(),
+        wallets.fee_account.unwrap().address(),
         l2_chain_id,
     );
 
     let storage_caches = PostgresStorageCaches::new(1, 1);
-    let batch_fee_model_input_provider = Arc::new(MockBatchFeeParamsProvider::default());
+    let batch_fee_model_input_provider = Arc::<MockBatchFeeParamsProvider>::default();
     let (mut tx_sender, vm_barrier) = crate::tx_sender::build_tx_sender(
         &tx_sender_config,
         &web3_config,
-        &state_keeper_config,
         pool.clone(),
         pool,
         batch_fee_model_input_provider,
@@ -48,8 +52,17 @@ pub(crate) async fn create_test_tx_sender(
     .await
     .expect("failed building transaction sender");
 
-    Arc::get_mut(&mut tx_sender.0).unwrap().executor = tx_executor;
+    let tx_sender_inner = Arc::get_mut(&mut tx_sender.0).unwrap();
+    tx_sender_inner.executor = tx_executor;
+    tx_sender_inner.transaction_filter = Arc::new(()); // prevents "unexecutable transaction" errors
     (tx_sender, vm_barrier)
+}
+
+/// Handles to the initialized API server.
+#[derive(Debug)]
+pub struct ApiServerHandles {
+    pub tasks: Vec<JoinHandle<anyhow::Result<()>>>,
+    pub health_check: ReactiveHealthCheck,
 }
 
 impl ApiServerHandles {
@@ -62,18 +75,13 @@ impl ApiServerHandles {
                 "Timed out waiting for API server"
             );
             let health = self.health_check.check_health().await;
-            if health.status().is_healthy() {
-                break;
+            if matches!(health.status(), HealthStatus::Ready) {
+                let health_details = health.details().unwrap();
+                break serde_json::from_value(health_details["local_addr"].clone())
+                    .expect("invalid `local_addr` in health details");
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
-
-        let mut local_addr_future = Pin::new(&mut self.local_addr);
-        local_addr_future
-            .as_mut()
-            .await
-            .expect("API server panicked");
-        local_addr_future.output_mut().copied().unwrap()
     }
 
     pub async fn shutdown(self) {
@@ -96,84 +104,147 @@ impl ApiServerHandles {
     }
 }
 
-pub async fn spawn_http_server(
-    api_config: InternalApiConfig,
+/// Builder for test server instances.
+#[derive(Debug)]
+pub struct TestServerBuilder {
     pool: ConnectionPool<Core>,
-    tx_executor: MockTransactionExecutor,
+    api_config: InternalApiConfig,
+    request_timeout: Option<Duration>,
+    tx_executor: MockOneshotExecutor,
+    executor_options: Option<SandboxExecutorOptions>,
     method_tracer: Arc<MethodTracer>,
-    stop_receiver: watch::Receiver<bool>,
-) -> ApiServerHandles {
-    spawn_server(
-        ApiTransportLabel::Http,
-        api_config,
-        pool,
-        None,
-        tx_executor,
-        method_tracer,
-        stop_receiver,
-    )
-    .await
-    .0
 }
 
-pub async fn spawn_ws_server(
-    api_config: InternalApiConfig,
-    pool: ConnectionPool<Core>,
-    stop_receiver: watch::Receiver<bool>,
-    websocket_requests_per_minute_limit: Option<NonZeroU32>,
-) -> (ApiServerHandles, mpsc::UnboundedReceiver<PubSubEvent>) {
-    spawn_server(
-        ApiTransportLabel::Ws,
-        api_config,
-        pool,
-        websocket_requests_per_minute_limit,
-        MockTransactionExecutor::default(),
-        Arc::default(),
-        stop_receiver,
-    )
-    .await
-}
-
-async fn spawn_server(
-    transport: ApiTransportLabel,
-    api_config: InternalApiConfig,
-    pool: ConnectionPool<Core>,
-    websocket_requests_per_minute_limit: Option<NonZeroU32>,
-    tx_executor: MockTransactionExecutor,
-    method_tracer: Arc<MethodTracer>,
-    stop_receiver: watch::Receiver<bool>,
-) -> (ApiServerHandles, mpsc::UnboundedReceiver<PubSubEvent>) {
-    let (tx_sender, vm_barrier) =
-        create_test_tx_sender(pool.clone(), api_config.l2_chain_id, tx_executor.into()).await;
-    let (pub_sub_events_sender, pub_sub_events_receiver) = mpsc::unbounded_channel();
-
-    let mut namespaces = Namespace::DEFAULT.to_vec();
-    namespaces.extend([Namespace::Debug, Namespace::Snapshots]);
-
-    let server_builder = match transport {
-        ApiTransportLabel::Http => ApiBuilder::jsonrpsee_backend(api_config, pool).http(0),
-        ApiTransportLabel::Ws => {
-            let mut builder = ApiBuilder::jsonrpsee_backend(api_config, pool)
-                .ws(0)
-                .with_subscriptions_limit(100);
-            if let Some(websocket_requests_per_minute_limit) = websocket_requests_per_minute_limit {
-                builder = builder
-                    .with_websocket_requests_per_minute_limit(websocket_requests_per_minute_limit);
-            }
-            builder
+impl TestServerBuilder {
+    /// Creates a new builder.
+    pub fn new(pool: ConnectionPool<Core>, api_config: InternalApiConfig) -> Self {
+        Self {
+            api_config,
+            pool,
+            request_timeout: None,
+            tx_executor: MockOneshotExecutor::default(),
+            executor_options: None,
+            method_tracer: Arc::default(),
         }
-    };
-    let server_handles = server_builder
-        .with_polling_interval(POLL_INTERVAL)
-        .with_tx_sender(tx_sender)
-        .with_vm_barrier(vm_barrier)
-        .with_pub_sub_events(pub_sub_events_sender)
-        .with_method_tracer(method_tracer)
-        .enable_api_namespaces(namespaces)
-        .build()
-        .expect("Unable to build API server")
-        .run(stop_receiver)
+    }
+
+    /// Sets a transaction / call executor for this builder.
+    #[must_use]
+    pub fn with_tx_executor(mut self, tx_executor: MockOneshotExecutor) -> Self {
+        self.tx_executor = tx_executor;
+        self
+    }
+
+    /// Sets an RPC method tracer for this builder.
+    #[must_use]
+    pub fn with_method_tracer(mut self, tracer: Arc<MethodTracer>) -> Self {
+        self.method_tracer = tracer;
+        self
+    }
+
+    #[must_use]
+    pub fn with_executor_options(mut self, options: SandboxExecutorOptions) -> Self {
+        self.executor_options = Some(options);
+        self
+    }
+
+    #[must_use]
+    pub fn with_request_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    /// Builds an HTTP server.
+    pub async fn build_http(self, stop_receiver: watch::Receiver<bool>) -> ApiServerHandles {
+        self.spawn_server(ApiTransportLabel::Http, None, stop_receiver)
+            .await
+            .0
+    }
+
+    /// Builds a WS server.
+    pub async fn build_ws(
+        self,
+        websocket_requests_per_minute_limit: Option<NonZeroU32>,
+        stop_receiver: watch::Receiver<bool>,
+    ) -> (ApiServerHandles, mpsc::UnboundedReceiver<PubSubEvent>) {
+        self.spawn_server(
+            ApiTransportLabel::Ws,
+            websocket_requests_per_minute_limit,
+            stop_receiver,
+        )
         .await
-        .expect("Failed spawning JSON-RPC server");
-    (server_handles, pub_sub_events_receiver)
+    }
+
+    async fn spawn_server(
+        self,
+        transport: ApiTransportLabel,
+        websocket_requests_per_minute_limit: Option<NonZeroU32>,
+        stop_receiver: watch::Receiver<bool>,
+    ) -> (ApiServerHandles, mpsc::UnboundedReceiver<PubSubEvent>) {
+        let Self {
+            tx_executor,
+            executor_options,
+            request_timeout,
+            pool,
+            api_config,
+            method_tracer,
+        } = self;
+
+        let tx_executor = if let Some(options) = executor_options {
+            SandboxExecutor::custom_mock(tx_executor, options)
+        } else {
+            SandboxExecutor::mock(tx_executor).await
+        };
+        let (tx_sender, vm_barrier) =
+            create_test_tx_sender(pool.clone(), api_config.l2_chain_id, tx_executor).await;
+        let (pub_sub_events_sender, pub_sub_events_receiver) = mpsc::unbounded_channel();
+
+        let mut namespaces = HashSet::from(Namespace::DEFAULT);
+        namespaces.extend([Namespace::Debug, Namespace::Snapshots, Namespace::Unstable]);
+        let sealed_l2_block_handle = SealedL2BlockNumber::default();
+        let bridge_addresses_handle =
+            BridgeAddressesHandle::new(api_config.bridge_addresses.clone());
+
+        let mut server_tasks = vec![];
+        let (pub_sub, server_builder) = match transport {
+            ApiTransportLabel::Http => (None, ApiBuilder::new(api_config, pool).http(0)),
+            ApiTransportLabel::Ws => {
+                let mut pub_sub = EthSubscribe::new(POLL_INTERVAL);
+                pub_sub.set_events_sender(pub_sub_events_sender);
+                server_tasks.extend(pub_sub.spawn_notifiers(pool.clone(), &stop_receiver));
+
+                let mut builder = ApiBuilder::new(api_config, pool)
+                    .ws(0)
+                    .with_subscriptions_limit(100);
+                if let Some(websocket_requests_per_minute_limit) =
+                    websocket_requests_per_minute_limit
+                {
+                    builder = builder.with_websocket_requests_per_minute_limit(
+                        websocket_requests_per_minute_limit,
+                    );
+                }
+                (Some(pub_sub), builder)
+            }
+        };
+
+        let mut server_builder = server_builder
+            .with_tx_sender(tx_sender)
+            .with_vm_barrier(vm_barrier)
+            .with_method_tracer(method_tracer)
+            .enable_api_namespaces(namespaces)
+            .with_sealed_l2_block_handle(sealed_l2_block_handle)
+            .with_bridge_addresses_handle(bridge_addresses_handle);
+        if let Some(timeout) = request_timeout {
+            server_builder = server_builder.with_request_timeout(timeout);
+        }
+
+        let server = server_builder.build().expect("Unable to build API server");
+        let health_check = server.health_check();
+        server_tasks.push(tokio::spawn(server.run(pub_sub, stop_receiver)));
+        let handles = ApiServerHandles {
+            tasks: server_tasks,
+            health_check,
+        };
+        (handles, pub_sub_events_receiver)
+    }
 }

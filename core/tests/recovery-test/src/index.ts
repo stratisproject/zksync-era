@@ -8,9 +8,10 @@ import { promisify } from 'node:util';
 import { ChildProcess, exec, spawn } from 'node:child_process';
 import * as zksync from 'zksync-ethers';
 import * as ethers from 'ethers';
-import path from 'node:path';
 import { expect } from 'chai';
 import { runExternalNodeInBackground } from './utils';
+import { killPidWithAllChilds } from 'utils/build/kill';
+import { getMainWalletPk } from 'highlevel-test-tools/src/wallets';
 
 export interface Health<T> {
     readonly status: string;
@@ -83,24 +84,19 @@ export async function getExternalNodeHealth(url: string) {
     }
 }
 
-export async function dropNodeData(useZkSupervisor: boolean, env: { [key: string]: string }) {
-    if (useZkSupervisor) {
-        await executeNodeCommand(env, 'zk_inception external-node init');
-    } else {
-        await executeNodeCommand(env, 'zk db reset');
-        await executeNodeCommand(env, 'zk clean --database');
-    }
+export async function dropNodeData(chain: string) {
+    const cmd = `zkstack external-node init --chain ${chain}`;
+    await executeNodeCommand(cmd);
 }
 
-async function executeNodeCommand(env: { [key: string]: string }, command: string) {
+async function executeNodeCommand(command: string) {
     const childProcess = spawn(command, {
         cwd: process.env.ZKSYNC_HOME!!,
         stdio: 'inherit',
-        shell: true,
-        env
+        shell: true
     });
     try {
-        await waitForProcess(childProcess, true);
+        await waitForProcess(childProcess);
     } finally {
         childProcess.kill();
     }
@@ -110,11 +106,11 @@ export async function executeCommandWithLogs(command: string, logsPath: string) 
     const logs = await fs.open(logsPath, 'w');
     const childProcess = spawn(command, {
         cwd: process.env.ZKSYNC_HOME!!,
-        stdio: [null, logs.fd, logs.fd],
+        stdio: ['ignore', logs.fd, logs.fd],
         shell: true
     });
     try {
-        await waitForProcess(childProcess, true);
+        await waitForProcess(childProcess);
     } finally {
         childProcess.kill();
         await logs.close();
@@ -125,6 +121,10 @@ export enum NodeComponents {
     STANDARD = 'all',
     WITH_TREE_FETCHER = 'all,tree_fetcher',
     WITH_TREE_FETCHER_AND_NO_TREE = 'core,api,tree_fetcher'
+}
+
+export function withDAFetcher(components: NodeComponents): string {
+    return components + ',da_fetcher';
 }
 
 export class NodeProcess {
@@ -145,49 +145,78 @@ export class NodeProcess {
         }
     }
 
+    async stop(signal: 'INT' | 'KILL' = 'INT') {
+        interface ChildProcessError extends Error {
+            readonly code: number | null;
+        }
+
+        let signalNumber;
+        if (signal == 'KILL') {
+            signalNumber = 9;
+        } else {
+            signalNumber = 15;
+        }
+        try {
+            await killPidWithAllChilds(this.childProcess.pid!, signalNumber);
+        } catch (err) {
+            const typedErr = err as ChildProcessError;
+            if (typedErr.code === 1) {
+                // No matching processes were found; this is fine.
+            } else {
+                throw err;
+            }
+        }
+    }
+
     static async spawn(
-        env: { [key: string]: string },
         logsFile: FileHandle | string,
         pathToHome: string,
-        useZkInception: boolean,
-        components: NodeComponents = NodeComponents.STANDARD
+        components: NodeComponents = NodeComponents.STANDARD,
+        chain: string,
+        deploymentMode?: string
     ) {
-        const logs = typeof logsFile === 'string' ? await fs.open(logsFile, 'w') : logsFile;
+        const logs = typeof logsFile === 'string' ? await fs.open(logsFile, 'a') : logsFile;
+        let componentsArr = deploymentMode === 'Validium' ? [withDAFetcher(components)] : [components];
 
         let childProcess = runExternalNodeInBackground({
-            components: [components],
-            stdio: [null, logs.fd, logs.fd],
+            components: componentsArr,
+            stdio: ['ignore', logs.fd, logs.fd],
             cwd: pathToHome,
-            env,
-            useZkInception
+            chain
         });
-
         return new NodeProcess(childProcess, logs);
     }
 
-    private constructor(private childProcess: ChildProcess, readonly logs: FileHandle) {}
+    private constructor(
+        private childProcess: ChildProcess,
+        readonly logs: FileHandle
+    ) {}
 
     exitCode() {
         return this.childProcess.exitCode;
     }
 
     async stopAndWait(signal: 'INT' | 'KILL' = 'INT') {
-        await NodeProcess.stopAll(signal);
-        await waitForProcess(this.childProcess, signal === 'INT');
+        let processWait = waitForProcess(this.childProcess);
+        await this.stop(signal);
+        await processWait;
+        console.log('stopped');
     }
 }
 
-async function waitForProcess(childProcess: ChildProcess, checkExitCode: boolean) {
-    await new Promise((resolve, reject) => {
+function waitForProcess(childProcess: ChildProcess): Promise<any> {
+    return new Promise((resolve, reject) => {
+        childProcess.on('close', (_code, _signal) => {
+            resolve(undefined);
+        });
         childProcess.on('error', (error) => {
             reject(error);
         });
-        childProcess.on('exit', (code) => {
-            if (!checkExitCode || code === 0) {
-                resolve(undefined);
-            } else {
-                reject(new Error(`Process exited with non-zero code: ${code}`));
-            }
+        childProcess.on('exit', (_code) => {
+            resolve(undefined);
+        });
+        childProcess.on('disconnect', () => {
+            resolve(undefined);
         });
     });
 }
@@ -197,16 +226,17 @@ async function waitForProcess(childProcess: ChildProcess, checkExitCode: boolean
  */
 export class FundedWallet {
     static async create(mainNode: zksync.Provider, eth: ethers.Provider): Promise<FundedWallet> {
-        const testConfigPath = path.join(process.env.ZKSYNC_HOME!, `etc/test_config/constant/eth.json`);
-        const ethTestConfig = JSON.parse(await fs.readFile(testConfigPath, { encoding: 'utf-8' }));
-        const mnemonic = ethers.Mnemonic.fromPhrase(ethTestConfig.test_mnemonic);
-        const walletHD = ethers.HDNodeWallet.fromMnemonic(mnemonic, "m/44'/60'/0'/0/0");
-        const wallet = new zksync.Wallet(walletHD.privateKey, mainNode, eth);
+        const chainName = process.env.CHAIN_NAME!!;
+        const wallet = new zksync.Wallet(getMainWalletPk(chainName), mainNode, eth);
 
         return new FundedWallet(wallet);
     }
 
     private constructor(private readonly wallet: zksync.Wallet) {}
+
+    public evmWallet(): ethers.Wallet {
+        return new ethers.Wallet(this.wallet.privateKey, this.wallet._providerL2());
+    }
 
     /** Ensure that this wallet is funded on L2, depositing funds from L1 if necessary. */
     async ensureIsFunded() {
@@ -234,7 +264,7 @@ export class FundedWallet {
         await depositTx.waitFinalize();
     }
 
-    /** Generates at least one L1 batch by transfering funds to itself. */
+    /** Generates at least one L1 batch by transferring funds to itself. */
     async generateL1Batch(): Promise<number> {
         const transactionResponse = await this.wallet.transfer({
             to: this.wallet.address,
@@ -242,15 +272,15 @@ export class FundedWallet {
             token: zksync.utils.ETH_ADDRESS
         });
         console.log('Generated a transaction from funded wallet', transactionResponse);
-        const receipt = await transactionResponse.wait();
-        console.log('Got finalized transaction receipt', receipt);
 
-        // Wait until an L1 batch with the transaction is sealed.
-        const pastL1BatchNumber = await this.wallet.provider.getL1BatchNumber();
-        let newL1BatchNumber: number;
-        while ((newL1BatchNumber = await this.wallet.provider.getL1BatchNumber()) <= pastL1BatchNumber) {
+        let receipt: zksync.types.TransactionReceipt;
+        while (!(receipt = await transactionResponse.wait()).l1BatchNumber) {
+            console.log('Transaction is not included in L1 batch; sleeping');
             await sleep(1000);
         }
+
+        console.log('Got finalized transaction receipt', receipt);
+        const newL1BatchNumber = receipt.l1BatchNumber;
         console.log(`Sealed L1 batch #${newL1BatchNumber}`);
         return newL1BatchNumber;
     }

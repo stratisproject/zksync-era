@@ -3,30 +3,29 @@ use std::{collections::HashMap, ops, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use rand::{prelude::SliceRandom, Rng};
 use tokio::sync::RwLock;
-use zksync_contracts::BaseSystemContractsHashes;
 use zksync_dal::{Connection, ConnectionPool, Core, CoreDal};
-use zksync_multivm::interface::TransactionExecutionMetrics;
+use zksync_node_genesis::GenesisParams;
 use zksync_node_test_utils::{
     create_l1_batch_metadata, create_l2_block, execute_l2_transaction,
     l1_batch_metadata_to_commitment_artifacts,
 };
-use zksync_state::OwnedStorage;
-use zksync_state_keeper::{StateKeeperOutputHandler, UpdatesManager};
-use zksync_test_account::Account;
+use zksync_test_contracts::Account;
 use zksync_types::{
-    block::{BlockGasCount, L1BatchHeader, L2BlockHasher},
+    block::{L1BatchHeader, L2BlockHasher},
+    bytecode::BytecodeHash,
     fee::Fee,
-    get_intrinsic_constants,
+    get_intrinsic_constants, h256_to_u256,
     l2::L2Tx,
+    u256_to_h256,
     utils::storage_key_for_standard_token_balance,
-    AccountTreeId, Address, Execute, L1BatchNumber, L2BlockNumber, L2ChainId, ProtocolVersionId,
-    StorageKey, StorageLog, StorageLogKind, StorageValue, H160, H256, L2_BASE_TOKEN_ADDRESS, U256,
+    AccountTreeId, Address, Execute, L1BatchNumber, L2BlockNumber, ProtocolVersionId, StorageKey,
+    StorageLog, StorageLogKind, StorageValue, H160, H256, L2_BASE_TOKEN_ADDRESS, U256,
 };
-use zksync_utils::u256_to_h256;
-use zksync_vm_utils::storage::L1BatchParamsProvider;
+use zksync_vm_interface::{
+    tracer::ValidationTraces, L1BatchEnv, L2BlockEnv, SystemEnv, TransactionExecutionMetrics,
+};
 
-use super::{BatchExecuteData, OutputHandlerFactory, VmRunnerIo};
-use crate::storage::{load_batch_execute_data, StorageLoader};
+use super::*;
 
 mod output_handler;
 mod playground;
@@ -36,33 +35,6 @@ mod storage_writer;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Simplified storage loader that always gets data from Postgres (i.e., doesn't do RocksDB caching).
-#[derive(Debug)]
-struct PostgresLoader(ConnectionPool<Core>);
-
-#[async_trait]
-impl StorageLoader for PostgresLoader {
-    async fn load_batch(
-        &self,
-        l1_batch_number: L1BatchNumber,
-    ) -> anyhow::Result<Option<(BatchExecuteData, OwnedStorage)>> {
-        let mut conn = self.0.connection().await?;
-        let Some(data) = load_batch_execute_data(
-            &mut conn,
-            l1_batch_number,
-            &L1BatchParamsProvider::new(),
-            L2ChainId::default(),
-        )
-        .await?
-        else {
-            return Ok(None);
-        };
-
-        let storage = OwnedStorage::postgres(conn, l1_batch_number - 1).await?;
-        Ok(Some((data, storage)))
-    }
-}
-
 #[derive(Debug, Default)]
 struct IoMock {
     current: L1BatchNumber,
@@ -70,7 +42,7 @@ struct IoMock {
 }
 
 #[async_trait]
-impl VmRunnerIo for Arc<RwLock<IoMock>> {
+impl VmRunnerIo for RwLock<IoMock> {
     fn name(&self) -> &'static str {
         "io_mock"
     }
@@ -184,26 +156,28 @@ struct TestOutputFactory {
 #[async_trait]
 impl OutputHandlerFactory for TestOutputFactory {
     async fn create_handler(
-        &mut self,
-        l1_batch_number: L1BatchNumber,
-    ) -> anyhow::Result<Box<dyn StateKeeperOutputHandler>> {
+        &self,
+        _system_env: SystemEnv,
+        l1_batch_env: L1BatchEnv,
+    ) -> anyhow::Result<Box<dyn OutputHandler>> {
         #[derive(Debug)]
         struct TestOutputHandler {
             delay: Option<Duration>,
         }
 
         #[async_trait]
-        impl StateKeeperOutputHandler for TestOutputHandler {
+        impl OutputHandler for TestOutputHandler {
             async fn handle_l2_block(
                 &mut self,
-                _updates_manager: &UpdatesManager,
+                _env: L2BlockEnv,
+                _output: &L2BlockOutput,
             ) -> anyhow::Result<()> {
                 Ok(())
             }
 
             async fn handle_l1_batch(
-                &mut self,
-                _updates_manager: Arc<UpdatesManager>,
+                self: Box<Self>,
+                _output: Arc<L1BatchOutput>,
             ) -> anyhow::Result<()> {
                 if let Some(delay) = self.delay {
                     tokio::time::sleep(delay).await
@@ -212,7 +186,7 @@ impl OutputHandlerFactory for TestOutputFactory {
             }
         }
 
-        let delay = self.delays.get(&l1_batch_number).copied();
+        let delay = self.delays.get(&l1_batch_env.number).copied();
         Ok(Box::new(TestOutputHandler { delay }))
     }
 }
@@ -231,7 +205,7 @@ pub fn create_l2_transaction(
     };
     let tx = account.get_l2_tx_for_execute(
         Execute {
-            contract_address: Address::random(),
+            contract_address: Some(Address::random()),
             calldata: vec![],
             value: Default::default(),
             factory_deps: vec![],
@@ -244,7 +218,7 @@ pub fn create_l2_transaction(
 async fn store_l1_batches(
     conn: &mut Connection<'_, Core>,
     numbers: ops::RangeInclusive<u32>,
-    contract_hashes: BaseSystemContractsHashes,
+    genesis_params: &GenesisParams,
     accounts: &mut [Account],
 ) -> anyhow::Result<Vec<L1BatchHeader>> {
     let mut rng = rand::thread_rng();
@@ -268,10 +242,25 @@ async fn store_l1_batches(
     };
     for l1_batch_number in numbers {
         let l1_batch_number = L1BatchNumber(l1_batch_number);
+
+        let mut header = L1BatchHeader::new(
+            l1_batch_number,
+            l2_block_number.0 as u64, // Matches the first L2 block in the batch
+            genesis_params.base_system_contracts().hashes(),
+            ProtocolVersionId::default(),
+        );
+        conn.blocks_dal()
+            .insert_l1_batch(header.to_unsealed_header())
+            .await?;
+
         let account = accounts.choose_mut(&mut rng).unwrap();
         let tx = create_l2_transaction(account, 1000000, 100);
         conn.transactions_dal()
-            .insert_transaction_l2(&tx, TransactionExecutionMetrics::default())
+            .insert_transaction_l2(
+                &tx,
+                TransactionExecutionMetrics::default(),
+                ValidationTraces::default(),
+            )
             .await?;
         let mut logs = Vec::new();
         let mut written_keys = Vec::new();
@@ -308,7 +297,7 @@ async fn store_l1_batches(
         digest.push_tx_hash(tx.hash());
         new_l2_block.hash = digest.finalize(ProtocolVersionId::latest());
 
-        new_l2_block.base_system_contracts_hashes = contract_hashes;
+        new_l2_block.base_system_contracts_hashes = genesis_params.base_system_contracts().hashes();
         new_l2_block.l2_tx_count = 1;
         conn.blocks_dal().insert_l2_block(&new_l2_block).await?;
         last_l2_block_hash = new_l2_block.hash;
@@ -337,25 +326,25 @@ async fn store_l1_batches(
         last_l2_block_hash = fictive_l2_block.hash;
         l2_block_number += 1;
 
-        let header = L1BatchHeader::new(
-            l1_batch_number,
-            l2_block_number.0 as u64 - 2, // Matches the first L2 block in the batch
-            BaseSystemContractsHashes::default(),
-            ProtocolVersionId::default(),
-        );
-        let predicted_gas = BlockGasCount {
-            commit: 2,
-            prove: 3,
-            execute: 10,
-        };
+        // Conservatively assume that the bootloader / transactions touch *all* system contracts + default AA.
+        // By convention, bootloader hash isn't included into `used_contract_hashes`.
+        header.used_contract_hashes = genesis_params
+            .system_contracts()
+            .iter()
+            .map(|contract| BytecodeHash::for_bytecode(&contract.bytecode).value())
+            .chain([genesis_params.base_system_contracts().hashes().default_aa])
+            .chain(genesis_params.base_system_contracts().hashes().evm_emulator)
+            .map(h256_to_u256)
+            .collect();
+
         conn.blocks_dal()
-            .insert_l1_batch(&header, &[], predicted_gas, &[], &[], Default::default())
+            .mark_l1_batch_as_sealed(&header, &[], &[], &[], Default::default(), 1)
             .await?;
         conn.blocks_dal()
             .mark_l2_blocks_as_executed_in_l1_batch(l1_batch_number)
             .await?;
         conn.transactions_dal()
-            .mark_txs_as_executed_in_l1_batch(l1_batch_number, &[tx_result])
+            .mark_txs_as_executed_in_l1_batch(l1_batch_number, &[tx_result.hash])
             .await?;
 
         let metadata = create_l1_batch_metadata(l1_batch_number.0);

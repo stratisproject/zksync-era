@@ -3,7 +3,7 @@ use std::fmt;
 use super::VmRevertReason;
 
 /// Structure for non-contract errors from the Virtual Machine (EVM).
-
+///
 /// Differentiates VM-specific issues from contract-related errors.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Halt {
@@ -42,6 +42,7 @@ pub enum Halt {
     VMPanic,
     TracerCustom(String),
     FailedToPublishCompressedBytecodes,
+    FailedBlockTimestampAssertion,
 }
 
 impl fmt::Display for Halt {
@@ -115,6 +116,9 @@ impl fmt::Display for Halt {
             }
             Halt::FailedToPublishCompressedBytecodes => {
                 write!(f, "Failed to publish compressed bytecodes")
+            }
+            Halt::FailedBlockTimestampAssertion => {
+                write!(f, "Transaction failed block.timestamp assertion")
             }
         }
     }

@@ -7,15 +7,22 @@ use tempfile::TempDir;
 use test_casing::{test_casing, Product};
 use tokio::sync::mpsc;
 use zksync_config::configs::{
-    chain::{OperationsManagerConfig, StateKeeperConfig},
+    chain::SharedStateKeeperConfig,
     database::{MerkleTreeConfig, MerkleTreeMode},
+    snapshot_recovery::TreeRecoveryConfig,
 };
-use zksync_dal::CoreDal;
+use zksync_dal::{
+    custom_genesis_export_dal::{GenesisState, StorageLogRow},
+    CoreDal,
+};
 use zksync_health_check::{CheckHealth, HealthStatus, ReactiveHealthCheck};
 use zksync_merkle_tree::{domain::ZkSyncTree, recovery::PersistenceThreadHandle, TreeInstruction};
-use zksync_node_genesis::{insert_genesis_batch, GenesisParams};
+use zksync_node_genesis::{
+    insert_genesis_batch, insert_genesis_batch_with_custom_state, GenesisParams,
+};
 use zksync_node_test_utils::prepare_recovery_snapshot;
-use zksync_types::{L1BatchNumber, ProtocolVersionId, StorageLog};
+use zksync_storage::RocksDB;
+use zksync_types::{L1BatchNumber, StorageLog};
 
 use super::*;
 use crate::{
@@ -27,12 +34,15 @@ use crate::{
     MetadataCalculator, MetadataCalculatorConfig,
 };
 
+impl HandleRecoveryEvent for () {}
+
 #[test]
 fn calculating_chunk_count() {
-    let mut snapshot = SnapshotParameters {
+    let mut snapshot = InitParameters {
+        l1_batch: L1BatchNumber(1),
         l2_block: L2BlockNumber(1),
         log_count: 160_000_000,
-        expected_root_hash: H256::zero(),
+        expected_root_hash: Some(H256::zero()),
         desired_chunk_size: 200_000,
     };
     assert_eq!(snapshot.chunk_count(), 800);
@@ -57,13 +67,15 @@ async fn create_tree_recovery(
 async fn basic_recovery_workflow() {
     let pool = ConnectionPool::<Core>::test_pool().await;
     let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
-    let snapshot_recovery = prepare_recovery_snapshot_with_genesis(pool.clone(), &temp_dir).await;
-    let config = MetadataCalculatorRecoveryConfig::default();
-    let snapshot = SnapshotParameters::new(&pool, &snapshot_recovery, &config)
-        .await
-        .unwrap();
+    let root_hash = prepare_storage_logs(pool.clone(), &temp_dir).await;
+    prune_storage(&pool, L1BatchNumber(1)).await;
 
-    assert!(snapshot.log_count > 200);
+    let config = MetadataCalculatorRecoveryConfig::default();
+    let init_params = InitParameters::new(&pool, &config)
+        .await
+        .unwrap()
+        .expect("no init params");
+    assert!(init_params.log_count > 200, "{init_params:?}");
 
     let (_stop_sender, stop_receiver) = watch::channel(false);
     for chunk_count in [1, 4, 9, 16, 60, 256] {
@@ -78,54 +90,104 @@ async fn basic_recovery_workflow() {
             events: Box::new(RecoveryHealthUpdater::new(&health_updater)),
         };
         let tree = tree
-            .recover(snapshot, recovery_options, &pool, &stop_receiver)
+            .recover(init_params, recovery_options, &pool, &stop_receiver)
             .await
-            .unwrap()
-            .expect("Tree recovery unexpectedly aborted");
+            .unwrap();
 
-        assert_eq!(tree.root_hash(), snapshot_recovery.l1_batch_root_hash);
+        assert_eq!(tree.root_hash(), root_hash);
         let health = health_check.check_health().await;
         assert_matches!(health.status(), HealthStatus::Affected);
     }
 }
 
-async fn prepare_recovery_snapshot_with_genesis(
-    pool: ConnectionPool<Core>,
-    temp_dir: &TempDir,
-) -> SnapshotRecoveryStatus {
+async fn prepare_storage_logs(pool: ConnectionPool<Core>, temp_dir: &TempDir) -> H256 {
     let mut storage = pool.connection().await.unwrap();
     insert_genesis_batch(&mut storage, &GenesisParams::mock())
         .await
         .unwrap();
-    let mut logs = gen_storage_logs(100..300, 1).pop().unwrap();
-
-    // Add all logs from the genesis L1 batch to `logs` so that they cover all state keys.
-    let genesis_logs = storage
-        .storage_logs_dal()
-        .get_touched_slots_for_executed_l1_batch(L1BatchNumber(0))
-        .await
-        .unwrap();
-    let genesis_logs = genesis_logs
-        .into_iter()
-        .map(|(key, value)| StorageLog::new_write_log(key, value));
-    logs.extend(genesis_logs);
+    let logs = gen_storage_logs(100..300, 1).pop().unwrap();
     extend_db_state(&mut storage, vec![logs]).await;
     drop(storage);
 
     // Ensure that metadata for L1 batch #1 is present in the DB.
     let (calculator, _) = setup_calculator(&temp_dir.path().join("init"), pool, true).await;
-    let l1_batch_root_hash = run_calculator(calculator).await;
+    run_calculator(calculator).await
+}
 
-    SnapshotRecoveryStatus {
-        l1_batch_number: L1BatchNumber(1),
-        l1_batch_timestamp: 1,
-        l1_batch_root_hash,
-        l2_block_number: L2BlockNumber(1),
-        l2_block_timestamp: 1,
-        l2_block_hash: H256::zero(), // not used
-        protocol_version: ProtocolVersionId::latest(),
-        storage_logs_chunks_processed: vec![],
-    }
+async fn prune_storage(pool: &ConnectionPool<Core>, pruned_l1_batch: L1BatchNumber) {
+    // Emulate pruning batches in the storage.
+    let mut storage = pool.connection().await.unwrap();
+    let (_, pruned_l2_block) = storage
+        .blocks_dal()
+        .get_l2_block_range_of_l1_batch(pruned_l1_batch)
+        .await
+        .unwrap()
+        .expect("L1 batch not present in Postgres");
+    let root_hash = storage
+        .blocks_dal()
+        .get_l1_batch_state_root(pruned_l1_batch)
+        .await
+        .unwrap()
+        .expect("L1 batch does not have root hash");
+
+    storage
+        .pruning_dal()
+        .insert_soft_pruning_log(pruned_l1_batch, pruned_l2_block)
+        .await
+        .unwrap();
+    let pruning_stats = storage
+        .pruning_dal()
+        .hard_prune_batches_range(pruned_l1_batch, pruned_l2_block)
+        .await
+        .unwrap();
+    assert!(
+        pruning_stats.deleted_l1_batches > 0 && pruning_stats.deleted_l2_blocks > 0,
+        "{pruning_stats:?}"
+    );
+    storage
+        .pruning_dal()
+        .insert_hard_pruning_log(pruned_l1_batch, pruned_l2_block, root_hash)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn recovery_workflow_for_partial_pruning() {
+    let pool = ConnectionPool::<Core>::test_pool().await;
+    let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
+    let recovery_root_hash = prepare_storage_logs(pool.clone(), &temp_dir).await;
+
+    // Add more storage logs and prune initial logs.
+    let logs = gen_storage_logs(200..400, 5);
+    extend_db_state(&mut pool.connection().await.unwrap(), logs).await;
+    let (calculator, _) = setup_calculator(&temp_dir.path().join("init"), pool.clone(), true).await;
+    let final_root_hash = run_calculator(calculator).await;
+    prune_storage(&pool, L1BatchNumber(1)).await;
+
+    let tree_path = temp_dir.path().join("recovery");
+    let db = create_db(mock_config(&tree_path)).await.unwrap();
+    let tree = GenericAsyncTree::Empty {
+        db,
+        mode: MerkleTreeMode::Lightweight,
+    };
+    let (_stop_sender, stop_receiver) = watch::channel(false);
+    let tree = tree
+        .ensure_ready(
+            &MetadataCalculatorRecoveryConfig::default(),
+            &pool,
+            pool.clone(),
+            &ReactiveHealthCheck::new("tree").1,
+            &stop_receiver,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(tree.root_hash(), recovery_root_hash);
+    drop(tree); // Release exclusive lock on RocksDB
+
+    // Check that tree operates as intended after recovery
+    let (calculator, _) = setup_calculator(&tree_path, pool, true).await;
+    assert_eq!(run_calculator(calculator).await, final_root_hash);
 }
 
 #[derive(Debug)]
@@ -164,12 +226,13 @@ impl TestEventListener {
     }
 }
 
+#[async_trait]
 impl HandleRecoveryEvent for TestEventListener {
     fn recovery_started(&mut self, _chunk_count: u64, recovered_chunk_count: u64) {
         assert_eq!(recovered_chunk_count, self.expected_recovered_chunks);
     }
 
-    fn chunk_recovered(&self) {
+    async fn chunk_recovered(&self) {
         let processed_chunk_count = self.processed_chunk_count.fetch_add(1, Ordering::SeqCst) + 1;
         if processed_chunk_count >= self.stop_threshold {
             self.stop_sender.send_replace(true);
@@ -201,7 +264,8 @@ impl FaultToleranceCase {
 async fn recovery_fault_tolerance(chunk_count: u64, case: FaultToleranceCase) {
     let pool = ConnectionPool::<Core>::test_pool().await;
     let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
-    let snapshot_recovery = prepare_recovery_snapshot_with_genesis(pool.clone(), &temp_dir).await;
+    let root_hash = prepare_storage_logs(pool.clone(), &temp_dir).await;
+    prune_storage(&pool, L1BatchNumber(1)).await;
 
     let tree_path = temp_dir.path().join("recovery");
     let mut config = MetadataCalculatorRecoveryConfig::default();
@@ -217,18 +281,19 @@ async fn recovery_fault_tolerance(chunk_count: u64, case: FaultToleranceCase) {
         concurrency_limit: 1,
         events: Box::new(TestEventListener::new(1, stop_sender)),
     };
-    let snapshot = SnapshotParameters::new(&pool, &snapshot_recovery, &config)
-        .await
-        .unwrap();
-    assert!(tree
-        .recover(snapshot, recovery_options, &pool, &stop_receiver)
+    let init_params = InitParameters::new(&pool, &config)
         .await
         .unwrap()
-        .is_none());
+        .expect("no init params");
+    let err = tree
+        .recover(init_params, recovery_options, &pool, &stop_receiver)
+        .await
+        .unwrap_err();
+    assert_matches!(err, OrStopped::Stopped);
 
     // Emulate a restart and recover 2 more chunks (or 1 + emulated persistence crash).
     let (mut tree, handle) = create_tree_recovery(&tree_path, L1BatchNumber(1), &config).await;
-    assert_ne!(tree.root_hash().await, snapshot_recovery.l1_batch_root_hash);
+    assert_ne!(tree.root_hash().await, root_hash);
     let (stop_sender, stop_receiver) = watch::channel(false);
     let mut event_listener = TestEventListener::new(2, stop_sender).expect_recovered_chunks(1);
     let expected_recovered_chunks = if matches!(case, FaultToleranceCase::ParallelWithCrash) {
@@ -244,18 +309,18 @@ async fn recovery_fault_tolerance(chunk_count: u64, case: FaultToleranceCase) {
         events: Box::new(event_listener),
     };
     let recovery_result = tree
-        .recover(snapshot, recovery_options, &pool, &stop_receiver)
+        .recover(init_params, recovery_options, &pool, &stop_receiver)
         .await;
     if matches!(case, FaultToleranceCase::ParallelWithCrash) {
         let err = format!("{:#}", recovery_result.unwrap_err());
         assert!(err.contains("emulated persistence crash"), "{err}");
     } else {
-        assert!(recovery_result.unwrap().is_none());
+        assert_matches!(recovery_result.unwrap_err(), OrStopped::Stopped);
     }
 
     // Emulate another restart and recover remaining chunks.
     let (mut tree, _) = create_tree_recovery(&tree_path, L1BatchNumber(1), &config).await;
-    assert_ne!(tree.root_hash().await, snapshot_recovery.l1_batch_root_hash);
+    assert_ne!(tree.root_hash().await, root_hash);
     let (stop_sender, stop_receiver) = watch::channel(false);
     let recovery_options = RecoveryOptions {
         chunk_count,
@@ -266,11 +331,10 @@ async fn recovery_fault_tolerance(chunk_count: u64, case: FaultToleranceCase) {
         ),
     };
     let tree = tree
-        .recover(snapshot, recovery_options, &pool, &stop_receiver)
+        .recover(init_params, recovery_options, &pool, &stop_receiver)
         .await
-        .unwrap()
-        .expect("Tree recovery unexpectedly aborted");
-    assert_eq!(tree.root_hash(), snapshot_recovery.l1_batch_root_hash);
+        .unwrap();
+    assert_eq!(tree.root_hash(), root_hash);
 }
 
 #[derive(Debug)]
@@ -299,17 +363,14 @@ async fn entire_recovery_workflow(case: RecoveryWorkflowCase) {
     .await;
 
     let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
-    let merkle_tree_config = MerkleTreeConfig {
-        path: temp_dir.path().to_str().unwrap().to_owned(),
-        ..MerkleTreeConfig::default()
-    };
-    let calculator_config = MetadataCalculatorConfig::for_main_node(
+    let merkle_tree_config = MerkleTreeConfig::for_tests(temp_dir.path().to_owned());
+    let calculator_config = MetadataCalculatorConfig::from_configs(
         &merkle_tree_config,
-        &OperationsManagerConfig { delay_interval: 50 },
-        &StateKeeperConfig {
+        &SharedStateKeeperConfig {
             protective_reads_persistence_enabled: true,
-            ..Default::default()
+            ..SharedStateKeeperConfig::default()
         },
+        &TreeRecoveryConfig::default(),
     );
     let mut calculator = MetadataCalculator::new(calculator_config, None, pool.clone())
         .await
@@ -345,6 +406,7 @@ async fn entire_recovery_workflow(case: RecoveryWorkflowCase) {
             extend_db_state_from_l1_batch(
                 &mut storage,
                 snapshot_recovery.l1_batch_number + 1,
+                snapshot_recovery.l2_block_number + 1,
                 [new_logs.clone()],
             )
             .await;
@@ -375,4 +437,282 @@ async fn entire_recovery_workflow(case: RecoveryWorkflowCase) {
 
     stop_sender.send_replace(true);
     calculator_task.await.expect("calculator panicked").unwrap();
+}
+
+#[test_casing(3, [1, 2, 4])]
+#[tokio::test]
+async fn recovery_with_further_pruning(pruned_batches: u32) {
+    const NEW_BATCH_COUNT: usize = 5;
+
+    assert!(
+        (pruned_batches as usize) < NEW_BATCH_COUNT,
+        "at least 1 batch should remain in DB"
+    );
+
+    let pool = ConnectionPool::<Core>::test_pool().await;
+    let snapshot_logs = gen_storage_logs(100..300, 1).pop().unwrap();
+    let mut storage = pool.connection().await.unwrap();
+    let mut db_transaction = storage.start_transaction().await.unwrap();
+    let snapshot_recovery = prepare_recovery_snapshot(
+        &mut db_transaction,
+        L1BatchNumber(23),
+        L2BlockNumber(42),
+        &snapshot_logs,
+    )
+    .await;
+
+    // Add some batches after recovery.
+    let logs = gen_storage_logs(200..400, NEW_BATCH_COUNT);
+    extend_db_state_from_l1_batch(
+        &mut db_transaction,
+        snapshot_recovery.l1_batch_number + 1,
+        snapshot_recovery.l2_block_number + 1,
+        logs,
+    )
+    .await;
+    db_transaction.commit().await.unwrap();
+
+    // Run the first tree instance to compute root hashes for all batches.
+    let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
+    let (calculator, _) =
+        setup_calculator(&temp_dir.path().join("first"), pool.clone(), true).await;
+    let expected_root_hash = run_calculator(calculator).await;
+
+    prune_storage(&pool, snapshot_recovery.l1_batch_number + pruned_batches).await;
+
+    // Create a new tree instance. It should recover and process the remaining batches.
+    let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
+    let (calculator, _) = setup_calculator(&temp_dir.path().join("new"), pool, true).await;
+    assert_eq!(run_calculator(calculator).await, expected_root_hash);
+}
+
+#[tokio::test]
+async fn detecting_root_hash_mismatch_after_pruning() {
+    let pool = ConnectionPool::<Core>::test_pool().await;
+    let snapshot_logs = gen_storage_logs(100..300, 1).pop().unwrap();
+    let mut storage = pool.connection().await.unwrap();
+    let mut db_transaction = storage.start_transaction().await.unwrap();
+    let snapshot_recovery = prepare_recovery_snapshot(
+        &mut db_transaction,
+        L1BatchNumber(23),
+        L2BlockNumber(42),
+        &snapshot_logs,
+    )
+    .await;
+
+    let logs = gen_storage_logs(200..400, 5);
+    extend_db_state_from_l1_batch(
+        &mut db_transaction,
+        snapshot_recovery.l1_batch_number + 1,
+        snapshot_recovery.l2_block_number + 1,
+        logs,
+    )
+    .await;
+    // Intentionally add an incorrect root has of the batch to be pruned.
+    db_transaction
+        .blocks_dal()
+        .set_l1_batch_hash(snapshot_recovery.l1_batch_number + 1, H256::repeat_byte(42))
+        .await
+        .unwrap();
+    db_transaction.commit().await.unwrap();
+
+    prune_storage(&pool, snapshot_recovery.l1_batch_number + 1).await;
+
+    let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
+    let config = MetadataCalculatorRecoveryConfig::default();
+    let (tree, _) = create_tree_recovery(temp_dir.path(), L1BatchNumber(1), &config).await;
+    let (_stop_sender, stop_receiver) = watch::channel(false);
+    let recovery_options = RecoveryOptions {
+        chunk_count: 5,
+        concurrency_limit: 1,
+        events: Box::new(()),
+    };
+    let init_params = InitParameters::new(&pool, &config)
+        .await
+        .unwrap()
+        .expect("no init params");
+    assert_eq!(init_params.expected_root_hash, Some(H256::repeat_byte(42)));
+
+    let err = tree
+        .recover(init_params, recovery_options, &pool, &stop_receiver)
+        .await
+        .unwrap_err();
+    let err = format!("{err:#}").to_lowercase();
+    assert!(err.contains("root hash"), "{err}");
+
+    // Because of an abrupt error, terminating a RocksDB instance needs to be handled explicitly.
+    tokio::task::spawn_blocking(RocksDB::await_rocksdb_termination)
+        .await
+        .unwrap();
+}
+
+#[derive(Debug)]
+struct PruningEventListener {
+    pool: ConnectionPool<Core>,
+    pruned_l1_batch: L1BatchNumber,
+}
+
+#[async_trait]
+impl HandleRecoveryEvent for PruningEventListener {
+    async fn chunk_recovered(&self) {
+        prune_storage(&self.pool, self.pruned_l1_batch).await;
+    }
+}
+
+#[tokio::test]
+async fn pruning_during_recovery_is_detected() {
+    let pool = ConnectionPool::<Core>::test_pool().await;
+    let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
+
+    let mut storage = pool.connection().await.unwrap();
+    insert_genesis_batch(&mut storage, &GenesisParams::mock())
+        .await
+        .unwrap();
+    let logs = gen_storage_logs(200..400, 5);
+    extend_db_state(&mut storage, logs).await;
+    drop(storage);
+
+    // Set root hashes for all L1 batches in Postgres.
+    let (calculator, _) =
+        setup_calculator(&temp_dir.path().join("first"), pool.clone(), true).await;
+    run_calculator(calculator).await;
+    prune_storage(&pool, L1BatchNumber(1)).await;
+
+    let tree_path = temp_dir.path().join("recovery");
+    let config = MetadataCalculatorRecoveryConfig::default();
+    let (tree, _) = create_tree_recovery(&tree_path, L1BatchNumber(1), &config).await;
+    let (_stop_sender, stop_receiver) = watch::channel(false);
+    let recovery_options = RecoveryOptions {
+        chunk_count: 5,
+        concurrency_limit: 1,
+        events: Box::new(PruningEventListener {
+            pool: pool.clone(),
+            pruned_l1_batch: L1BatchNumber(3),
+        }),
+    };
+    let init_params = InitParameters::new(&pool, &config)
+        .await
+        .unwrap()
+        .expect("no init params");
+
+    let err = tree
+        .recover(init_params, recovery_options, &pool, &stop_receiver)
+        .await
+        .unwrap_err();
+    let err = format!("{err:#}").to_lowercase();
+    assert!(err.contains("continuing recovery is impossible"), "{err}");
+
+    // Because of an abrupt error, terminating a RocksDB instance needs to be handled explicitly.
+    tokio::task::spawn_blocking(RocksDB::await_rocksdb_termination)
+        .await
+        .unwrap();
+}
+
+async fn insert_large_genesis(storage: &mut Connection<'_, Core>) -> Vec<StorageLog> {
+    let log_count = InitParameters::MIN_STORAGE_LOGS_FOR_GENESIS_RECOVERY * 2;
+    let genesis_logs = gen_storage_logs(100..(log_count + 100), 1).pop().unwrap();
+    let genesis_state = GenesisState {
+        storage_logs: genesis_logs
+            .iter()
+            .map(|log| StorageLogRow {
+                address: log.key.address().0,
+                key: log.key.key().0,
+                value: log.value.0,
+            })
+            .collect(),
+        factory_deps: vec![], // Not necessary for tests
+    };
+    insert_genesis_batch_with_custom_state(storage, &GenesisParams::mock(), Some(genesis_state))
+        .await
+        .unwrap();
+    genesis_logs
+}
+
+#[tokio::test]
+async fn init_params_for_large_genesis_state() {
+    let pool = ConnectionPool::<Core>::test_pool().await;
+    let genesis_logs = insert_large_genesis(&mut pool.connection().await.unwrap()).await;
+
+    let config = MetadataCalculatorRecoveryConfig::default();
+    let init_params = InitParameters::new(&pool, &config)
+        .await
+        .unwrap()
+        .expect("no init params");
+    assert_eq!(init_params.l1_batch, L1BatchNumber(0));
+    assert_eq!(init_params.l2_block, L2BlockNumber(0));
+    assert_eq!(init_params.log_count, genesis_logs.len() as u64);
+    assert!(init_params.expected_root_hash.is_some());
+}
+
+#[tokio::test]
+async fn entire_workflow_with_large_genesis_state() {
+    let pool = ConnectionPool::<Core>::test_pool().await;
+    let mut genesis_logs = insert_large_genesis(&mut pool.connection().await.unwrap()).await;
+    let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
+
+    let config = mock_config(temp_dir.path());
+    let calculator = MetadataCalculator::new(config, None, pool).await.unwrap();
+    let tree_reader = calculator.tree_reader();
+
+    let (stop_sender, stop_receiver) = watch::channel(false);
+    let calculator_task = tokio::spawn(calculator.run(stop_receiver));
+    let tree_reader = tree_reader.wait().await.unwrap();
+    let tree_info = tree_reader.info().await;
+    assert_eq!(tree_info.leaf_count, genesis_logs.len() as u64);
+
+    genesis_logs.sort_unstable_by_key(|log| log.key);
+    let tree_instructions: Vec<_> = genesis_logs
+        .into_iter()
+        .enumerate()
+        .map(|(i, log)| TreeInstruction::write(log.key.hashed_key_u256(), i as u64 + 1, log.value))
+        .collect();
+    let expected_genesis_root_hash =
+        ZkSyncTree::process_genesis_batch(&tree_instructions).root_hash;
+    assert_eq!(tree_info.root_hash, expected_genesis_root_hash);
+
+    stop_sender.send_replace(true);
+    calculator_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn fault_tolerance_for_large_genesis_state() {
+    let pool = ConnectionPool::<Core>::test_pool().await;
+    insert_large_genesis(&mut pool.connection().await.unwrap()).await;
+    let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
+
+    let config = MetadataCalculatorRecoveryConfig::default();
+    let (tree, _) = create_tree_recovery(temp_dir.path(), L1BatchNumber(0), &config).await;
+    let (stop_sender, stop_receiver) = watch::channel(false);
+
+    // Process 3 chunks and stop.
+    let recovered_chunk_count = 3;
+    let recovery_options = RecoveryOptions {
+        chunk_count: 10,
+        concurrency_limit: 1,
+        events: Box::new(TestEventListener::new(recovered_chunk_count, stop_sender)),
+    };
+    let init_params = InitParameters::new(&pool, &config)
+        .await
+        .unwrap()
+        .expect("no init params");
+    let err = tree
+        .recover(init_params, recovery_options, &pool, &stop_receiver)
+        .await
+        .unwrap_err();
+    assert_matches!(err, OrStopped::Stopped);
+
+    // Restart recovery and process the remaining chunks
+    let (tree, _) = create_tree_recovery(temp_dir.path(), L1BatchNumber(0), &config).await;
+    let (stop_sender, stop_receiver) = watch::channel(false);
+    let recovery_options = RecoveryOptions {
+        chunk_count: 10,
+        concurrency_limit: 1,
+        events: Box::new(
+            TestEventListener::new(u64::MAX, stop_sender)
+                .expect_recovered_chunks(recovered_chunk_count),
+        ),
+    };
+    tree.recover(init_params, recovery_options, &pool, &stop_receiver)
+        .await
+        .unwrap();
 }

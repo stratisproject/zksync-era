@@ -3,27 +3,28 @@
 use std::{future::Future, ops, panic, path::Path, sync::Arc, time::Duration};
 
 use assert_matches::assert_matches;
-use itertools::Itertools;
 use tempfile::TempDir;
 use test_casing::{test_casing, Product};
 use tokio::sync::{mpsc, watch};
 use zksync_config::configs::{
-    chain::{OperationsManagerConfig, StateKeeperConfig},
+    chain::{SharedStateKeeperConfig, StateKeeperConfig},
     database::{MerkleTreeConfig, MerkleTreeMode},
+    snapshot_recovery::TreeRecoveryConfig,
 };
 use zksync_dal::{Connection, ConnectionPool, Core, CoreDal};
 use zksync_health_check::{CheckHealth, HealthStatus};
 use zksync_merkle_tree::domain::ZkSyncTree;
 use zksync_node_genesis::{insert_genesis_batch, GenesisParams};
-use zksync_node_test_utils::{create_l1_batch, create_l2_block};
+use zksync_node_test_utils::{
+    create_l1_batch, create_l2_block, generate_storage_logs, insert_initial_writes_for_batch,
+};
 use zksync_object_store::{MockObjectStore, ObjectStore};
 use zksync_prover_interface::inputs::WitnessInputMerklePaths;
 use zksync_storage::RocksDB;
 use zksync_types::{
     block::{L1BatchHeader, L1BatchTreeData},
-    AccountTreeId, Address, L1BatchNumber, L2BlockNumber, StorageKey, StorageLog, H256,
+    L1BatchNumber, L2BlockNumber, StorageLog, H256,
 };
-use zksync_utils::u32_to_h256;
 
 use super::{
     helpers::L1BatchWithLogs, GenericAsyncTree, MetadataCalculator, MetadataCalculatorConfig,
@@ -47,7 +48,7 @@ where
 
 pub(super) fn mock_config(db_path: &Path) -> MetadataCalculatorConfig {
     MetadataCalculatorConfig {
-        db_path: db_path.to_str().unwrap().to_owned(),
+        db_path: db_path.to_owned(),
         max_open_files: None,
         mode: MerkleTreeMode::Full,
         delay_interval: POLL_INTERVAL,
@@ -403,12 +404,17 @@ async fn error_on_pruned_next_l1_batch(sealed_protective_reads: bool) {
     extend_db_state(&mut storage, new_logs).await;
     storage
         .pruning_dal()
-        .soft_prune_batches_range(L1BatchNumber(5), L2BlockNumber(5))
+        .insert_soft_pruning_log(L1BatchNumber(5), L2BlockNumber(5))
         .await
         .unwrap();
     storage
         .pruning_dal()
         .hard_prune_batches_range(L1BatchNumber(5), L2BlockNumber(5))
+        .await
+        .unwrap();
+    storage
+        .pruning_dal()
+        .insert_hard_pruning_log(L1BatchNumber(5), L2BlockNumber(5), H256::zero())
         .await
         .unwrap();
     // Sanity check: there should be no pruned batch headers.
@@ -487,16 +493,14 @@ async fn running_metadata_calculator_with_additional_blocks(sealed_protective_re
 async fn shutting_down_calculator() {
     let pool = ConnectionPool::<Core>::test_pool().await;
     let temp_dir = TempDir::new().expect("failed get temporary directory for RocksDB");
-    let (merkle_tree_config, mut operation_config) =
-        create_config(temp_dir.path(), MerkleTreeMode::Lightweight);
-    operation_config.delay_interval = 30_000; // ms; chosen to be larger than `RUN_TIMEOUT`
+    let mut merkle_tree_config = create_config(temp_dir.path(), MerkleTreeMode::Lightweight);
+    merkle_tree_config.processing_delay = Duration::from_secs(30); // chosen to be larger than `RUN_TIMEOUT`
 
     let calculator = setup_calculator_with_options(
         &merkle_tree_config,
-        &operation_config,
-        &StateKeeperConfig {
+        &SharedStateKeeperConfig {
             protective_reads_persistence_enabled: true,
-            ..Default::default()
+            ..SharedStateKeeperConfig::default()
         },
         pool.clone(),
         None,
@@ -638,13 +642,16 @@ pub(crate) async fn setup_calculator(
     sealed_protective_reads: bool,
 ) -> (MetadataCalculator, Arc<dyn ObjectStore>) {
     let store = MockObjectStore::arc();
-    let (merkle_tree_config, operation_manager) = create_config(db_path, MerkleTreeMode::Full);
+    let merkle_tree_config = create_config(db_path, MerkleTreeMode::Full);
+    let mut state_keeper_config = StateKeeperConfig::for_tests();
+    state_keeper_config
+        .shared
+        .protective_reads_persistence_enabled = sealed_protective_reads;
     let calculator = setup_calculator_with_options(
         &merkle_tree_config,
-        &operation_manager,
-        &StateKeeperConfig {
+        &SharedStateKeeperConfig {
             protective_reads_persistence_enabled: sealed_protective_reads,
-            ..Default::default()
+            ..SharedStateKeeperConfig::default()
         },
         pool,
         Some(store.clone()),
@@ -658,13 +665,12 @@ async fn setup_lightweight_calculator(
     pool: ConnectionPool<Core>,
     sealed_protective_reads: bool,
 ) -> MetadataCalculator {
-    let (db_config, operation_config) = create_config(db_path, MerkleTreeMode::Lightweight);
+    let db_config = create_config(db_path, MerkleTreeMode::Lightweight);
     setup_calculator_with_options(
         &db_config,
-        &operation_config,
-        &StateKeeperConfig {
+        &SharedStateKeeperConfig {
             protective_reads_persistence_enabled: sealed_protective_reads,
-            ..Default::default()
+            ..SharedStateKeeperConfig::default()
         },
         pool,
         None,
@@ -672,49 +678,38 @@ async fn setup_lightweight_calculator(
     .await
 }
 
-fn create_config(
-    db_path: &Path,
-    mode: MerkleTreeMode,
-) -> (MerkleTreeConfig, OperationsManagerConfig) {
-    let db_config = MerkleTreeConfig {
-        path: path_to_string(&db_path.join("new")),
+fn create_config(db_path: &Path, mode: MerkleTreeMode) -> MerkleTreeConfig {
+    MerkleTreeConfig {
         mode,
-        ..MerkleTreeConfig::default()
-    };
-
-    let operation_config = OperationsManagerConfig {
-        delay_interval: 50, // ms
-    };
-    (db_config, operation_config)
+        processing_delay: Duration::from_millis(50),
+        ..MerkleTreeConfig::for_tests(db_path.join("new"))
+    }
 }
 
 async fn setup_calculator_with_options(
     merkle_tree_config: &MerkleTreeConfig,
-    operation_config: &OperationsManagerConfig,
-    state_keeper_config: &StateKeeperConfig,
+    state_keeper_config: &SharedStateKeeperConfig,
     pool: ConnectionPool<Core>,
     object_store: Option<Arc<dyn ObjectStore>>,
 ) -> MetadataCalculator {
     let mut storage = pool.connection().await.unwrap();
-    if storage.blocks_dal().is_genesis_needed().await.unwrap() {
+    let pruning_info = storage.pruning_dal().get_pruning_info().await.unwrap();
+    let has_pruning_logs = pruning_info.last_hard_pruned.is_some();
+    if !has_pruning_logs && storage.blocks_dal().is_genesis_needed().await.unwrap() {
         insert_genesis_batch(&mut storage, &GenesisParams::mock())
             .await
             .unwrap();
     }
     drop(storage);
 
-    let calculator_config = MetadataCalculatorConfig::for_main_node(
+    let calculator_config = MetadataCalculatorConfig::from_configs(
         merkle_tree_config,
-        operation_config,
         state_keeper_config,
+        &TreeRecoveryConfig::default(),
     );
     MetadataCalculator::new(calculator_config, object_store, pool)
         .await
         .unwrap()
-}
-
-fn path_to_string(path: &Path) -> String {
-    path.to_str().unwrap().to_owned()
 }
 
 pub(crate) async fn run_calculator(mut calculator: MetadataCalculator) -> H256 {
@@ -782,13 +777,26 @@ pub(super) async fn extend_db_state(
         .await
         .unwrap()
         .expect("no L1 batches in Postgres");
-    extend_db_state_from_l1_batch(&mut storage, sealed_l1_batch + 1, new_logs).await;
+    let sealed_l2_block = storage
+        .blocks_dal()
+        .get_sealed_l2_block_number()
+        .await
+        .unwrap()
+        .expect("no L2 blocks in Postgres");
+    extend_db_state_from_l1_batch(
+        &mut storage,
+        sealed_l1_batch + 1,
+        sealed_l2_block + 1,
+        new_logs,
+    )
+    .await;
     storage.commit().await.unwrap();
 }
 
 pub(super) async fn extend_db_state_from_l1_batch(
     storage: &mut Connection<'_, Core>,
     next_l1_batch: L1BatchNumber,
+    mut next_l2_block: L2BlockNumber,
     new_logs: impl IntoIterator<Item = Vec<StorageLog>>,
 ) {
     assert!(storage.in_transaction(), "must be called in DB transaction");
@@ -797,8 +805,7 @@ pub(super) async fn extend_db_state_from_l1_batch(
         let header = create_l1_batch(idx);
         let batch_number = header.number;
         // Assumes that L1 batch consists of only one L2 block.
-        let l2_block_header = create_l2_block(idx);
-        let l2_block_number = l2_block_header.number;
+        let l2_block_header = create_l2_block(next_l2_block.0);
 
         storage
             .blocks_dal()
@@ -812,7 +819,7 @@ pub(super) async fn extend_db_state_from_l1_batch(
             .unwrap();
         storage
             .storage_logs_dal()
-            .insert_storage_logs(l2_block_number, &batch_logs)
+            .insert_storage_logs(next_l2_block, &batch_logs)
             .await
             .unwrap();
         storage
@@ -831,77 +838,18 @@ pub(super) async fn extend_db_state_from_l1_batch(
             .await
             .unwrap();
         insert_initial_writes_for_batch(storage, batch_number).await;
+
+        next_l2_block += 1;
     }
-}
-
-async fn insert_initial_writes_for_batch(
-    connection: &mut Connection<'_, Core>,
-    l1_batch_number: L1BatchNumber,
-) {
-    let written_non_zero_slots: Vec<_> = connection
-        .storage_logs_dal()
-        .get_touched_slots_for_executed_l1_batch(l1_batch_number)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter_map(|(key, value)| (!value.is_zero()).then_some(key))
-        .collect();
-    let hashed_keys: Vec<_> = written_non_zero_slots
-        .iter()
-        .map(|key| key.hashed_key())
-        .collect();
-    let pre_written_slots = connection
-        .storage_logs_dedup_dal()
-        .filter_written_slots(&hashed_keys)
-        .await
-        .unwrap();
-
-    let keys_to_insert: Vec<_> = written_non_zero_slots
-        .into_iter()
-        .sorted()
-        .filter(|key| !pre_written_slots.contains(&key.hashed_key()))
-        .map(|key| key.hashed_key())
-        .collect();
-    connection
-        .storage_logs_dedup_dal()
-        .insert_initial_writes(l1_batch_number, &keys_to_insert)
-        .await
-        .unwrap();
 }
 
 pub(crate) fn gen_storage_logs(
     indices: ops::Range<u32>,
     num_batches: usize,
 ) -> Vec<Vec<StorageLog>> {
-    // Addresses and keys of storage logs must be sorted for the `multi_block_workflow` test.
-    let mut accounts = [
-        "4b3af74f66ab1f0da3f2e4ec7a3cb99baf1af7b2",
-        "ef4bb7b21c5fe7432a7d63876cc59ecc23b46636",
-        "89b8988a018f5348f52eeac77155a793adf03ecc",
-        "782806db027c08d36b2bed376b4271d1237626b3",
-        "b2b57b76717ee02ae1327cc3cf1f40e76f692311",
-    ]
-    .map(|s| AccountTreeId::new(s.parse::<Address>().unwrap()));
-    accounts.sort_unstable();
-
-    let account_keys = (indices.start / 5)..(indices.end / 5);
-    let proof_keys = accounts.iter().flat_map(|&account| {
-        account_keys
-            .clone()
-            .map(move |i| StorageKey::new(account, u32_to_h256(i)))
-    });
-    let proof_values = indices.map(u32_to_h256);
-
-    let logs: Vec<_> = proof_keys
-        .zip(proof_values)
-        .map(|(proof_key, proof_value)| StorageLog::new_write_log(proof_key, proof_value))
-        .collect();
-    for window in logs.windows(2) {
-        let [prev, next] = window else { unreachable!() };
-        assert!(prev.key < next.key);
-    }
-
-    logs.chunks(logs.len() / num_batches)
+    let all_logs = generate_storage_logs(indices);
+    all_logs
+        .chunks(all_logs.len() / num_batches)
         .map(<[_]>::to_vec)
         .collect()
 }

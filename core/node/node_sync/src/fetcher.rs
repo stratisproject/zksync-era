@@ -1,9 +1,11 @@
+use anyhow::Context;
 use zksync_dal::{Connection, Core, CoreDal};
 use zksync_shared_metrics::{TxStage, APP_METRICS};
 use zksync_state_keeper::io::{common::IoCursor, L1BatchParams, L2BlockParams};
 use zksync_types::{
-    api::en::SyncBlock, block::L2BlockHasher, fee_model::BatchFeeInput, helpers::unix_timestamp_ms,
-    Address, L1BatchNumber, L2BlockNumber, ProtocolVersionId, H256,
+    api::en::SyncBlock, block::L2BlockHasher, commitment::PubdataParams, fee_model::BatchFeeInput,
+    helpers::unix_timestamp_ms, Address, InteropRoot, L1BatchNumber, L2BlockNumber,
+    ProtocolVersionId, H256,
 };
 
 use super::{
@@ -12,6 +14,7 @@ use super::{
 };
 
 /// Same as [`zksync_types::Transaction`], just with additional guarantees that the "received at" timestamp was set locally.
+///
 /// We cannot transfer `Transaction`s without these timestamps, because this would break backward compatibility.
 #[derive(Debug, Clone)]
 pub struct FetchedTransaction(zksync_types::Transaction);
@@ -51,6 +54,9 @@ pub struct FetchedBlock {
     pub virtual_blocks: u32,
     pub operator_address: Address,
     pub transactions: Vec<FetchedTransaction>,
+    pub pubdata_params: PubdataParams,
+    pub pubdata_limit: Option<u64>,
+    pub interop_roots: Vec<InteropRoot>,
 }
 
 impl FetchedBlock {
@@ -77,6 +83,14 @@ impl TryFrom<SyncBlock> for FetchedBlock {
             ));
         }
 
+        let pubdata_params = if block.protocol_version.is_pre_gateway() {
+            block.pubdata_params.unwrap_or_default()
+        } else {
+            block
+                .pubdata_params
+                .context("Missing `pubdata_params` for post-gateway payload")?
+        };
+
         Ok(Self {
             number: block.number,
             l1_batch_number: block.l1_batch_number,
@@ -93,6 +107,9 @@ impl TryFrom<SyncBlock> for FetchedBlock {
                 .into_iter()
                 .map(FetchedTransaction::new)
                 .collect(),
+            pubdata_params,
+            pubdata_limit: block.pubdata_limit,
+            interop_roots: block.interop_roots.clone().unwrap_or_default(),
         })
     }
 }
@@ -161,10 +178,14 @@ impl IoCursorExt for IoCursor {
                         block.fair_pubdata_price,
                         block.l1_gas_price,
                     ),
-                    first_l2_block: L2BlockParams {
-                        timestamp: block.timestamp,
-                        virtual_blocks: block.virtual_blocks,
-                    },
+                    // It's ok that we lose info about millis since it's only used for sealing criteria.
+                    first_l2_block: L2BlockParams::new_raw(
+                        block.timestamp * 1000,
+                        block.virtual_blocks,
+                        block.interop_roots,
+                    ),
+                    pubdata_params: block.pubdata_params,
+                    pubdata_limit: block.pubdata_limit,
                 },
                 number: block.l1_batch_number,
                 first_l2_block_number: block.number,
@@ -175,10 +196,12 @@ impl IoCursorExt for IoCursor {
             // New batch implicitly means a new L2 block, so we only need to push the L2 block action
             // if it's not a new batch.
             new_actions.push(SyncAction::L2Block {
-                params: L2BlockParams {
-                    timestamp: block.timestamp,
-                    virtual_blocks: block.virtual_blocks,
-                },
+                params: L2BlockParams::new_raw(
+                    block.timestamp * 1000,
+                    block.virtual_blocks,
+                    block.interop_roots,
+                ),
+
                 number: block.number,
             });
             FETCHER_METRICS.miniblock.set(block.number.0.into());

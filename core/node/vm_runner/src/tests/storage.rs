@@ -10,7 +10,7 @@ use tokio::{
 use zksync_dal::{ConnectionPool, Core, CoreDal};
 use zksync_node_genesis::{insert_genesis_batch, GenesisParams};
 use zksync_state::{interface::ReadStorage, OwnedStorage, PostgresStorage};
-use zksync_test_account::Account;
+use zksync_test_contracts::Account;
 use zksync_types::{AccountTreeId, L1BatchNumber, L2ChainId, StorageKey};
 
 use crate::{
@@ -41,7 +41,7 @@ impl StorageTester {
     ) -> anyhow::Result<VmRunnerStorage<Arc<RwLock<IoMock>>>> {
         let (vm_runner_storage, task) = VmRunnerStorage::new(
             self.pool.clone(),
-            self.db_dir.path().to_str().unwrap().to_owned(),
+            self.db_dir.path().to_owned(),
             io_mock,
             L2ChainId::default(),
         )
@@ -71,11 +71,11 @@ impl<Io: VmRunnerIo> VmRunnerStorage<Io> {
 
     async fn ensure_batch_unloads_eventually(&self, number: L1BatchNumber) -> anyhow::Result<()> {
         (|| async {
-            Ok(anyhow::ensure!(
+            anyhow::ensure!(
                 self.load_batch(number).await?.is_none(),
-                "Batch #{} is still available",
-                number
-            ))
+                "Batch #{number} is still available"
+            );
+            Ok(())
         })
         .retry(&ExponentialBuilder::default())
         .await
@@ -115,7 +115,7 @@ async fn rerun_storage_on_existing_data() -> anyhow::Result<()> {
     let batches = store_l1_batches(
         &mut connection_pool.connection().await?,
         1..=10,
-        genesis_params.base_system_contracts().hashes(),
+        &genesis_params,
         &mut accounts,
     )
     .await?;
@@ -212,7 +212,7 @@ async fn continuously_load_new_batches() -> anyhow::Result<()> {
     store_l1_batches(
         &mut connection_pool.connection().await?,
         1..=1,
-        genesis_params.base_system_contracts().hashes(),
+        &genesis_params,
         &mut accounts,
     )
     .await?;
@@ -230,7 +230,7 @@ async fn continuously_load_new_batches() -> anyhow::Result<()> {
     store_l1_batches(
         &mut connection_pool.connection().await?,
         2..=2,
-        genesis_params.base_system_contracts().hashes(),
+        &genesis_params,
         &mut accounts,
     )
     .await?;
@@ -266,7 +266,7 @@ async fn access_vm_runner_storage() -> anyhow::Result<()> {
     store_l1_batches(
         &mut connection_pool.connection().await?,
         batch_range,
-        genesis_params.base_system_contracts().hashes(),
+        &genesis_params,
         &mut accounts,
     )
     .await?;

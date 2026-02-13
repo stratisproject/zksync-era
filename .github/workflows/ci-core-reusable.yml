@@ -8,24 +8,26 @@ on:
         required: false
         default: '[{ "zksolc": ["1.3.14", "1.3.16", "1.3.17", "1.3.1", "1.3.7", "1.3.18", "1.3.19", "1.3.21"] } , { "zkvyper": ["1.3.13"] }]'
 
+env:
+  RUST_BACKTRACE: 1
+  PASSED_ENV_VARS: RUST_BACKTRACE
+  YQ_VERSION: "4.45.1"
+
 jobs:
   lint:
     name: lint
     uses: ./.github/workflows/ci-core-lint-reusable.yml
   unit-tests:
-    runs-on: [matterlabs-ci-runner]
+    runs-on: [ matterlabs-ci-runner-highmem-long ]
 
     steps:
-      - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
           submodules: "recursive"
           fetch-depth: 0
 
-      - name: Setup environment
-        run: |
-          echo ZKSYNC_HOME=$(pwd) >> $GITHUB_ENV
-          echo $(pwd)/bin >> $GITHUB_PATH
-          echo IN_DOCKER=1 >> .env
+      - name: Setup Environment
+        uses: ./.github/actions/setup-env
 
       # TODO: Remove when we after upgrade of hardhat-plugins
       - name: pre-download compilers
@@ -45,85 +47,89 @@ jobs:
             chmod +x "./hardhat-nodejs/compilers-v2/$compiler/${compiler}-v${version}"
           done
 
-      - name: Start services
-        run: |
-          ci_localnet_up
-          ci_run sccache --start-server
-
       - name: Init
         run: |
-          ci_run zk
           ci_run run_retried rustup show
-          ci_run zk run yarn
-          ci_run zk db setup
-          ci_run zk compiler all
-          ci_run zk contract build
 
-      - name: Contracts unit tests
-        run: ci_run yarn l1-contracts test
+      - name: Build contracts
+        run: |
+          ci_run zkstack dev contracts
+
+      - name: Use Node.js
+        uses: actions/setup-node@cdca7365b2dadb8aad0a33bc7601856ffabcc48e # v4
+        with:
+          node-version: 18.20.8
+
+      - name: Install yarn
+        run: |
+          npm install -g yarn
+
+      - name: Check contracts hashes
+        working-directory: contracts
+        run: |
+          yarn calculate-hashes:check
+
+      - name: Download compilers for contract verifier tests
+        run: ci_run zkstack contract-verifier init --zksolc-version=v1.5.10 --zkvyper-version=v1.5.4 --solc-version=0.8.26 --vyper-version=v0.3.10 --era-vm-solc-version=0.8.26-1.0.2 --only --chain era
 
       - name: Rust unit tests
         run: |
-          ci_run zk test rust
+          ci_run zkstack dev test rust
           # Benchmarks are not tested by `cargo nextest` unless specified explicitly, and even then `criterion` harness is incompatible
           # with how `cargo nextest` runs tests. Thus, we run criterion-based benchmark tests manually.
-          ci_run zk f cargo test --release -p vm-benchmark --bench criterion --bench fill_bootloader
+          ci_run cargo test --manifest-path ./core/Cargo.toml --release -p vm-benchmark --bench oneshot --bench batch
 
   loadtest:
-    runs-on: [matterlabs-ci-runner]
+    runs-on: [ matterlabs-ci-runner-high-performance ]
     strategy:
       fail-fast: false
       matrix:
-        vm_mode: ["old", "new"]
+        vm_mode: [ "OLD", "NEW" ]
 
     steps:
-      - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
           submodules: "recursive"
           fetch-depth: 0
 
-      - name: Setup environment
-        run: |
-          echo ZKSYNC_HOME=$(pwd) >> $GITHUB_ENV
-          echo $(pwd)/bin >> $GITHUB_PATH
-          echo IN_DOCKER=1 >> .env
-
       - name: Loadtest configuration
         run: |
-          echo EXPECTED_TX_COUNT=${{ matrix.vm_mode == 'new' && 22000 || 16000 }} >> .env
-          echo ACCOUNTS_AMOUNT="150" >> .env
+          echo EXPECTED_TX_COUNT=${{ matrix.vm_mode == 'NEW' && 36000 || 22500 }} >> .env
+          echo ACCOUNTS_AMOUNT="100" >> .env
+          echo MAX_INFLIGHT_TXS="10" >> .env
+          echo SYNC_API_REQUESTS_LIMIT="15" >> .env
           echo FAIL_FAST=true >> .env
-          echo IN_DOCKER=1 >> .env
-          echo DATABASE_MERKLE_TREE_MODE=lightweight >> .env
 
-      - name: Start services
+      - name: Setup Environment
+        uses: ./.github/actions/setup-env
+
+      - name: Create and initialize legacy chain
         run: |
-          ci_localnet_up
-          ci_run sccache --start-server
+          ci_run zkstack chain create \
+            --chain-name legacy \
+            --chain-id sequential \
+            --prover-mode no-proofs \
+            --wallet-creation localhost \
+            --l1-batch-commit-data-generator-mode rollup \
+            --base-token-address 0x0000000000000000000000000000000000000001 \
+            --base-token-price-nominator 1 \
+            --base-token-price-denominator 1 \
+            --set-as-default false \
+            --ignore-prerequisites \
+            --legacy-bridge \
+            --evm-emulator false
 
-      - name: Init
-        run: |
-          ci_run git config --global --add safe.directory /usr/src/zksync
-          ci_run git config --global --add safe.directory /usr/src/zksync/sdk/binaryen
-          ci_run git config --global --add safe.directory /usr/src/zksync/contracts/system-contracts
-          ci_run git config --global --add safe.directory /usr/src/zksync/contracts
-
-          ci_run zk
-          ci_run zk init --local-legacy-bridge-testing
+          ci_run zkstack ecosystem init --dev --support-l2-legacy-shared-bridge-test true --verbose
 
       # `sleep 60` because we need to wait until server added all the tokens
       - name: Run server
         run: |
-          EXPERIMENTAL_VM_STATE_KEEPER_FAST_VM_MODE=${{ matrix.vm_mode }} \
-          PASSED_ENV_VARS="EXPERIMENTAL_VM_STATE_KEEPER_FAST_VM_MODE" \
-            ci_run zk server --uring --components api,tree,eth,state_keeper,housekeeper,commitment_generator,vm_runner_protective_reads &>server.log &
+          ci_run zkstack dev config-writer --path ${{ matrix.vm_mode == 'NEW' && 'etc/env/file_based/overrides/tests/loadtest-new.yaml' || 'etc/env/file_based/overrides/tests/loadtest-old.yaml' }} --chain legacy
+          ci_run zkstack server --uring --chain=legacy --components api,tree,eth,state_keeper,housekeeper,commitment_generator,vm_runner_protective_reads &>server.log &
           ci_run sleep 60
 
-      - name: Deploy legacy era contracts
-        run: ci_run zk contract setup-legacy-bridge-era
-
       - name: Perform loadtest
-        run: ci_run zk run loadtest
+        run: ci_run zkstack dev t loadtest -v --chain=legacy
 
       - name: Show server.log logs
         if: always()
@@ -135,299 +141,159 @@ jobs:
           ci_run sccache --show-stats || true
           ci_run cat /tmp/sccache_log.txt || true
 
-  integration:
-    name: Integration (consensus=${{ matrix.consensus }}, base_token=${{ matrix.base_token }}, deployment_mode=${{ matrix.deployment_mode }})
+  integration-tests:
+    runs-on: [ matterlabs-ci-runner-ultra-performance ]
     strategy:
-      # In matrix jobs, fail-fast is true by default.
-      # To be consistent with the rest of the workflow we disable it explicitly.
-      fail-fast: false
+      # ----------------------------------------------
+      # Note, that while the contracts do support gateway chain
+      # in reality it won't exist for quite some time and so
+      # we will test both cases here
+      # ----------------------------------------------
       matrix:
-        consensus: [false, true]
-        base_token: ["Eth", "Custom"]
-        deployment_mode: ["Rollup", "Validium"]
-    env:
-      SERVER_COMPONENTS: "api,tree,eth,state_keeper,housekeeper,commitment_generator,vm_runner_protective_reads,vm_runner_bwip,vm_playground,da_dispatcher${{ matrix.consensus && ',consensus' || '' }}${{ matrix.base_token == 'Custom' && ',base_token_ratio_persister' || '' }}"
-
-    runs-on: [matterlabs-ci-runner]
+        use_gateway_chain: [ "WITH_GATEWAY", "WITHOUT_GATEWAY" ]
+        tested_chain_type: [ "era", "validium", "custom_token"]
+      # In some cases it's useful to continue one job even if another fails.
+      fail-fast: false
     steps:
-      - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
           submodules: "recursive"
           fetch-depth: 0
 
       - name: Setup environment
         run: |
-          echo ZKSYNC_HOME=$(pwd) >> $GITHUB_ENV
-          echo $(pwd)/bin >> $GITHUB_PATH
-          echo IN_DOCKER=1 >> .env
-          echo RUN_CONTRACT_VERIFICATION_TEST=true >> .env
-          echo ZKSYNC_DEBUG_LOGS=true >> .env
+          echo "GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> .env
+          echo RUN_CONTRACT_VERIFICATION_TEST=true >> $GITHUB_ENV
+          echo "USE_GATEWAY_CHAIN=${{ matrix.use_gateway_chain }}" >> .env
+          echo "TESTED_CHAIN_TYPE=${{ matrix.tested_chain_type }}" >> .env
+          SERVER_LOGS_DIR=logs/server
+          mkdir -p $SERVER_LOGS_DIR
+          echo "SERVER_LOGS_DIR=$SERVER_LOGS_DIR" >> $GITHUB_ENV
+          sudo wget https://github.com/mikefarah/yq/releases/download/v$YQ_VERSION/yq_linux_amd64 -O /usr/local/bin/yq && sudo chmod a+x /usr/local/bin/yq
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
 
-      - name: Download zksolc/solc and zkvyper/vyper
+      - name: Setup Environment
+        uses: ./.github/actions/setup-env
+
+      - name: Build test dependencies
         run: |
-          sudo apt update && sudo apt install wget -y
+          ci_run zkstack dev test build
 
-          mkdir -p $(pwd)/etc/solc-bin/0.8.23
-          wget https://github.com/ethereum/solc-bin/raw/gh-pages/linux-amd64/solc-linux-amd64-v0.8.23%2Bcommit.f704f362
-          mv solc-linux-amd64-v0.8.23+commit.f704f362 $(pwd)/etc/solc-bin/0.8.23/solc
-          chmod +x $(pwd)/etc/solc-bin/0.8.23/solc
-
-          mkdir -p $(pwd)/etc/solc-bin/zkVM-0.8.23-1.0.0
-          wget https://github.com/matter-labs/era-solidity/releases/download/0.8.23-1.0.0/solc-linux-amd64-0.8.23-1.0.0 -O $(pwd)/etc/solc-bin/zkVM-0.8.23-1.0.0/solc
-          chmod +x $(pwd)/etc/solc-bin/zkVM-0.8.23-1.0.0/solc
-
-          mkdir -p $(pwd)/etc/zksolc-bin/v1.3.21
-          wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-v1.3.21
-          mv zksolc-linux-amd64-musl-v1.3.21 $(pwd)/etc/zksolc-bin/v1.3.21/zksolc
-          chmod +x $(pwd)/etc/zksolc-bin/v1.3.21/zksolc
-
-          mkdir -p $(pwd)/etc/vyper-bin/0.3.10
-          wget -O vyper0.3.10 https://github.com/vyperlang/vyper/releases/download/v0.3.10/vyper.0.3.10%2Bcommit.91361694.linux
-          mv vyper0.3.10 $(pwd)/etc/vyper-bin/0.3.10/vyper
-          chmod +x $(pwd)/etc/vyper-bin/0.3.10/vyper
-
-          mkdir -p $(pwd)/etc/zkvyper-bin/v1.3.13
-          wget https://github.com/matter-labs/zkvyper-bin/raw/main/linux-amd64/zkvyper-linux-amd64-musl-v1.3.13
-          mv zkvyper-linux-amd64-musl-v1.3.13 $(pwd)/etc/zkvyper-bin/v1.3.13/zkvyper
-          chmod +x $(pwd)/etc/zkvyper-bin/v1.3.13/zkvyper
-
-      - name: Start services
+      - name: Build code and init ecosystem
         run: |
-          ci_localnet_up
-          ci_run pre_download_compilers.sh
-          ci_run sccache --start-server
+          ci_run build_and_init_ecosystem
 
-      - name: Init
+      - name: Test registration of chains with transactions signed "offline"
         run: |
-          ci_run git config --global --add safe.directory /usr/src/zksync
-          ci_run git config --global --add safe.directory /usr/src/zksync/sdk/binaryen
-          ci_run git config --global --add safe.directory /usr/src/zksync/contracts/system-contracts
-          ci_run git config --global --add safe.directory /usr/src/zksync/contracts
-          ci_run zk
-          ci_run run_retried rustup show
-          if [[ "${{ matrix.deployment_mode }}" == "Validium" ]]; then
-            ci_run zk env dev_validium_docker
-            ci_run zk config compile dev_validium_docker
+          ci_run zkstack chain create \
+          --chain-name offline_chain \
+          --chain-id sequential \
+          --prover-mode no-proofs \
+          --wallet-creation localhost \
+          --l1-batch-commit-data-generator-mode rollup \
+          --base-token-address 0x0000000000000000000000000000000000000001 \
+          --base-token-price-nominator 1 \
+          --base-token-price-denominator 1 \
+          --set-as-default false \
+          --ignore-prerequisites \
+          --evm-emulator false
+
+          ci_run zkstack chain build-transactions --chain offline_chain --l1-rpc-url http://127.0.0.1:8545
+
+          governor_pk=$(awk '/governor:/ {flag=1} flag && /private_key:/ {print $2; exit}' ./configs/wallets.yaml)
+
+          ci_run zkstack dev send-transactions \
+          --file ./transactions/chain/offline_chain/register-zk-chain-txns.json \
+          --l1-rpc-url http://127.0.0.1:8545 \
+          --private-key $governor_pk
+
+          bridge_hub=$(awk '/bridgehub_proxy_addr/ {print $2}' ./configs/contracts.yaml)
+          chain_id=$(awk '/chain_id:/ {print $2}' ./chains/offline_chain/ZkStack.yaml)
+
+          hyperchain_output=$(ci_run cast call $bridge_hub "getHyperchain(uint256)" $chain_id)
+
+          if [[ $hyperchain_output == 0x* && ${#hyperchain_output} -eq 66 ]]; then
+              echo "Chain successfully registered: $hyperchain_output"
           else
-            ci_run zk config compile
+              echo "Failed to register chain: $hyperchain_output"
+              exit 1
           fi
-          ci_run zk init ${{ matrix.base_token == 'Custom' && '--base-token-name BAT' || ''}} ${{ matrix.deployment_mode == 'Validium' && '--validium-mode' || ''}}
 
-      # `sleep 5` because we need to wait until server started properly
-      - name: Run server
+      # ----------------------------------------------------------------
+      #  Only create/initialize the gateway chain *if* use_gateway_chain=WITH_GATEWAY
+      # ----------------------------------------------------------------
+      - name: Initialize gateway chain
+        if: matrix.use_gateway_chain == 'WITH_GATEWAY'
         run: |
-          ci_run zk server --components=$SERVER_COMPONENTS &>server.log &
-          ci_run sleep 5
+          ci_run zkstack chain create \
+          --chain-name gateway \
+          --chain-id 505 \
+          --prover-mode no-proofs \
+          --wallet-creation localhost \
+          --l1-batch-commit-data-generator-mode rollup \
+          --base-token-address 0x0000000000000000000000000000000000000001 \
+          --base-token-price-nominator 1 \
+          --base-token-price-denominator 1 \
+          --set-as-default false \
+          --ignore-prerequisites \
+          --evm-emulator false
+          
+          ci_run zkstack chain init \
+          --deploy-paymaster \
+          --l1-rpc-url=http://localhost:8545 \
+          --server-db-url=postgres://postgres:notsecurepassword@localhost:5432 \
+          --server-db-name=zksync_server_localhost_gateway \
+          --chain gateway \
+          --validium-type no-da
+          
+          ci_run zkstack chain gateway create-tx-filterer --chain gateway --ignore-prerequisites
+          ci_run zkstack chain gateway convert-to-gateway --chain gateway --ignore-prerequisites
 
-      - name: Run contract verifier
+      - name: Run gateway
+        if: matrix.use_gateway_chain == 'WITH_GATEWAY'
         run: |
-          ci_run zk contract_verifier &>contract_verifier.log &
-          ci_run sleep 2
+          ci_run zkstack dev config-writer --path etc/env/file_based/overrides/tests/gateway.yaml --chain gateway
+          ci_run zkstack server --ignore-prerequisites --chain gateway &> ${{ env.SERVER_LOGS_DIR }}/gateway.log &
+          ci_run zkstack server wait --ignore-prerequisites --verbose --chain gateway
 
-      - name: Server integration tests
-        run: ci_run zk test i server
-
-      - name: Snapshot recovery test
-        # We use `yarn` directly because the test launches `zk` commands in both server and EN envs.
-        # An empty topmost environment helps avoid a mess when redefining env vars shared between both envs
-        # (e.g., DATABASE_URL).
-        #
-        # Since `base_token` doesn't meaningfully influence the test, we use it as a flag for
-        # enabling / disabling tree during pruning.
+      - name: Initialize Contract verifier
         run: |
-          if [[ "${{ matrix.deployment_mode }}" == "Validium" ]]; then
-            ci_run zk config compile ext-node-validium
-            ci_run zk config compile ext-node-validium-docker
-          fi
-          ENABLE_CONSENSUS=${{ matrix.consensus }} \
-          DEPLOYMENT_MODE=${{ matrix.deployment_mode }} \
-          SNAPSHOTS_CREATOR_VERSION=${{ matrix.deployment_mode == 'Validium' && '0' || '1' }} \
-          DISABLE_TREE_DURING_PRUNING=${{ matrix.base_token == 'Eth' }} \
-          ETH_CLIENT_WEB3_URL="http://reth:8545" \
-          PASSED_ENV_VARS="ENABLE_CONSENSUS,DEPLOYMENT_MODE,DISABLE_TREE_DURING_PRUNING,SNAPSHOTS_CREATOR_VERSION,ETH_CLIENT_WEB3_URL" \
-            ci_run yarn recovery-test snapshot-recovery-test
+          ci_run zkstack contract-verifier init --zksolc-version=v1.5.10 --zkvyper-version=v1.5.4 --solc-version=0.8.26 --vyper-version=v0.3.10 --era-vm-solc-version=0.8.26-1.0.2 --only --chain era
+          ci_run zkstack contract-verifier run --chain era &> ${{ env.SERVER_LOGS_DIR }}/contract-verifier-rollup.log &
+          ci_run zkstack contract-verifier wait --chain era --verbose
 
-      - name: Genesis recovery test
+      - name: Run tests
         run: |
-          ENABLE_CONSENSUS=${{ matrix.consensus }} \
-          DEPLOYMENT_MODE=${{ matrix.deployment_mode }} \
-          ETH_CLIENT_WEB3_URL="http://reth:8545" \
-          PASSED_ENV_VARS="ENABLE_CONSENSUS,DEPLOYMENT_MODE,ETH_CLIENT_WEB3_URL" \
-            ci_run yarn recovery-test genesis-recovery-test
+          ci_run yarn highlevel-test-tools test
 
-      - name: Fee projection tests
-        run: ci_run zk test i fees
-
-      - name: Run revert test
-        run: |
-          ci_run pkill zksync_server || true
-          ci_run sleep 2
-          ENABLE_CONSENSUS=${{ matrix.consensus }} DEPLOYMENT_MODE=${{ matrix.deployment_mode }} PASSED_ENV_VARS="ENABLE_CONSENSUS,DEPLOYMENT_MODE" ci_run zk test i revert
-
-
-        # This test should be the last one as soon as it
-        # finished bootloader will be different
+      # Upgrade tests should run be separately,
+      # because as soon as they finish the bootloader will be different
       - name: Run upgrade test
         run: |
-          ci_run pkill zksync_server || true
-          ci_run sleep 10
-          ci_run zk test i upgrade
+          ci_run zkstack dev init-test-wallet --chain era
+          if [ "${{ matrix.use_gateway_chain }}" == "WITH_GATEWAY" ]; then
+            ci_run zkstack server --ignore-prerequisites --chain gateway &> ${{ env.SERVER_LOGS_DIR }}/gateway.log &
+            ci_run zkstack server wait --timeout 30 --ignore-prerequisites --verbose --chain gateway
+            ci_run zkstack dev test gateway-migration --to-gateway  --chain era --no-deps
+          fi
+          ci_run ./bin/stop_nodes.sh
 
-      - name: Show server.log logs
+          # Only start & wait for the gateway server if use_gateway_chain == WITH_GATEWAY
+          if [ "${{ matrix.use_gateway_chain }}" == "WITH_GATEWAY" ]; then
+            ci_run zkstack server --ignore-prerequisites --chain gateway &> ${{ env.SERVER_LOGS_DIR }}/gateway.log &
+            ci_run zkstack server wait --timeout 30 --ignore-prerequisites --verbose --chain gateway
+          fi
+
+          # Always run the upgrade test against era
+          ci_run zkstack dev test upgrade --no-deps --chain era
+
+      - name: Upload logs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
-        run: ci_run cat server.log || true
-
-      - name: Show contract_verifier.log logs
-        if: always()
-        run: ci_run cat contract_verifier.log || true
-
-      - name: Show snapshot-creator.log logs
-        if: always()
-        run: ci_run cat core/tests/recovery-test/snapshot-creator.log || true
-      - name: Show snapshot-recovery.log logs
-        if: always()
-        run: ci_run cat core/tests/recovery-test/snapshot-recovery.log || true
-      - name: Show genesis-recovery.log logs
-        if: always()
-        run: ci_run cat core/tests/recovery-test/genesis-recovery.log || true
-
-      - name: Show revert.log logs
-        if: always()
-        run: ci_run cat core/tests/revert-test/revert.log || true
-
-      - name: Show upgrade.log logs
-        if: always()
-        run: ci_run cat core/tests/upgrade-test/upgrade.log || true
-
-      - name: Show fee-projection.log logs
-        if: always()
-        run: ci_run cat core/tests/ts-integration/fees.log || true
-
-      - name: Show sccache logs
-        if: always()
-        run: |
-          ci_run sccache --show-stats || true
-          ci_run cat /tmp/sccache_log.txt || true
-
-  external-node:
-    name: External node (consensus=${{ matrix.consensus }}, base_token=${{ matrix.base_token }}, deployment_mode=${{ matrix.deployment_mode }})
-    strategy:
-      fail-fast: false
-      matrix:
-        consensus: [false, true]
-        base_token: ["Eth", "Custom"]
-        deployment_mode: ["Rollup", "Validium"]
-    runs-on: [matterlabs-ci-runner]
-
-    env:
-      SERVER_COMPONENTS: "api,tree,eth,state_keeper,housekeeper,commitment_generator,vm_runner_protective_reads,vm_runner_bwip,da_dispatcher${{ matrix.consensus && ',consensus' || '' }}${{ matrix.base_token == 'Custom' && ',base_token_ratio_persister' || '' }}"
-      EXT_NODE_FLAGS: "${{ matrix.consensus && '-- --enable-consensus' || '' }}"
-
-    steps:
-      - name: Checkout code # Checks out the repository under $GITHUB_WORKSPACE, so the job can access it.
-        uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4
         with:
-          submodules: "recursive"
-          fetch-depth: 0
-
-      - name: Setup environment
-        run: |
-          echo ZKSYNC_HOME=$(pwd) >> $GITHUB_ENV
-          echo $(pwd)/bin >> $GITHUB_PATH
-          echo IN_DOCKER=1 >> .env
-          echo RUN_CONTRACT_VERIFICATION_TEST=true >> .env
-          echo ZKSYNC_DEBUG_LOGS=true >> .env
-
-      - name: Start services
-        run: |
-          ci_localnet_up
-          ci_run pre_download_compilers.sh
-          ci_run sccache --start-server
-
-      - name: Init
-        run: |
-          ci_run git config --global --add safe.directory /usr/src/zksync
-          ci_run git config --global --add safe.directory /usr/src/zksync/sdk/binaryen
-          ci_run git config --global --add safe.directory /usr/src/zksync/contracts/system-contracts
-          ci_run git config --global --add safe.directory /usr/src/zksync/contracts
-          ci_run zk
-          ci_run run_retried rustup show
-          if [[ "${{ matrix.deployment_mode }}" == "Rollup" ]]; then
-            ci_run zk config compile
-          elif [[ "${{ matrix.deployment_mode }}" == "Validium" ]]; then
-            ci_run zk env dev_validium_docker
-            ci_run zk config compile dev_validium_docker
-          fi
-          ci_run zk init ${{ matrix.base_token == 'Custom' && '--base-token-name BAT' || ''}} ${{ matrix.deployment_mode == 'Validium' && '--validium-mode' || ''}}
-
-      # `sleep 30` because we need to wait until server started properly
-      - name: Run server
-        run: |
-          ci_run zk server --components=$SERVER_COMPONENTS &>>server.log &
-          ci_run sleep 30
-
-      - name: Run external node
-        run: |
-          if [[ "${{ matrix.deployment_mode }}" == "Rollup" ]]; then
-            ci_run zk env ext-node-docker
-          elif [[ "${{ matrix.deployment_mode }}" == "Validium" ]]; then
-            ci_run zk env ext-node-validium-docker
-          fi
-          ci_run zk db setup
-          ci_run zk external-node $EXT_NODE_FLAGS &>>ext-node.log &
-          ci_run sleep 30
-
-      - name: Integration tests
-        run: ci_run zk test i server --testPathIgnorePatterns 'contract-verification|snapshots-creator'
-
-      - name: Run revert test
-        run: |
-          ENABLE_CONSENSUS=${{ matrix.consensus }} DEPLOYMENT_MODE=${{ matrix.deployment_mode }} PASSED_ENV_VARS="ENABLE_CONSENSUS,DEPLOYMENT_MODE" ci_run zk test i revert-en
-          # test terminates the nodes, so we restart them.
-          if [[ "${{ matrix.deployment_mode }}" == "Rollup" ]]; then
-            ZKSYNC_ENV=docker ci_run zk server --components=$SERVER_COMPONENTS &>>server.log &
-            ZKSYNC_ENV=ext-node-docker ci_run zk external-node $EXT_NODE_FLAGS &>>ext-node.log &
-          elif [[ "${{ matrix.deployment_mode }}" == "Validium" ]]; then
-            ZKSYNC_ENV=dev_validium_docker ci_run zk server --components=$SERVER_COMPONENTS &>>server.log &
-            ZKSYNC_ENV=ext-node-validium-docker ci_run zk external-node $EXT_NODE_FLAGS &>>ext-node.log &
-          fi
-          ci_run sleep 30
-
-      - name: Run upgrade test
-        run: |
-          if [[ "${{ matrix.deployment_mode }}" == "Rollup" ]]; then
-            ci_run zk env docker
-          elif [[ "${{ matrix.deployment_mode }}" == "Validium" ]]; then
-            ci_run zk env dev_validium_docker
-          fi
-          CHECK_EN_URL="http://0.0.0.0:3060" ci_run zk test i upgrade
-
-      - name: Show server.log logs
-        if: always()
-        run: ci_run cat server.log || true
-
-      - name: Show ext-node.log logs
-        if: always()
-        run: ci_run cat ext-node.log || true
-
-      - name: Show contract_verifier.log logs
-        if: always()
-        run: ci_run cat ext-node.log || true
-
-      - name: Show revert_main.log logs
-        if: always()
-        run: ci_run cat core/tests/revert-test/revert_main.log || true
-
-      - name: Show revert_ext.log logs
-        if: always()
-        run: ci_run cat core/tests/revert-test/revert_ext.log || true
-
-      - name: Show upgrade.log logs
-        if: always()
-        run: ci_run cat core/tests/upgrade-test/upgrade.log || true
-
-      - name: Show sccache logs
-        if: always()
-        run: |
-          ci_run sccache --show-stats || true
-          ci_run cat /tmp/sccache_log.txt || true
+          name: logs_${{matrix.use_gateway_chain}}_${{matrix.tested_chain_type}}
+          path: |
+            logs/
+            chains/*/artifacts/vm_dumps/
+            chains/*/configs/

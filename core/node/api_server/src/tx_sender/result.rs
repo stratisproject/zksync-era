@@ -1,6 +1,6 @@
 use thiserror::Error;
-use zksync_multivm::interface::{ExecutionResult, VmExecutionResultAndLogs};
-use zksync_types::{l2::error::TxCheckError, U256};
+use zksync_multivm::interface::ExecutionResult;
+use zksync_types::{l2::error::TxCheckError, Address, U256};
 use zksync_web3_decl::error::EnrichedClientError;
 
 use crate::execution_sandbox::{SandboxExecutionError, ValidationError};
@@ -18,14 +18,12 @@ pub enum SubmitTxError {
     IncorrectTx(#[from] TxCheckError),
     #[error("insufficient funds for gas + value. balance: {0}, fee: {1}, value: {2}")]
     NotEnoughBalanceForFeeValue(U256, U256, U256),
-    #[error("execution reverted{}{}" , if .0.is_empty() { "" } else { ": " }, .0)]
+    #[error("execution reverted{}{}", if.0.is_empty() { "" } else { ": " }, .0)]
     ExecutionReverted(String, Vec<u8>),
     #[error("exceeds block gas limit")]
     GasLimitIsTooBig,
     #[error("{0}")]
     Unexecutable(String),
-    #[error("too many transactions")]
-    RateLimitExceeded,
     #[error("server shutting down")]
     ServerShuttingDown,
     #[error("failed to include transaction in the system. reason: {0}")]
@@ -45,36 +43,34 @@ pub enum SubmitTxError {
     #[error("max priority fee per gas higher than max fee per gas")]
     MaxPriorityFeeGreaterThanMaxFee,
     #[error(
-        "virtual machine entered unexpected state. please contact developers and provide transaction details \
+    "virtual machine entered unexpected state. please contact developers and provide transaction details \
         that caused this error. Error description: {0}"
     )]
     UnexpectedVMBehavior(String),
-    #[error("pubdata price limit is too low, ensure that the price limit is correct")]
-    UnrealisticPubdataPriceLimit,
     #[error(
         "too many factory dependencies in the transaction. {0} provided, while only {1} allowed"
     )]
     TooManyFactoryDependencies(usize, usize),
-    #[error("max fee per gas higher than 2^32")]
-    FeePerGasTooHigh,
-    #[error("max fee per pubdata byte higher than 2^32")]
-    FeePerPubdataByteTooHigh,
-    /// InsufficientFundsForTransfer is returned if the transaction sender doesn't
-    /// have enough funds for transfer.
-    #[error("insufficient balance for transfer")]
-    InsufficientFundsForTransfer,
     /// IntrinsicGas is returned if the transaction is specified to use less gas
     /// than required to start the invocation.
     #[error("intrinsic gas too low")]
     IntrinsicGas,
-    /// Error returned from main node
-    #[error("{0}")]
-    ProxyError(#[from] EnrichedClientError),
     #[error("not enough gas to publish compressed bytecodes")]
     FailedToPublishCompressedBytecodes,
+    /// Currently only triggered during gas estimation for L1 and protocol upgrade transactions.
+    #[error("integer overflow computing base token amount to mint")]
+    MintedAmountOverflow,
+    #[error("transaction failed block.timestamp assertion")]
+    FailedBlockTimestampAssertion,
+
+    /// Error returned from main node.
+    #[error("{0}")]
+    ProxyError(#[from] EnrichedClientError),
     /// Catch-all internal error (e.g., database error) that should not be exposed to the caller.
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
+    #[error("contract deployer address {0} is not in the allow list")]
+    DeployerNotInAllowList(Address),
 }
 
 impl SubmitTxError {
@@ -88,7 +84,6 @@ impl SubmitTxError {
             Self::ExecutionReverted(_, _) => "execution-reverted",
             Self::GasLimitIsTooBig => "gas-limit-is-too-big",
             Self::Unexecutable(_) => "unexecutable",
-            Self::RateLimitExceeded => "rate-limit-exceeded",
             Self::ServerShuttingDown => "shutting-down",
             Self::BootloaderFailure(_) => "bootloader-failure",
             Self::ValidationFailed(_) => "validation-failed",
@@ -99,15 +94,14 @@ impl SubmitTxError {
             Self::MaxFeePerGasTooLow => "max-fee-per-gas-too-low",
             Self::MaxPriorityFeeGreaterThanMaxFee => "max-priority-fee-greater-than-max-fee",
             Self::UnexpectedVMBehavior(_) => "unexpected-vm-behavior",
-            Self::UnrealisticPubdataPriceLimit => "unrealistic-pubdata-price-limit",
             Self::TooManyFactoryDependencies(_, _) => "too-many-factory-dependencies",
-            Self::FeePerGasTooHigh => "gas-price-limit-too-high",
-            Self::FeePerPubdataByteTooHigh => "pubdata-price-limit-too-high",
-            Self::InsufficientFundsForTransfer => "insufficient-funds-for-transfer",
             Self::IntrinsicGas => "intrinsic-gas",
-            Self::ProxyError(_) => "proxy-error",
             Self::FailedToPublishCompressedBytecodes => "failed-to-publish-compressed-bytecodes",
+            Self::MintedAmountOverflow => "minted-amount-overflow",
+            Self::FailedBlockTimestampAssertion => "failed-block-timestamp-assertion",
+            Self::ProxyError(_) => "proxy-error",
             Self::Internal(_) => "internal",
+            Self::DeployerNotInAllowList(_) => "deployer-not-in-allow-list",
         }
     }
 
@@ -145,6 +139,9 @@ impl From<SandboxExecutionError> for SubmitTxError {
             SandboxExecutionError::FailedToPayForTransaction(reason) => {
                 Self::FailedToChargeFee(reason)
             }
+            SandboxExecutionError::FailedBlockTimestampAssertion => {
+                Self::FailedBlockTimestampAssertion
+            }
         }
     }
 }
@@ -158,19 +155,35 @@ impl From<ValidationError> for SubmitTxError {
     }
 }
 
-pub(crate) trait ApiCallResult {
+pub(crate) trait ApiCallResult: Sized {
+    fn check_api_call_result(&self) -> Result<(), SubmitTxError>;
+
     fn into_api_call_result(self) -> Result<Vec<u8>, SubmitTxError>;
 }
 
-impl ApiCallResult for VmExecutionResultAndLogs {
-    fn into_api_call_result(self) -> Result<Vec<u8>, SubmitTxError> {
-        match self.result {
-            ExecutionResult::Success { output } => Ok(output),
-            ExecutionResult::Revert { output } => Err(SubmitTxError::ExecutionReverted(
+impl ApiCallResult for ExecutionResult {
+    fn check_api_call_result(&self) -> Result<(), SubmitTxError> {
+        match self {
+            Self::Success { .. } => Ok(()),
+            Self::Revert { output } => Err(SubmitTxError::ExecutionReverted(
                 output.to_user_friendly_string(),
                 output.encoded_data(),
             )),
-            ExecutionResult::Halt { reason } => {
+            Self::Halt { reason } => {
+                let output: SandboxExecutionError = reason.clone().into();
+                Err(output.into())
+            }
+        }
+    }
+
+    fn into_api_call_result(self) -> Result<Vec<u8>, SubmitTxError> {
+        match self {
+            Self::Success { output } => Ok(output),
+            Self::Revert { output } => Err(SubmitTxError::ExecutionReverted(
+                output.to_user_friendly_string(),
+                output.encoded_data(),
+            )),
+            Self::Halt { reason } => {
                 let output: SandboxExecutionError = reason.into();
                 Err(output.into())
             }

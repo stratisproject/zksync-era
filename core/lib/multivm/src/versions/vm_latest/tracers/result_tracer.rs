@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use zk_evm_1_5_0::{
+use zk_evm_1_5_2::{
     tracing::{AfterDecodingData, BeforeExecutionData, VmLocalStateData},
     vm_state::{ErrorFlags, VmLocalState},
     zkevm_opcode_defs::{FatPointer, Opcode, RET_IMPLICIT_RETURNDATA_PARAMS_REGISTER},
@@ -14,17 +14,18 @@ use crate::{
         tracer::{TracerExecutionStopReason, VmExecutionStopReason},
         ExecutionResult, Halt, TxRevertReason, VmExecutionMode, VmRevertReason,
     },
-    tracers::dynamic::vm_1_5_0::DynTracer,
+    tracers::dynamic::vm_1_5_2::DynTracer,
     vm_latest::{
+        bootloader::BootloaderState,
         constants::{get_result_success_first_slot, BOOTLOADER_HEAP_PAGE},
         old_vm::utils::{vm_may_have_ended_inner, VmExecutionResult},
         tracers::{
             traits::VmTracer,
-            utils::{get_vm_hook_params, read_pointer, VmHook},
+            utils::{get_vm_hook_params, read_pointer},
         },
-        types::internals::ZkSyncVmState,
-        vm::MultiVMSubversion,
-        BootloaderState, HistoryMode, SimpleMemory,
+        types::ZkSyncVmState,
+        vm::MultiVmSubversion,
+        HistoryMode, SimpleMemory, VmHook,
     },
 };
 
@@ -102,19 +103,22 @@ pub(crate) struct ResultTracer<S> {
     execution_mode: VmExecutionMode,
 
     far_call_tracker: FarCallTracker,
-    subversion: MultiVMSubversion,
+    subversion: MultiVmSubversion,
+
+    pub(crate) tx_finished_in_one_tx_mode: bool,
 
     _phantom: PhantomData<S>,
 }
 
 impl<S> ResultTracer<S> {
-    pub(crate) fn new(execution_mode: VmExecutionMode, subversion: MultiVMSubversion) -> Self {
+    pub(crate) fn new(execution_mode: VmExecutionMode, subversion: MultiVmSubversion) -> Self {
         Self {
             result: None,
             bootloader_out_of_gas: false,
             execution_mode,
             far_call_tracker: Default::default(),
             subversion,
+            tx_finished_in_one_tx_mode: false,
             _phantom: PhantomData,
         }
     }
@@ -152,18 +156,15 @@ impl<S, H: HistoryMode> DynTracer<S, SimpleMemory<H>> for ResultTracer<S> {
         _storage: StoragePtr<S>,
     ) {
         let hook = VmHook::from_opcode_memory(&state, &data, self.subversion);
-        if let VmHook::ExecutionResult = hook {
+        if matches!(hook, Some(VmHook::PostResult)) {
             let vm_hook_params = get_vm_hook_params(memory, self.subversion);
             let success = vm_hook_params[0];
-            let returndata = self
-                .far_call_tracker
-                .get_latest_returndata()
-                .map(|ptr| read_pointer(memory, ptr))
-                .unwrap_or_default();
+            let return_ptr = FatPointer::from_u256(vm_hook_params[1]);
+            let returndata = read_pointer(memory, return_ptr);
             if success == U256::zero() {
                 self.result = Some(Result::Error {
                     // Tx has reverted, without bootloader error, we can simply parse the revert reason
-                    error_reason: (VmRevertReason::from(returndata.as_slice())),
+                    error_reason: VmRevertReason::from(returndata.as_slice()),
                 });
             } else {
                 self.result = Some(Result::Success {
@@ -183,7 +184,7 @@ impl<S, H: HistoryMode> DynTracer<S, SimpleMemory<H>> for ResultTracer<S> {
     fn after_execution(
         &mut self,
         state: VmLocalStateData<'_>,
-        data: zk_evm_1_5_0::tracing::AfterExecutionData,
+        data: zk_evm_1_5_2::tracing::AfterExecutionData,
         _memory: &SimpleMemory<H>,
         _storage: StoragePtr<S>,
     ) {
@@ -297,7 +298,7 @@ impl<S: WriteStorage> ResultTracer<S> {
 
             let has_failed =
                 tx_has_failed(state, bootloader_state.current_tx() as u32, self.subversion);
-            if has_failed {
+            if self.tx_finished_in_one_tx_mode && has_failed {
                 self.result = Some(Result::Error {
                     error_reason: VmRevertReason::General {
                         msg: "Transaction reverted with empty reason. Possibly out of gas"
@@ -306,9 +307,9 @@ impl<S: WriteStorage> ResultTracer<S> {
                     },
                 });
             } else {
-                self.result = Some(self.result.clone().unwrap_or(Result::Success {
+                self.result = Some(Result::Success {
                     return_data: vec![],
-                }));
+                });
             }
         }
     }
@@ -333,7 +334,7 @@ impl<S: WriteStorage> ResultTracer<S> {
 pub(crate) fn tx_has_failed<S: WriteStorage, H: HistoryMode>(
     state: &ZkSyncVmState<S, H>,
     tx_id: u32,
-    subversion: MultiVMSubversion,
+    subversion: MultiVmSubversion,
 ) -> bool {
     let mem_slot = get_result_success_first_slot(subversion) + tx_id;
     let mem_value = state

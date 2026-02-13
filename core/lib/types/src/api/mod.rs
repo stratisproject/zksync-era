@@ -1,18 +1,28 @@
+use anyhow::Context;
 use chrono::{DateTime, Utc};
+use derive_more::Display;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use strum::Display;
+use serde_with::{hex::Hex, serde_as};
 use zksync_basic_types::{
-    tee_types::TeeType,
+    commitment::PubdataType,
+    settlement::SettlementLayer,
     web3::{AccessList, Bytes, Index},
-    Bloom, L1BatchNumber, H160, H256, H64, U256, U64,
+    Bloom, L1BatchNumber, SLChainId, H160, H256, H64, U256, U64,
 };
 use zksync_contracts::BaseSystemContractsHashes;
 
 pub use crate::transaction_request::{
     Eip712Meta, SerializationTransactionError, TransactionRequest,
 };
-use crate::{protocol_version::L1VerifierConfig, Address, L2BlockNumber, ProtocolVersionId};
+use crate::{
+    debug_flat_call::{DebugCallFlat, ResultDebugCallFlat},
+    eth_sender::EthTxFinalityStatus,
+    protocol_version::L1VerifierConfig,
+    server_notification::{GatewayMigrationNotification, GatewayMigrationState},
+    tee_types::TeeType,
+    Address, L2BlockNumber, ProtocolVersionId,
+};
 
 pub mod en;
 pub mod state_override;
@@ -24,8 +34,12 @@ pub enum BlockNumber {
     Committed,
     /// Last block that was finalized on L1.
     Finalized,
+    /// Last block that was fast finalized on L1.
+    FastFinalized,
     /// Latest sealed block
     Latest,
+    /// Precommitted
+    Precommitted,
     /// Last block that was committed on L1
     L1Committed,
     /// Earliest block (genesis)
@@ -55,6 +69,8 @@ impl Serialize for BlockNumber {
             BlockNumber::L1Committed => serializer.serialize_str("l1_committed"),
             BlockNumber::Earliest => serializer.serialize_str("earliest"),
             BlockNumber::Pending => serializer.serialize_str("pending"),
+            BlockNumber::FastFinalized => serializer.serialize_str("fast_finalized"),
+            BlockNumber::Precommitted => serializer.serialize_str("precommitted"),
         }
     }
 }
@@ -77,7 +93,11 @@ impl<'de> Deserialize<'de> for BlockNumber {
                     "latest" => BlockNumber::Latest,
                     "l1_committed" => BlockNumber::L1Committed,
                     "earliest" => BlockNumber::Earliest,
+                    // For zksync safe is l1 precommitted. Real chances of revert are very low.
+                    "safe" => BlockNumber::Precommitted,
                     "pending" => BlockNumber::Pending,
+                    "fast_finalized" => BlockNumber::FastFinalized,
+                    "precommitted" => BlockNumber::Precommitted,
                     num => {
                         let number =
                             U64::deserialize(de::value::BorrowedStrDeserializer::new(num))?;
@@ -179,6 +199,55 @@ impl From<H256> for TransactionId {
     }
 }
 
+/// Interop modes are used to specify the target Merkle root for interop log proofs
+#[derive(Copy, Clone, Debug, PartialEq, Display)]
+pub enum InteropMode {
+    // Proof-based interop on Gateway, meaning the Merkle proof hashes to Gateway's MessageRoot
+    ProofBasedGateway,
+    // Proof-based interop on L1, meaning the Merkle proof hashes to L1's MessageRoot
+    // ProofBasedL1, // todo: v30
+}
+
+impl Serialize for InteropMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match *self {
+            InteropMode::ProofBasedGateway => serializer.serialize_str("proof_based_gw"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for InteropMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = InteropMode;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("One of the supported aliases")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                let result = match value {
+                    "proof_based_gw" => InteropMode::ProofBasedGateway,
+                    _ => {
+                        return Err(E::custom(format!(
+                            "Unsupported InteropMode variant: {}",
+                            value
+                        )));
+                    }
+                };
+
+                Ok(result)
+            }
+        }
+        deserializer.deserialize_str(V)
+    }
+}
+
 /// A struct with the proof for the L2->L1 log in a specific block.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -189,6 +258,15 @@ pub struct L2ToL1LogProof {
     pub id: u32,
     /// The root of the tree.
     pub root: H256,
+    /// The L1 batch number where the log was included.
+    pub batch_number: L1BatchNumber,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainAggProof {
+    pub chain_id_leaf_proof: Vec<H256>,
+    pub chain_id_leaf_proof_mask: u64,
 }
 
 /// A struct with the two default bridge contracts.
@@ -201,6 +279,7 @@ pub struct BridgeAddresses {
     pub l2_erc20_default_bridge: Option<Address>,
     pub l1_weth_bridge: Option<Address>,
     pub l2_weth_bridge: Option<Address>,
+    pub l2_legacy_shared_bridge: Option<Address>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -251,8 +330,6 @@ pub struct TransactionReceipt {
     pub l2_to_l1_logs: Vec<L2ToL1Log>,
     /// Status: either 1 (success) or 0 (failure).
     pub status: U64,
-    /// State root.
-    pub root: H256,
     /// Logs bloom
     #[serde(rename = "logsBloom")]
     pub logs_bloom: Bloom,
@@ -462,6 +539,45 @@ impl Log {
     }
 }
 
+impl From<Log> for zksync_basic_types::web3::Log {
+    fn from(log: Log) -> Self {
+        zksync_basic_types::web3::Log {
+            address: log.address,
+            topics: log.topics,
+            data: log.data,
+            block_hash: log.block_hash,
+            block_number: log.block_number,
+            transaction_hash: log.transaction_hash,
+            transaction_index: log.transaction_index,
+            log_index: log.log_index,
+            transaction_log_index: log.transaction_log_index,
+            log_type: log.log_type,
+            removed: log.removed,
+            block_timestamp: log.block_timestamp,
+        }
+    }
+}
+
+impl From<zksync_basic_types::web3::Log> for Log {
+    fn from(log: zksync_basic_types::web3::Log) -> Self {
+        Log {
+            address: log.address,
+            topics: log.topics,
+            data: log.data,
+            block_hash: log.block_hash,
+            block_number: log.block_number,
+            transaction_hash: log.transaction_hash,
+            transaction_index: log.transaction_index,
+            log_index: log.log_index,
+            transaction_log_index: log.transaction_log_index,
+            log_type: log.log_type,
+            removed: log.removed,
+            block_timestamp: log.block_timestamp,
+            l1_batch_number: None,
+        }
+    }
+}
+
 /// A log produced by a transaction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -511,6 +627,9 @@ pub struct Transaction {
     pub gas: U256,
     /// Input data
     pub input: Bytes,
+    /// The parity (0 for even, 1 for odd) of the y-value of the secp256k1 signature
+    #[serde(rename = "yParity", default, skip_serializing_if = "Option::is_none")]
+    pub y_parity: Option<U64>,
     /// ECDSA recovery id
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v: Option<U64>,
@@ -561,11 +680,13 @@ pub struct Transaction {
     pub l1_batch_tx_index: Option<U64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum TransactionStatus {
     Pending,
     Included,
+    FastFinalized,
+    Precommitted,
     Verified,
     Failed,
 }
@@ -582,6 +703,7 @@ pub struct TransactionDetails {
     pub eth_commit_tx_hash: Option<H256>,
     pub eth_prove_tx_hash: Option<H256>,
     pub eth_execute_tx_hash: Option<H256>,
+    pub eth_precommit_tx_hash: Option<H256>,
 }
 
 #[derive(Debug, Clone)]
@@ -601,9 +723,11 @@ pub struct ResultDebugCall {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub enum DebugCallType {
     #[default]
     Call,
+    DelegateCall,
     Create,
 }
 
@@ -623,8 +747,7 @@ pub struct DebugCall {
     pub calls: Vec<DebugCall>,
 }
 
-// TODO (PLA-965): remove deprecated fields from the struct. It is currently in a "migration" phase
-// to keep compatibility between old and new versions.
+// TODO: remove in favour of `ProtocolVersionInfo` once all ENs have been upgraded.
 #[derive(Default, Serialize, Deserialize, Clone, Debug)]
 pub struct ProtocolVersion {
     /// Minor version of the protocol
@@ -638,7 +761,7 @@ pub struct ProtocolVersion {
     /// Verifier configuration
     #[deprecated]
     pub verification_keys_hashes: Option<L1VerifierConfig>,
-    /// Hashes of base system contracts (bootloader and default account)
+    /// Hashes of base system contracts (bootloader, default account and evm emulator)
     #[deprecated]
     pub base_system_contracts: Option<BaseSystemContractsHashes>,
     /// Bootloader code hash
@@ -647,6 +770,9 @@ pub struct ProtocolVersion {
     /// Default account code hash
     #[serde(rename = "defaultAccountCodeHash")]
     pub default_account_code_hash: Option<H256>,
+    /// EVM emulator code hash
+    #[serde(rename = "evmSimulatorCodeHash")]
+    pub evm_emulator_code_hash: Option<H256>,
     /// L2 Upgrade transaction hash
     #[deprecated]
     pub l2_system_upgrade_tx_hash: Option<H256>,
@@ -662,6 +788,7 @@ impl ProtocolVersion {
         timestamp: u64,
         bootloader_code_hash: H256,
         default_account_code_hash: H256,
+        evm_emulator_code_hash: Option<H256>,
         l2_system_upgrade_tx_hash: Option<H256>,
     ) -> Self {
         Self {
@@ -672,9 +799,11 @@ impl ProtocolVersion {
             base_system_contracts: Some(BaseSystemContractsHashes {
                 bootloader: bootloader_code_hash,
                 default_aa: default_account_code_hash,
+                evm_emulator: evm_emulator_code_hash,
             }),
             bootloader_code_hash: Some(bootloader_code_hash),
             default_account_code_hash: Some(default_account_code_hash),
+            evm_emulator_code_hash,
             l2_system_upgrade_tx_hash,
             l2_system_upgrade_tx_hash_new: l2_system_upgrade_tx_hash,
         }
@@ -690,6 +819,13 @@ impl ProtocolVersion {
             .or_else(|| self.base_system_contracts.map(|hashes| hashes.default_aa))
     }
 
+    pub fn evm_emulator_code_hash(&self) -> Option<H256> {
+        self.evm_emulator_code_hash.or_else(|| {
+            self.base_system_contracts
+                .and_then(|hashes| hashes.evm_emulator)
+        })
+    }
+
     pub fn minor_version(&self) -> Option<u16> {
         self.minor_version.or(self.version_id)
     }
@@ -700,19 +836,62 @@ impl ProtocolVersion {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Default, Serialize, Deserialize, Clone, Debug)]
+pub struct ProtocolVersionInfo {
+    /// Minor version of the protocol
+    #[serde(rename = "minorVersion")]
+    pub minor_version: u16,
+    /// Timestamp at which upgrade should be performed
+    pub timestamp: u64,
+    /// Bootloader code hash
+    #[serde(rename = "bootloaderCodeHash")]
+    pub bootloader_code_hash: H256,
+    /// Default account code hash
+    #[serde(rename = "defaultAccountCodeHash")]
+    pub default_account_code_hash: H256,
+    /// EVM emulator code hash
+    #[serde(rename = "evmEmulatorCodeHash")]
+    pub evm_emulator_code_hash: Option<H256>,
+    /// L2 Upgrade transaction hash
+    #[serde(rename = "l2SystemUpgradeTxHash")]
+    pub l2_system_upgrade_tx_hash: Option<H256>,
+}
+
+impl TryFrom<ProtocolVersion> for ProtocolVersionInfo {
+    type Error = anyhow::Error;
+
+    fn try_from(value: ProtocolVersion) -> Result<Self, Self::Error> {
+        Ok(ProtocolVersionInfo {
+            minor_version: value
+                .minor_version
+                .context("missing minor protocol version")?,
+            timestamp: value.timestamp,
+            bootloader_code_hash: value
+                .bootloader_code_hash
+                .context("missing bootloader code hash")?,
+            default_account_code_hash: value
+                .default_account_code_hash
+                .context("missing default account code hash")?,
+            evm_emulator_code_hash: value.evm_emulator_code_hash,
+            l2_system_upgrade_tx_hash: value.l2_system_upgrade_tx_hash_new,
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 #[serde(rename_all = "camelCase")]
 pub enum SupportedTracers {
     CallTracer,
+    FlatCallTracer,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, Copy)]
 #[serde(rename_all = "camelCase")]
 pub struct CallTracerConfig {
     pub only_top_call: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 #[serde(rename_all = "camelCase")]
 pub struct TracerConfig {
     pub tracer: SupportedTracers,
@@ -720,11 +899,72 @@ pub struct TracerConfig {
     pub tracer_config: CallTracerConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Default for TracerConfig {
+    fn default() -> Self {
+        TracerConfig {
+            tracer: SupportedTracers::CallTracer,
+            tracer_config: CallTracerConfig {
+                only_top_call: false,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum BlockStatus {
     Sealed,
     Verified,
+    FastFinalized,
+}
+
+/// Result tracers need to have a nested result field for compatibility. So we have two different
+/// structs 1 for blocks tracing and one for txs and call tracing
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum CallTracerBlockResult {
+    CallTrace(Vec<ResultDebugCall>),
+    FlatCallTrace(Vec<ResultDebugCallFlat>),
+}
+
+impl CallTracerBlockResult {
+    pub fn unwrap_flat(self) -> Vec<ResultDebugCallFlat> {
+        match self {
+            Self::CallTrace(_) => panic!("Result is a FlatCallTrace"),
+            Self::FlatCallTrace(trace) => trace,
+        }
+    }
+
+    pub fn unwrap_default(self) -> Vec<ResultDebugCall> {
+        match self {
+            Self::CallTrace(trace) => trace,
+            Self::FlatCallTrace(_) => panic!("Result is a CallTrace"),
+        }
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum CallTracerResult {
+    CallTrace(DebugCall),
+    FlatCallTrace(Vec<DebugCallFlat>),
+}
+
+impl CallTracerResult {
+    pub fn unwrap_flat(self) -> Vec<DebugCallFlat> {
+        match self {
+            Self::CallTrace(_) => panic!("Result is a FlatCallTrace"),
+            Self::FlatCallTrace(trace) => trace,
+        }
+    }
+
+    pub fn unwrap_default(self) -> DebugCall {
+        match self {
+            Self::CallTrace(trace) => trace,
+            Self::FlatCallTrace(_) => panic!("Result is a CallTrace"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -738,10 +978,20 @@ pub struct BlockDetailsBase {
     pub status: BlockStatus,
     pub commit_tx_hash: Option<H256>,
     pub committed_at: Option<DateTime<Utc>>,
+    pub commit_tx_finality: Option<EthTxFinalityStatus>,
+    pub commit_chain_id: Option<SLChainId>,
     pub prove_tx_hash: Option<H256>,
+    pub prove_tx_finality: Option<EthTxFinalityStatus>,
     pub proven_at: Option<DateTime<Utc>>,
+    pub prove_chain_id: Option<SLChainId>,
     pub execute_tx_hash: Option<H256>,
+    pub execute_tx_finality: Option<EthTxFinalityStatus>,
     pub executed_at: Option<DateTime<Utc>>,
+    pub execute_chain_id: Option<SLChainId>,
+    pub precommit_tx_hash: Option<H256>,
+    pub precommit_tx_finality: Option<EthTxFinalityStatus>,
+    pub precommitted_at: Option<DateTime<Utc>>,
+    pub precommit_chain_id: Option<SLChainId>,
     pub l1_gas_price: u64,
     pub l2_fair_gas_price: u64,
     // Cost of publishing one byte (in wei).
@@ -764,6 +1014,7 @@ pub struct BlockDetails {
 #[serde(rename_all = "camelCase")]
 pub struct L1BatchDetails {
     pub number: L1BatchNumber,
+    pub commitment: Option<H256>,
     #[serde(flatten)]
     pub base: BlockDetailsBase,
 }
@@ -784,15 +1035,21 @@ pub struct Proof {
     pub storage_proof: Vec<StorageProof>,
 }
 
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TeeProof {
     pub l1_batch_number: L1BatchNumber,
     pub tee_type: Option<TeeType>,
+    #[serde_as(as = "Option<Hex>")]
     pub pubkey: Option<Vec<u8>>,
+    #[serde_as(as = "Option<Hex>")]
     pub signature: Option<Vec<u8>>,
+    #[serde_as(as = "Option<Hex>")]
     pub proof: Option<Vec<u8>>,
     pub proved_at: DateTime<Utc>,
+    pub status: String,
+    #[serde_as(as = "Option<Hex>")]
     pub attestation: Option<Vec<u8>>,
 }
 
@@ -831,6 +1088,47 @@ pub struct FeeHistory {
     pub l2_pubdata_price: Vec<U256>,
 }
 
+/// The data availability details type. Used exclusively in Validiums.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataAvailabilityDetails {
+    pub pubdata_type: Option<PubdataType>,
+    pub blob_id: String,
+    pub inclusion_data: Option<Vec<u8>>,
+    pub sent_at: DateTime<Utc>,
+    pub l2_da_validator: Option<Address>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct L1ToL2TxsStatus {
+    pub l1_to_l2_txs_in_mempool: usize,
+    pub l1_to_l2_txs_paused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayMigrationStatus {
+    pub latest_notification: Option<GatewayMigrationNotification>,
+    pub state: GatewayMigrationState,
+    pub settlement_layer: Option<SettlementLayer>,
+    pub wait_for_batches_to_be_committed: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct EcosystemContracts {
+    pub bridgehub_proxy_addr: Address,
+    pub state_transition_proxy_addr: Option<Address>,
+    pub transparent_proxy_admin_addr: Option<Address>,
+    pub l1_bytecodes_supplier_addr: Option<Address>,
+    // Note that on the contract side of things this contract is called `L2WrappedBaseTokenStore`,
+    // while on the server side for consistency with the conventions, where the prefix denotes
+    // the location of the contracts we call it `l1_wrapped_base_token_store`
+    pub l1_wrapped_base_token_store: Option<Address>,
+    pub server_notifier_addr: Option<Address>,
+    pub message_root_proxy_addr: Option<Address>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,6 +1145,7 @@ mod tests {
             base_system_contracts: Some(Default::default()),
             bootloader_code_hash: Some(Default::default()),
             default_account_code_hash: Some(Default::default()),
+            evm_emulator_code_hash: Some(Default::default()),
             l2_system_upgrade_tx_hash: Default::default(),
             l2_system_upgrade_tx_hash_new: Default::default(),
         };
@@ -863,5 +1162,25 @@ mod tests {
 
         serde_json::from_str::<OldProtocolVersion>(&serde_json::to_string(&new_version).unwrap())
             .unwrap();
+    }
+
+    #[test]
+    fn proper_display() {
+        let block_number = BlockNumber::Committed;
+        assert_eq!(format!("{}", block_number), "Committed");
+        let block_number = BlockNumber::Finalized;
+        assert_eq!(format!("{}", block_number), "Finalized");
+        let block_number = BlockNumber::Latest;
+        assert_eq!(format!("{}", block_number), "Latest");
+        let block_number = BlockNumber::L1Committed;
+        assert_eq!(format!("{}", block_number), "L1Committed");
+        let block_number = BlockNumber::FastFinalized;
+        assert_eq!(format!("{}", block_number), "FastFinalized");
+        let block_number = BlockNumber::Earliest;
+        assert_eq!(format!("{}", block_number), "Earliest");
+        let block_number = BlockNumber::Pending;
+        assert_eq!(format!("{}", block_number), "Pending");
+        let block_number = BlockNumber::Number(U64::from(42));
+        assert_eq!(format!("{}", block_number), "42");
     }
 }

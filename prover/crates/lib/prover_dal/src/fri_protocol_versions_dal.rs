@@ -2,7 +2,7 @@ use zksync_basic_types::{
     protocol_version::{L1VerifierConfig, ProtocolSemanticVersion},
     H256,
 };
-use zksync_db_connection::connection::Connection;
+use zksync_db_connection::{connection::Connection, error::DalError, instrument::InstrumentExt};
 
 use crate::Prover;
 
@@ -16,24 +16,34 @@ impl FriProtocolVersionsDal<'_, '_> {
         &mut self,
         id: ProtocolSemanticVersion,
         l1_verifier_config: L1VerifierConfig,
-    ) {
+    ) -> Result<(), DalError> {
         sqlx::query!(
             r#"
             INSERT INTO
-                prover_fri_protocol_versions (id, recursion_scheduler_level_vk_hash, created_at, protocol_version_patch)
+            prover_fri_protocol_versions (
+                id,
+                snark_wrapper_vk_hash,
+                fflonk_snark_wrapper_vk_hash,
+                created_at,
+                protocol_version_patch
+            )
             VALUES
-                ($1, $2, NOW(), $3)
+            ($1, $2, $3, NOW(), $4)
             ON CONFLICT (id, protocol_version_patch) DO NOTHING
             "#,
             id.minor as i32,
+            l1_verifier_config.snark_wrapper_vk_hash.as_bytes(),
             l1_verifier_config
-                .recursion_scheduler_level_vk_hash
-                .as_bytes(),
+                .fflonk_snark_wrapper_vk_hash
+                .as_ref()
+                .map(|x| x.as_bytes()),
             id.patch.0 as i32
         )
-        .execute(self.storage.conn())
-        .await
-        .unwrap();
+        .instrument("save_prover_protocol_version")
+        .execute(self.storage)
+        .await?;
+
+        Ok(())
     }
 
     pub async fn vk_commitments_for(
@@ -43,7 +53,8 @@ impl FriProtocolVersionsDal<'_, '_> {
         sqlx::query!(
             r#"
             SELECT
-                recursion_scheduler_level_vk_hash
+                snark_wrapper_vk_hash,
+                fflonk_snark_wrapper_vk_hash
             FROM
                 prover_fri_protocol_versions
             WHERE
@@ -57,9 +68,11 @@ impl FriProtocolVersionsDal<'_, '_> {
         .await
         .unwrap()
         .map(|row| L1VerifierConfig {
-            recursion_scheduler_level_vk_hash: H256::from_slice(
-                &row.recursion_scheduler_level_vk_hash,
-            ),
+            snark_wrapper_vk_hash: H256::from_slice(&row.snark_wrapper_vk_hash),
+            fflonk_snark_wrapper_vk_hash: row
+                .fflonk_snark_wrapper_vk_hash
+                .as_ref()
+                .map(|x| H256::from_slice(x)),
         })
     }
 
@@ -67,7 +80,8 @@ impl FriProtocolVersionsDal<'_, '_> {
         let result = sqlx::query!(
             r#"
             SELECT
-                recursion_scheduler_level_vk_hash
+                snark_wrapper_vk_hash,
+                fflonk_snark_wrapper_vk_hash
             FROM
                 prover_fri_protocol_versions
             ORDER BY
@@ -80,9 +94,11 @@ impl FriProtocolVersionsDal<'_, '_> {
         .await?;
 
         Ok(L1VerifierConfig {
-            recursion_scheduler_level_vk_hash: H256::from_slice(
-                &result.recursion_scheduler_level_vk_hash,
-            ),
+            snark_wrapper_vk_hash: H256::from_slice(&result.snark_wrapper_vk_hash),
+            fflonk_snark_wrapper_vk_hash: result
+                .fflonk_snark_wrapper_vk_hash
+                .as_ref()
+                .map(|x| H256::from_slice(x)),
         })
     }
 

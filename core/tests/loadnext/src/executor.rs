@@ -4,9 +4,8 @@ use anyhow::anyhow;
 use futures::{channel::mpsc, future, SinkExt};
 use zksync_eth_client::Options;
 use zksync_eth_signer::PrivateKeySigner;
-use zksync_system_constants::MAX_L1_TRANSACTION_GAS_LIMIT;
 use zksync_types::{
-    api::BlockNumber, tokens::ETHEREUM_ADDRESS, Address, Nonce,
+    api::BlockNumber, tokens::ETHEREUM_ADDRESS, Address, Nonce, MAX_L1_TRANSACTION_GAS_LIMIT,
     REQUIRED_L1_TO_L2_GAS_PER_PUBDATA_BYTE, U256, U64,
 };
 
@@ -244,7 +243,7 @@ impl Executor {
             });
 
         priority_op_handle
-            .polling_interval(POLLING_INTERVAL)
+            .polling_interval(POLLING_INTERVAL.end)
             .unwrap();
         priority_op_handle
             .commit_timeout(COMMIT_TIMEOUT)
@@ -313,7 +312,7 @@ impl Executor {
             });
 
         priority_op_handle
-            .polling_interval(POLLING_INTERVAL)
+            .polling_interval(POLLING_INTERVAL.end)
             .unwrap();
         priority_op_handle
             .commit_timeout(COMMIT_TIMEOUT)
@@ -400,6 +399,7 @@ impl Executor {
                         )
                         .await
                         .unwrap();
+
                     eth_nonce += U256::one();
                     eth_txs.push(res);
                 }
@@ -428,6 +428,19 @@ impl Executor {
                 }
             }
 
+            let balance = self
+                .pool
+                .master_wallet
+                .get_balance(BlockNumber::Latest, self.l2_main_token)
+                .await?;
+            let necessary_balance =
+                U256::from(self.erc20_transfer_amount() * self.config.accounts_amount as u128);
+
+            tracing::info!(
+                "Master account token balance on l2: {balance:?}, necessary balance \
+                for initial transfers {necessary_balance:?}"
+            );
+
             // And then we will prepare an L2 transaction to send ERC20 token (for transfers and fees).
             let mut builder = master_wallet
                 .start_transfer()
@@ -441,10 +454,8 @@ impl Executor {
                 self.l2_main_token,
                 MIN_ALLOWANCE_FOR_PAYMASTER_ESTIMATE.into(),
             );
-
             let fee = builder.estimate_fee(Some(paymaster_params)).await?;
             builder = builder.fee(fee.clone());
-
             let paymaster_params = get_approval_based_paymaster_input(
                 paymaster_address,
                 self.l2_main_token,
@@ -463,7 +474,7 @@ impl Executor {
         // Wait for transactions to be committed, if at least one of them fails,
         // return error.
         for mut handle in handles {
-            handle.polling_interval(POLLING_INTERVAL).unwrap();
+            handle.polling_interval(POLLING_INTERVAL.end).unwrap();
 
             let result = handle
                 .commit_timeout(COMMIT_TIMEOUT)

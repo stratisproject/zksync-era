@@ -1,4 +1,8 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -6,16 +10,17 @@ use tokio::sync::watch;
 use zksync_dal::{Connection, ConnectionPool, Core, CoreDal};
 use zksync_object_store::ObjectStore;
 use zksync_prover_interface::inputs::VMRunWitnessInputData;
-use zksync_state_keeper::{BatchExecutor, StateKeeperOutputHandler, UpdatesManager};
+use zksync_state::OwnedStorage;
 use zksync_types::{
-    block::StorageOracleInfo, witness_block_state::WitnessStorageState, L1BatchNumber, L2ChainId,
-    H256,
+    block::StorageOracleInfo, bytecode::BytecodeMarker, h256_to_u256, u256_to_h256,
+    witness_block_state::WitnessStorageState, L1BatchNumber, L2ChainId, H256,
 };
-use zksync_utils::{bytes_to_chunks, h256_to_u256, u256_to_h256};
+use zksync_vm_interface::{executor::BatchExecutorFactory, L1BatchEnv, L2BlockEnv, SystemEnv};
 
 use crate::{
     storage::StorageSyncTask, ConcurrentOutputHandlerFactory, ConcurrentOutputHandlerFactoryTask,
-    OutputHandlerFactory, VmRunner, VmRunnerIo, VmRunnerStorage,
+    L1BatchOutput, L2BlockOutput, OutputHandler, OutputHandlerFactory, VmRunner, VmRunnerIo,
+    VmRunnerStorage,
 };
 
 /// A standalone component that retrieves all needed data for basic witness generation and saves it to the bucket
@@ -30,8 +35,8 @@ impl BasicWitnessInputProducer {
     pub async fn new(
         pool: ConnectionPool<Core>,
         object_store: Arc<dyn ObjectStore>,
-        batch_executor: Box<dyn BatchExecutor>,
-        rocksdb_path: String,
+        batch_executor_factory: Box<dyn BatchExecutorFactory<OwnedStorage>>,
+        rocksdb_path: PathBuf,
         chain_id: L2ChainId,
         first_processed_batch: L1BatchNumber,
         window_size: u32,
@@ -50,10 +55,10 @@ impl BasicWitnessInputProducer {
             ConcurrentOutputHandlerFactory::new(pool.clone(), io.clone(), output_handler_factory);
         let vm_runner = VmRunner::new(
             pool,
-            Box::new(io),
+            Arc::new(io),
             Arc::new(loader),
-            Box::new(output_handler_factory),
-            batch_executor,
+            Arc::new(output_handler_factory),
+            batch_executor_factory,
         );
         Ok((
             Self { vm_runner },
@@ -145,30 +150,38 @@ impl VmRunnerIo for BasicWitnessInputProducerIo {
 struct BasicWitnessInputProducerOutputHandler {
     pool: ConnectionPool<Core>,
     object_store: Arc<dyn ObjectStore>,
+    system_env: SystemEnv,
+    l1_batch_number: L1BatchNumber,
 }
 
 #[async_trait]
-impl StateKeeperOutputHandler for BasicWitnessInputProducerOutputHandler {
-    async fn handle_l2_block(&mut self, _updates_manager: &UpdatesManager) -> anyhow::Result<()> {
+impl OutputHandler for BasicWitnessInputProducerOutputHandler {
+    async fn handle_l2_block(
+        &mut self,
+        _env: L2BlockEnv,
+        _output: &L2BlockOutput,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
     #[tracing::instrument(
         name = "BasicWitnessInputProducerOutputHandler::handle_l1_batch",
         skip_all,
-        fields(l1_batch = %updates_manager.l1_batch.number)
+        fields(l1_batch = %self.l1_batch_number)
     )]
-    async fn handle_l1_batch(
-        &mut self,
-        updates_manager: Arc<UpdatesManager>,
-    ) -> anyhow::Result<()> {
-        let l1_batch_number = updates_manager.l1_batch.number;
-        let mut connection = self.pool.connection().await?;
+    async fn handle_l1_batch(self: Box<Self>, output: Arc<L1BatchOutput>) -> anyhow::Result<()> {
+        let l1_batch_number = self.l1_batch_number;
+        let mut connection = self.pool.connection_tagged("bwip").await?;
 
         tracing::info!(%l1_batch_number, "Started saving VM run data");
 
-        let result =
-            get_updates_manager_witness_input_data(&mut connection, updates_manager).await?;
+        let result = get_updates_manager_witness_input_data(
+            &mut connection,
+            &self.system_env,
+            l1_batch_number,
+            &output,
+        )
+        .await?;
 
         assert_database_witness_input_data(&mut connection, l1_batch_number, &result).await;
 
@@ -193,18 +206,14 @@ impl StateKeeperOutputHandler for BasicWitnessInputProducerOutputHandler {
 #[tracing::instrument(skip_all)]
 async fn get_updates_manager_witness_input_data(
     connection: &mut Connection<'_, Core>,
-    updates_manager: Arc<UpdatesManager>,
+    system_env: &SystemEnv,
+    l1_batch_number: L1BatchNumber,
+    output: &L1BatchOutput,
 ) -> anyhow::Result<VMRunWitnessInputData> {
-    let l1_batch_number = updates_manager.l1_batch.number;
-    let finished_batch = updates_manager
-        .l1_batch
-        .finished
-        .clone()
-        .ok_or_else(|| anyhow!("L1 batch {l1_batch_number:?} is not finished"))?;
-
-    let initial_heap_content = finished_batch.final_bootloader_memory.unwrap(); // might be just empty
-    let default_aa = updates_manager.base_system_contract_hashes().default_aa;
-    let bootloader = updates_manager.base_system_contract_hashes().bootloader;
+    let initial_heap_content = output.batch.final_bootloader_memory.clone().unwrap(); // might be just empty
+    let default_aa = system_env.base_system_smart_contracts.hashes().default_aa;
+    let evm_emulator = system_env.base_system_smart_contracts.hashes().evm_emulator;
+    let bootloader = system_env.base_system_smart_contracts.hashes().bootloader;
     let bootloader_code_bytes = connection
         .factory_deps_dal()
         .get_sealed_factory_dep(bootloader)
@@ -218,11 +227,9 @@ async fn get_updates_manager_witness_input_data(
         .get_sealed_factory_dep(default_aa)
         .await?
         .ok_or_else(|| anyhow!("Default account bytecode should exist"))?;
-    let account_bytecode = bytes_to_chunks(&account_bytecode_bytes);
 
-    let hashes: HashSet<H256> = finished_batch
-        .final_execution_state
-        .used_contract_hashes
+    let used_contract_hashes = &output.batch.final_execution_state.used_contract_hashes;
+    let hashes: HashSet<H256> = used_contract_hashes
         .iter()
         // SMA-1555: remove this hack once updated to the latest version of `zkevm_test_harness`
         .filter(|&&hash| hash != h256_to_u256(bootloader))
@@ -232,39 +239,54 @@ async fn get_updates_manager_witness_input_data(
         .factory_deps_dal()
         .get_factory_deps(&hashes)
         .await;
-    if finished_batch
-        .final_execution_state
-        .used_contract_hashes
-        .contains(&account_code_hash)
-    {
-        used_bytecodes.insert(account_code_hash, account_bytecode);
+    if used_contract_hashes.contains(&account_code_hash) {
+        used_bytecodes.insert(account_code_hash, account_bytecode_bytes);
     }
 
-    let storage_refunds = finished_batch.final_execution_state.storage_refunds;
-    let pubdata_costs = finished_batch.final_execution_state.pubdata_costs;
+    let evm_emulator_code_hash = if let Some(evm_emulator) = evm_emulator {
+        let evm_emulator_code_hash = h256_to_u256(evm_emulator);
+        if used_contract_hashes.contains(&evm_emulator_code_hash) {
+            let evm_emulator_bytecode = connection
+                .factory_deps_dal()
+                .get_sealed_factory_dep(evm_emulator)
+                .await?
+                .ok_or_else(|| anyhow!("EVM emulator bytecode should exist"))?;
+            used_bytecodes.insert(evm_emulator_code_hash, evm_emulator_bytecode);
+        }
+        Some(evm_emulator_code_hash)
+    } else {
+        None
+    };
 
-    let storage_view_cache = updates_manager
-        .storage_view_cache()
-        .expect("Storage view cache was not initialized");
-
+    let storage_refunds = output.batch.final_execution_state.storage_refunds.clone();
+    let pubdata_costs = output.batch.final_execution_state.pubdata_costs.clone();
     let witness_block_state = WitnessStorageState {
-        read_storage_key: storage_view_cache.read_storage_keys(),
-        is_write_initial: storage_view_cache.initial_writes(),
+        read_storage_key: output.storage_view_cache.read_storage_keys(),
+        is_write_initial: output.storage_view_cache.initial_writes(),
     };
 
     Ok(VMRunWitnessInputData {
         l1_batch_number,
-        used_bytecodes,
+        used_bytecodes: used_bytecodes
+            .into_iter()
+            .map(|(hash, code)| (hash, bytes_to_chunks(&code)))
+            .collect(),
         initial_heap_content,
-
-        protocol_version: updates_manager.protocol_version(),
-
+        protocol_version: system_env.version,
         bootloader_code,
         default_account_code_hash: account_code_hash,
+        evm_emulator_code_hash,
         storage_refunds,
         pubdata_costs,
         witness_block_state,
     })
+}
+
+fn bytes_to_chunks(bytes: &[u8]) -> Vec<[u8; 32]> {
+    bytes
+        .chunks(32)
+        .map(|chunk| chunk.try_into().unwrap())
+        .collect()
 }
 
 #[tracing::instrument(skip_all)]
@@ -294,7 +316,6 @@ async fn assert_database_witness_input_data(
         .await
         .expect("Failed fetching default account bytecode from DB")
         .expect("Default account bytecode should exist");
-    let account_bytecode = bytes_to_chunks(&account_bytecode_bytes);
 
     let hashes: HashSet<H256> = block_header
         .used_contract_hashes
@@ -311,15 +332,26 @@ async fn assert_database_witness_input_data(
         .used_contract_hashes
         .contains(&account_code_hash)
     {
-        used_bytecodes.insert(account_code_hash, account_bytecode);
+        used_bytecodes.insert(account_code_hash, account_bytecode_bytes);
     }
 
-    assert_eq!(
-        hashes.len(),
-        used_bytecodes.len(),
-        "{} factory deps are not found in DB",
-        hashes.len() - used_bytecodes.len()
-    );
+    for hash in hashes {
+        // EVM bytecodes will be extracted from VM during witness generation
+        // We skip EVM bytecodes that are not published (tx with deployment reverted)
+        if BytecodeMarker::new(hash).expect("Failed to get bytecode marker") != BytecodeMarker::Evm
+        {
+            assert!(
+                used_bytecodes.contains_key(&h256_to_u256(hash)),
+                "{} factory dependency is not found in DB",
+                hash
+            );
+        }
+    }
+
+    let used_bytecodes: HashMap<_, _> = used_bytecodes
+        .into_iter()
+        .map(|(hash, code)| (hash, bytes_to_chunks(&code)))
+        .collect();
 
     let StorageOracleInfo {
         storage_refunds,
@@ -388,12 +420,15 @@ struct BasicWitnessInputProducerOutputHandlerFactory {
 #[async_trait]
 impl OutputHandlerFactory for BasicWitnessInputProducerOutputHandlerFactory {
     async fn create_handler(
-        &mut self,
-        _l1_batch_number: L1BatchNumber,
-    ) -> anyhow::Result<Box<dyn StateKeeperOutputHandler>> {
+        &self,
+        system_env: SystemEnv,
+        l1_batch_env: L1BatchEnv,
+    ) -> anyhow::Result<Box<dyn OutputHandler>> {
         Ok(Box::new(BasicWitnessInputProducerOutputHandler {
             pool: self.pool.clone(),
             object_store: self.object_store.clone(),
+            system_env,
+            l1_batch_number: l1_batch_env.number,
         }))
     }
 }

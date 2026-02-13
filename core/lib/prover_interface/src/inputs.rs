@@ -2,13 +2,11 @@ use std::{collections::HashMap, convert::TryInto, fmt::Debug};
 
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
-use zksync_multivm::interface::{L1BatchEnv, SystemEnv};
-use zksync_object_store::{serialize_using_bincode, Bucket, StoredObject};
+use zksync_object_store::{Bucket, StoredObject, _reexports::BoxedError};
 use zksync_types::{
-    basic_fri_types::Eip4844Blobs, block::L2BlockExecutionData,
-    witness_block_state::WitnessStorageState, L1BatchNumber, ProtocolVersionId, H256, U256,
+    basic_fri_types::Eip4844Blobs, witness_block_state::WitnessStorageState, L1BatchId,
+    L1BatchNumber, ProtocolVersionId, H256, U256,
 };
-
 const HASH_LEN: usize = H256::len_bytes();
 
 /// Metadata emitted by a Merkle tree after processing single storage log.
@@ -65,8 +63,8 @@ impl StorageLogMetadata {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WitnessInputMerklePaths {
     // Merkle paths and some auxiliary information for each read / write operation in a block.
-    merkle_paths: Vec<StorageLogMetadata>,
-    next_enumeration_index: u64,
+    pub merkle_paths: Vec<StorageLogMetadata>,
+    pub(crate) next_enumeration_index: u64,
 }
 
 impl StoredObject for WitnessInputMerklePaths {
@@ -74,10 +72,26 @@ impl StoredObject for WitnessInputMerklePaths {
     type Key<'a> = L1BatchNumber;
 
     fn encode_key(key: Self::Key<'_>) -> String {
-        format!("merkel_tree_paths_{key}.bin")
+        format!("merkle_tree_paths_{key}.cbor")
     }
 
-    serialize_using_bincode!();
+    fn serialize(&self) -> Result<Vec<u8>, BoxedError> {
+        let mut buf = Vec::new();
+
+        ciborium::into_writer(self, &mut buf).map_err(|e| {
+            BoxedError::from(format!("Failed to serialize WitnessInputMerklePaths: {e}"))
+        })?;
+
+        Ok(buf)
+    }
+
+    fn deserialize(bytes: Vec<u8>) -> Result<Self, BoxedError> {
+        ciborium::from_reader(&bytes[..]).map_err(|e| {
+            BoxedError::from(format!(
+                "Failed to deserialize WitnessInputMerklePaths: {e}"
+            ))
+        })
+    }
 }
 
 impl WitnessInputMerklePaths {
@@ -136,7 +150,7 @@ impl WitnessInputMerklePaths {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VMRunWitnessInputData {
     pub l1_batch_number: L1BatchNumber,
     pub used_bytecodes: HashMap<U256, Vec<[u8; 32]>>,
@@ -144,6 +158,8 @@ pub struct VMRunWitnessInputData {
     pub protocol_version: ProtocolVersionId,
     pub bootloader_code: Vec<[u8; 32]>,
     pub default_account_code_hash: U256,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evm_emulator_code_hash: Option<U256>,
     pub storage_refunds: Vec<u32>,
     pub pubdata_costs: Vec<i32>,
     pub witness_block_state: WitnessStorageState,
@@ -155,13 +171,28 @@ impl StoredObject for VMRunWitnessInputData {
     type Key<'a> = L1BatchNumber;
 
     fn encode_key(key: Self::Key<'_>) -> String {
-        format!("vm_run_data_{key}.bin")
+        format!("vm_run_data_{key}.cbor")
     }
 
-    serialize_using_bincode!();
+    fn serialize(&self) -> Result<Vec<u8>, BoxedError> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf).map_err(|e| {
+            BoxedError::from(format!("Failed to serialize VMRunWitnessInputData: {e}"))
+        })?;
+
+        Ok(buf)
+    }
+
+    fn deserialize(bytes: Vec<u8>) -> Result<Self, BoxedError> {
+        ciborium::from_reader(&bytes[..])
+            .map_err(|e| {
+                BoxedError::from(format!("Failed to deserialize VMRunWitnessInputData: {e}"))
+            })
+            .map(|data: Self| data)
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WitnessInputData {
     pub vm_run_data: VMRunWitnessInputData,
     pub merkle_paths: WitnessInputMerklePaths,
@@ -172,75 +203,68 @@ pub struct WitnessInputData {
 impl StoredObject for WitnessInputData {
     const BUCKET: Bucket = Bucket::WitnessInput;
 
-    type Key<'a> = L1BatchNumber;
+    type Key<'a> = L1BatchId;
 
-    fn encode_key(key: Self::Key<'_>) -> String {
-        format!("witness_inputs_{key}.bin")
+    fn fallback_key(key: Self::Key<'_>) -> Option<String> {
+        Some(format!(
+            "witness_inputs_{batch_number}.cbor",
+            batch_number = key.batch_number().0
+        ))
     }
 
-    serialize_using_bincode!();
+    fn encode_key(key: Self::Key<'_>) -> String {
+        format!(
+            "witness_inputs_{batch_number}_{chain_id}.cbor",
+            batch_number = key.batch_number().0,
+            chain_id = key.chain_id().inner()
+        )
+    }
+
+    fn serialize(&self) -> Result<Vec<u8>, BoxedError> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf)
+            .map_err(|e| BoxedError::from(format!("Failed to serialize WitnessInputData: {e}")))?;
+
+        Ok(buf)
+    }
+
+    fn deserialize(bytes: Vec<u8>) -> Result<Self, BoxedError> {
+        ciborium::from_reader(&bytes[..])
+            .map_err(|e| BoxedError::from(format!("Failed to deserialize WitnessInputData: {e}")))
+            .map(|data: Self| data)
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicWitnessInputData(WitnessInputData);
+
+impl PublicWitnessInputData {
+    pub fn new(witness_input_data: WitnessInputData) -> Self {
+        Self(witness_input_data)
+    }
+}
+
+impl StoredObject for PublicWitnessInputData {
+    const BUCKET: Bucket = Bucket::PublicWitnessInputs;
+    type Key<'a> = L1BatchId;
+
+    fn encode_key(key: Self::Key<'_>) -> String {
+        WitnessInputData::encode_key(key)
+    }
+
+    fn serialize(&self) -> Result<Vec<u8>, BoxedError> {
+        <WitnessInputData as StoredObject>::serialize(&self.0)
+    }
+
+    fn deserialize(bytes: Vec<u8>) -> Result<Self, BoxedError> {
+        <WitnessInputData as StoredObject>::deserialize(bytes).map(Self)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct L1BatchMetadataHashes {
     pub root_hash: H256,
     pub meta_hash: H256,
     pub aux_hash: H256,
-}
-
-/// Version 1 of the data used as input for the TEE verifier.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct V1TeeVerifierInput {
-    pub witness_input_merkle_paths: WitnessInputMerklePaths,
-    pub l2_blocks_execution_data: Vec<L2BlockExecutionData>,
-    pub l1_batch_env: L1BatchEnv,
-    pub system_env: SystemEnv,
-    pub used_contracts: Vec<(H256, Vec<u8>)>,
-}
-
-impl V1TeeVerifierInput {
-    pub fn new(
-        witness_input_merkle_paths: WitnessInputMerklePaths,
-        l2_blocks_execution_data: Vec<L2BlockExecutionData>,
-        l1_batch_env: L1BatchEnv,
-        system_env: SystemEnv,
-        used_contracts: Vec<(H256, Vec<u8>)>,
-    ) -> Self {
-        V1TeeVerifierInput {
-            witness_input_merkle_paths,
-            l2_blocks_execution_data,
-            l1_batch_env,
-            system_env,
-            used_contracts,
-        }
-    }
-}
-
-/// Data used as input for the TEE verifier.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[non_exhaustive]
-#[allow(clippy::large_enum_variant)]
-pub enum TeeVerifierInput {
-    /// `V0` suppresses warning about irrefutable `let...else` pattern
-    V0,
-    V1(V1TeeVerifierInput),
-}
-
-impl TeeVerifierInput {
-    pub fn new(input: V1TeeVerifierInput) -> Self {
-        TeeVerifierInput::V1(input)
-    }
-}
-
-impl StoredObject for TeeVerifierInput {
-    const BUCKET: Bucket = Bucket::TeeVerifierInput;
-    type Key<'a> = L1BatchNumber;
-
-    fn encode_key(key: Self::Key<'_>) -> String {
-        format!("tee_verifier_input_for_l1_batch_{key}.bin")
-    }
-
-    serialize_using_bincode!();
 }
 
 #[cfg(test)]

@@ -17,7 +17,7 @@ fn run_test(test_name: &str) {
     let contents = read_to_string(format!("src/commitment/tests/{test_name}.json")).unwrap();
     let commitment_test: CommitmentTest = serde_json::from_str(&contents).unwrap();
 
-    let commitment = L1BatchCommitment::new(commitment_test.input);
+    let commitment = L1BatchCommitment::new(commitment_test.input, true).unwrap();
 
     assert_eq!(
         commitment.pass_through_data,
@@ -28,7 +28,7 @@ fn run_test(test_name: &str) {
         commitment.auxiliary_output,
         commitment_test.auxiliary_output
     );
-    assert_eq!(commitment.hash(), commitment_test.hashes);
+    assert_eq!(commitment.hash().unwrap(), commitment_test.hashes);
 }
 
 #[test]
@@ -49,4 +49,14 @@ fn post_boojum_1_4_2() {
 #[test]
 fn post_boojum_1_5_0() {
     run_test("post_boojum_1_5_0_test");
+}
+
+#[test]
+fn post_boojum_1_5_0_with_evm() {
+    run_test("post_boojum_1_5_0_test_with_evm");
+}
+
+#[test]
+fn post_gateway() {
+    run_test("post_gateway_test");
 }

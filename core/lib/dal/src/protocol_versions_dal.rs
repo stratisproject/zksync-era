@@ -1,7 +1,7 @@
 use std::convert::TryInto;
 
 use anyhow::Context as _;
-use zksync_contracts::{BaseSystemContracts, BaseSystemContractsHashes};
+use zksync_contracts::BaseSystemContractsHashes;
 use zksync_db_connection::{
     connection::Connection,
     error::DalResult,
@@ -40,22 +40,27 @@ impl ProtocolVersionsDal<'_, '_> {
         sqlx::query!(
             r#"
             INSERT INTO
-                protocol_versions (
-                    id,
-                    timestamp,
-                    bootloader_code_hash,
-                    default_account_code_hash,
-                    upgrade_tx_hash,
-                    created_at
-                )
+            protocol_versions (
+                id,
+                timestamp,
+                bootloader_code_hash,
+                default_account_code_hash,
+                evm_emulator_code_hash,
+                upgrade_tx_hash,
+                created_at
+            )
             VALUES
-                ($1, $2, $3, $4, $5, NOW())
+            ($1, $2, $3, $4, $5, $6, NOW())
             ON CONFLICT DO NOTHING
             "#,
             version.minor as i32,
             timestamp as i64,
             base_system_contracts_hashes.bootloader.as_bytes(),
             base_system_contracts_hashes.default_aa.as_bytes(),
+            base_system_contracts_hashes
+                .evm_emulator
+                .as_ref()
+                .map(H256::as_bytes),
             tx_hash.as_ref().map(H256::as_bytes),
         )
         .instrument("save_protocol_version#minor")
@@ -71,16 +76,24 @@ impl ProtocolVersionsDal<'_, '_> {
         sqlx::query!(
             r#"
             INSERT INTO
-                protocol_patches (minor, patch, recursion_scheduler_level_vk_hash, created_at)
+            protocol_patches (
+                minor,
+                patch,
+                snark_wrapper_vk_hash,
+                fflonk_snark_wrapper_vk_hash,
+                created_at
+            )
             VALUES
-                ($1, $2, $3, NOW())
+            ($1, $2, $3, $4, NOW())
             ON CONFLICT DO NOTHING
             "#,
             version.minor as i32,
             version.patch.0 as i32,
+            l1_verifier_config.snark_wrapper_vk_hash.as_bytes(),
             l1_verifier_config
-                .recursion_scheduler_level_vk_hash
-                .as_bytes(),
+                .fflonk_snark_wrapper_vk_hash
+                .as_ref()
+                .map(|x| x.as_bytes()),
         )
         .instrument("save_protocol_version#patch")
         .with_arg("version", &version)
@@ -187,36 +200,36 @@ impl ProtocolVersionsDal<'_, '_> {
         ProtocolVersionId::try_from(row.id as u16).map_err(|err| sqlx::Error::Decode(err.into()))
     }
 
-    pub async fn load_base_system_contracts_by_version_id(
+    /// Returns base system contracts' hashes.
+    pub async fn get_base_system_contract_hashes_by_version_id(
         &mut self,
-        version_id: u16,
-    ) -> anyhow::Result<Option<BaseSystemContracts>> {
+        version_id: ProtocolVersionId,
+    ) -> anyhow::Result<Option<BaseSystemContractsHashes>> {
         let row = sqlx::query!(
             r#"
             SELECT
                 bootloader_code_hash,
-                default_account_code_hash
+                default_account_code_hash,
+                evm_emulator_code_hash
             FROM
                 protocol_versions
             WHERE
                 id = $1
             "#,
-            i32::from(version_id)
+            i32::from(version_id as u16)
         )
-        .fetch_optional(self.storage.conn())
+        .instrument("get_base_system_contract_hashes_by_version_id")
+        .with_arg("version_id", &(version_id as u16))
+        .fetch_optional(self.storage)
         .await
         .context("cannot fetch system contract hashes")?;
 
         Ok(if let Some(row) = row {
-            let contracts = self
-                .storage
-                .factory_deps_dal()
-                .get_base_system_contracts(
-                    H256::from_slice(&row.bootloader_code_hash),
-                    H256::from_slice(&row.default_account_code_hash),
-                )
-                .await?;
-            Some(contracts)
+            Some(BaseSystemContractsHashes {
+                bootloader: H256::from_slice(&row.bootloader_code_hash),
+                default_aa: H256::from_slice(&row.default_account_code_hash),
+                evm_emulator: row.evm_emulator_code_hash.as_deref().map(H256::from_slice),
+            })
         } else {
             None
         })
@@ -234,11 +247,13 @@ impl ProtocolVersionsDal<'_, '_> {
                 protocol_versions.timestamp,
                 protocol_versions.bootloader_code_hash,
                 protocol_versions.default_account_code_hash,
+                protocol_versions.evm_emulator_code_hash,
                 protocol_patches.patch,
-                protocol_patches.recursion_scheduler_level_vk_hash
+                protocol_patches.snark_wrapper_vk_hash,
+                protocol_patches.fflonk_snark_wrapper_vk_hash
             FROM
                 protocol_versions
-                JOIN protocol_patches ON protocol_patches.minor = protocol_versions.id
+            JOIN protocol_patches ON protocol_patches.minor = protocol_versions.id
             WHERE
                 id = $1
             ORDER BY
@@ -268,7 +283,8 @@ impl ProtocolVersionsDal<'_, '_> {
         let row = sqlx::query!(
             r#"
             SELECT
-                recursion_scheduler_level_vk_hash
+                snark_wrapper_vk_hash,
+                fflonk_snark_wrapper_vk_hash
             FROM
                 protocol_patches
             WHERE
@@ -282,16 +298,18 @@ impl ProtocolVersionsDal<'_, '_> {
         .await
         .unwrap()?;
         Some(L1VerifierConfig {
-            recursion_scheduler_level_vk_hash: H256::from_slice(
-                &row.recursion_scheduler_level_vk_hash,
-            ),
+            snark_wrapper_vk_hash: H256::from_slice(&row.snark_wrapper_vk_hash),
+            fflonk_snark_wrapper_vk_hash: row
+                .fflonk_snark_wrapper_vk_hash
+                .as_ref()
+                .map(|x| H256::from_slice(x)),
         })
     }
 
     pub async fn get_patch_versions_for_vk(
         &mut self,
         minor_version: ProtocolVersionId,
-        recursion_scheduler_level_vk_hash: H256,
+        snark_wrapper_vk_hash: H256,
     ) -> DalResult<Vec<VersionPatch>> {
         let rows = sqlx::query!(
             r#"
@@ -301,12 +319,12 @@ impl ProtocolVersionsDal<'_, '_> {
                 protocol_patches
             WHERE
                 minor = $1
-                AND recursion_scheduler_level_vk_hash = $2
+                AND snark_wrapper_vk_hash = $2
             ORDER BY
                 patch DESC
             "#,
             minor_version as i32,
-            recursion_scheduler_level_vk_hash.as_bytes()
+            snark_wrapper_vk_hash.as_bytes()
         )
         .instrument("get_patch_versions_for_vk")
         .fetch_all(self.storage)
@@ -377,6 +395,8 @@ impl ProtocolVersionsDal<'_, '_> {
                 protocol_version
             FROM
                 l1_batches
+            WHERE
+                is_sealed
             ORDER BY
                 number DESC
             LIMIT

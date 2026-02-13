@@ -1,10 +1,11 @@
-use std::{
-    fs::File,
-    path::{Path, PathBuf},
-};
+use std::{fs::File, path::PathBuf};
 
+use zksync_config::{
+    configs::{L1Secrets, PostgresSecrets},
+    ContractsConfig, PostgresConfig,
+};
 use zksync_types::ethabi::Contract;
-use zksync_utils::locate_workspace;
+use zksync_utils::env::Workspace;
 
 const ZKSYNC_HYPERCHAIN_CONTRACT_FILE: &str =
     "contracts/l1-contracts/artifacts/contracts/state-transition/chain-interfaces/IZkSyncHyperchain.sol/IZkSyncHyperchain.json";
@@ -27,21 +28,28 @@ fn read_file_to_json_value(path: &PathBuf) -> serde_json::Value {
 }
 
 fn load_contract_if_present(path: &str) -> Contract {
-    let home = core_workspace_dir_or_current_dir();
-    let path = Path::new(&home).join(path);
-    path.exists()
-        .then(|| {
+    let path = Workspace::locate().root().join(path);
+    if path.exists() {
+        {
             serde_json::from_value(read_file_to_json_value(&path)["abi"].take()).unwrap_or_else(
                 |e| panic!("Failed to parse contract abi from file {:?}: {}", path, e),
             )
-        })
-        .unwrap_or_else(|| {
+        }
+    } else {
+        {
             panic!("Failed to load contract from {:?}", path);
-        })
+        }
+    }
 }
 
-pub fn core_workspace_dir_or_current_dir() -> PathBuf {
-    locate_workspace()
-        .map(|a| a.join(".."))
-        .unwrap_or_else(|| PathBuf::from("."))
+// FIXME
+pub(crate) trait FromEnvButReallyJustExplode: Sized {
+    fn from_env() -> anyhow::Result<Self> {
+        anyhow::bail!("I thought we got rid of env-based configs, so what's this then?");
+    }
 }
+
+impl FromEnvButReallyJustExplode for PostgresConfig {}
+impl FromEnvButReallyJustExplode for ContractsConfig {}
+impl FromEnvButReallyJustExplode for PostgresSecrets {}
+impl FromEnvButReallyJustExplode for L1Secrets {}

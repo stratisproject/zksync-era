@@ -1,20 +1,16 @@
-use std::{fmt, ops};
-
 use serde::{Deserialize, Serialize};
-use zksync_basic_types::{Address, Bloom, BloomInput, H256, U256};
+use zksync_basic_types::{commitment::PubdataParams, Address, Bloom, BloomInput, H256, U256};
 use zksync_contracts::BaseSystemContractsHashes;
 use zksync_system_constants::SYSTEM_BLOCK_INFO_BLOCK_NUMBER_MULTIPLIER;
-use zksync_utils::concat_and_hash;
 
 use crate::{
     fee_model::BatchFeeInput,
     l2_to_l1_log::{SystemL2ToL1Log, UserL2ToL1Log},
     priority_op_onchain_data::PriorityOpOnchainData,
-    web3::keccak256,
-    AccountTreeId, L1BatchNumber, L2BlockNumber, ProtocolVersionId, Transaction,
+    web3::{keccak256, keccak256_concat},
+    AccountTreeId, InteropRoot, L1BatchNumber, L2BlockNumber, ProtocolVersionId, Transaction,
 };
 
-/// Represents a successfully deployed smart contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeployedContract {
     pub account_id: AccountTreeId,
@@ -30,12 +26,35 @@ impl DeployedContract {
     }
 }
 
-/// Holder for l1 batches data, used in eth sender metrics
-pub struct L1BatchStatistics {
-    pub number: L1BatchNumber,
+/// Holder for l1 batches or l2 blocks data.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CommonBlockStatistics {
+    pub number: u32,
     pub timestamp: u64,
     pub l2_tx_count: u32,
     pub l1_tx_count: u32,
+}
+
+impl From<L1BatchHeader> for CommonBlockStatistics {
+    fn from(header: L1BatchHeader) -> Self {
+        Self {
+            number: header.number.0,
+            timestamp: header.timestamp,
+            l1_tx_count: header.l1_tx_count.into(),
+            l2_tx_count: header.l2_tx_count.into(),
+        }
+    }
+}
+
+impl From<L2BlockHeader> for CommonBlockStatistics {
+    fn from(header: L2BlockHeader) -> Self {
+        Self {
+            number: header.number.0,
+            timestamp: header.timestamp,
+            l1_tx_count: header.l1_tx_count.into(),
+            l2_tx_count: header.l2_tx_count.into(),
+        }
+    }
 }
 
 /// Holder for the block metadata that is not available from transactions themselves.
@@ -65,6 +84,44 @@ pub struct L1BatchHeader {
     /// Version of protocol used for the L1 batch.
     pub protocol_version: Option<ProtocolVersionId>,
     pub pubdata_input: Option<Vec<u8>>,
+    pub fee_address: Address,
+    pub batch_fee_input: BatchFeeInput,
+    pub pubdata_limit: Option<u64>,
+}
+
+impl L1BatchHeader {
+    pub fn to_unsealed_header(&self) -> UnsealedL1BatchHeader {
+        UnsealedL1BatchHeader {
+            number: self.number,
+            timestamp: self.timestamp,
+            protocol_version: self.protocol_version,
+            fee_address: self.fee_address,
+            fee_input: self.batch_fee_input,
+            pubdata_limit: self.pubdata_limit,
+        }
+    }
+}
+
+/// Holder for the metadata that is relevant for unsealed batches.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnsealedL1BatchHeader {
+    pub number: L1BatchNumber,
+    pub timestamp: u64,
+    pub protocol_version: Option<ProtocolVersionId>,
+    pub fee_address: Address,
+    pub fee_input: BatchFeeInput,
+    pub pubdata_limit: Option<u64>,
+}
+
+/// Holder for the metadata that is relevant for both sealed and unsealed batches.
+pub struct CommonL1BatchHeader {
+    pub number: L1BatchNumber,
+    pub is_sealed: bool,
+    pub timestamp: u64,
+    pub protocol_version: Option<ProtocolVersionId>,
+    pub fee_address: Address,
+    pub fee_input: BatchFeeInput,
+    pub pubdata_limit: Option<u64>,
 }
 
 /// Holder for the L2 block metadata that is not available from transactions themselves.
@@ -91,6 +148,8 @@ pub struct L2BlockHeader {
     /// amount of gas can be spent on pubdata.
     pub gas_limit: u64,
     pub logs_bloom: Bloom,
+    pub pubdata_params: PubdataParams,
+    pub rolling_txs_hash: Option<H256>,
 }
 
 /// Structure that represents the data is returned by the storage oracle during batch execution.
@@ -109,6 +168,7 @@ pub struct L2BlockExecutionData {
     pub prev_block_hash: H256,
     pub virtual_blocks: u32,
     pub txs: Vec<Transaction>,
+    pub interop_roots: Vec<InteropRoot>,
 }
 
 impl L1BatchHeader {
@@ -132,6 +192,9 @@ impl L1BatchHeader {
             system_logs: vec![],
             protocol_version: Some(protocol_version),
             pubdata_input: Some(vec![]),
+            fee_address: Default::default(),
+            batch_fee_input: BatchFeeInput::pubdata_independent(0, 0, 0),
+            pubdata_limit: (protocol_version >= ProtocolVersionId::Version29).then_some(0),
         }
     }
 
@@ -151,51 +214,6 @@ impl L1BatchHeader {
 
     pub fn tx_count(&self) -> usize {
         (self.l1_tx_count + self.l2_tx_count) as usize
-    }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq, Default)]
-pub struct BlockGasCount {
-    pub commit: u32,
-    pub prove: u32,
-    pub execute: u32,
-}
-
-impl fmt::Debug for BlockGasCount {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "c:{}/p:{}/e:{}",
-            self.commit, self.prove, self.execute
-        )
-    }
-}
-
-impl BlockGasCount {
-    pub fn any_field_greater_than(&self, bound: u32) -> bool {
-        self.commit > bound || self.prove > bound || self.execute > bound
-    }
-}
-
-impl ops::Add for BlockGasCount {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        Self {
-            commit: self.commit + rhs.commit,
-            prove: self.prove + rhs.prove,
-            execute: self.execute + rhs.execute,
-        }
-    }
-}
-
-impl ops::AddAssign for BlockGasCount {
-    fn add_assign(&mut self, other: Self) {
-        *self = Self {
-            commit: self.commit + other.commit,
-            prove: self.prove + other.prove,
-            execute: self.execute + other.execute,
-        };
     }
 }
 
@@ -229,7 +247,7 @@ impl L2BlockHasher {
     /// Updates this hasher with a transaction hash. This should be called for all transactions in the block
     /// in the order of their execution.
     pub fn push_tx_hash(&mut self, tx_hash: H256) {
-        self.txs_rolling_hash = concat_and_hash(self.txs_rolling_hash, tx_hash);
+        self.txs_rolling_hash = keccak256_concat(self.txs_rolling_hash, tx_hash);
     }
 
     /// Returns the hash of the L2 block.

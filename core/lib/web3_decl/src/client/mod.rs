@@ -41,6 +41,7 @@ pub use self::{
     network::{ForWeb3Network, Network, TaggedClient, L1, L2},
     shared::Shared,
 };
+use crate::client::metrics::{ClientLabels, INFO_METRICS};
 
 mod boxed;
 mod metrics;
@@ -175,11 +176,7 @@ impl<Net: Network, C: ClientBase> Client<Net, C> {
         let network_label = self.network.metric_label();
         let stats = match rate_limit_result {
             Err(_) => {
-                self.metrics.observe_rate_limit_timeout(
-                    &network_label,
-                    self.component_name,
-                    origin,
-                );
+                self.metrics.observe_rate_limit_timeout(origin);
                 tracing::warn!(
                     network = network_label,
                     component = self.component_name,
@@ -195,12 +192,7 @@ impl<Net: Network, C: ClientBase> Client<Net, C> {
             Ok(stats) => stats,
         };
 
-        self.metrics.observe_rate_limit_latency(
-            &network_label,
-            self.component_name,
-            origin,
-            &stats,
-        );
+        self.metrics.observe_rate_limit_latency(origin, &stats);
         tracing::debug!(
             network = network_label,
             component = self.component_name,
@@ -220,8 +212,12 @@ impl<Net: Network, C: ClientBase> Client<Net, C> {
     ) -> Result<T, Error> {
         if let Err(err) = &call_result {
             let network_label = self.network.metric_label();
-            self.metrics
-                .observe_error(&network_label, self.component_name, origin, err);
+            let span = tracing::warn_span!(
+                "observe_error",
+                network = network_label,
+                component = self.component_name
+            );
+            span.in_scope(|| self.metrics.observe_error(origin, err));
         }
         call_result
     }
@@ -242,6 +238,10 @@ impl<Net: Network, C: ClientBase> ForWeb3Network for Client<Net, C> {
 impl<Net: Network, C: ClientBase> TaggedClient for Client<Net, C> {
     fn set_component(&mut self, component_name: &'static str) {
         self.component_name = component_name;
+        self.metrics = &METRICS[&ClientLabels {
+            network: self.network.metric_label(),
+            component: component_name,
+        }];
     }
 }
 
@@ -318,6 +318,7 @@ pub struct ClientBuilder<Net, C = HttpClient> {
     client: C,
     url: SensitiveUrl,
     rate_limit: (usize, Duration),
+    report_config: bool,
     network: Net,
 }
 
@@ -328,6 +329,7 @@ impl<Net: fmt::Debug, C: 'static> fmt::Debug for ClientBuilder<Net, C> {
             .field("client", &any::type_name::<C>())
             .field("url", &self.url)
             .field("rate_limit", &self.rate_limit)
+            .field("report_config", &self.report_config)
             .field("network", &self.network)
             .finish_non_exhaustive()
     }
@@ -340,6 +342,7 @@ impl<Net: Network, C: ClientBase> ClientBuilder<Net, C> {
             client,
             url,
             rate_limit: (1, Duration::ZERO),
+            report_config: true,
             network: Net::default(),
         }
     }
@@ -366,23 +369,35 @@ impl<Net: Network, C: ClientBase> ClientBuilder<Net, C> {
         self
     }
 
+    /// Allows switching off config reporting for this client in logs and metrics. This is useful if a client is a short-living one
+    /// and is not injected as a dependency.
+    pub fn report_config(mut self, report: bool) -> Self {
+        self.report_config = report;
+        self
+    }
+
     /// Builds the client.
     pub fn build(self) -> Client<Net, C> {
-        tracing::info!(
-            "Creating JSON-RPC client for network {:?} with inner client: {:?} and rate limit: {:?}",
-            self.network,
-            self.client,
-            self.rate_limit
-        );
         let rate_limit = SharedRateLimit::new(self.rate_limit.0, self.rate_limit.1);
-        METRICS.observe_config(self.network.metric_label(), &rate_limit);
+        if self.report_config {
+            tracing::info!(
+                "Creating JSON-RPC client for network {:?} with inner client: {:?} and rate limit: {:?}",
+                self.network,
+                self.client,
+                self.rate_limit
+            );
+            INFO_METRICS.observe_config(self.network.metric_label(), &rate_limit);
+        }
 
         Client {
             inner: self.client,
             url: self.url,
             rate_limit,
             component_name: "",
-            metrics: &METRICS,
+            metrics: &METRICS[&ClientLabels {
+                network: self.network.metric_label(),
+                component: "",
+            }],
             network: self.network,
         }
     }

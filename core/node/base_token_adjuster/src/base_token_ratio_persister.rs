@@ -1,36 +1,70 @@
-use std::{cmp::max, fmt::Debug, sync::Arc, time::Duration};
+use std::{fmt::Debug, num::NonZeroU64, sync::Arc, time::Instant};
 
 use anyhow::Context as _;
 use tokio::{sync::watch, time::sleep};
 use zksync_config::configs::base_token_adjuster::BaseTokenAdjusterConfig;
 use zksync_dal::{ConnectionPool, Core, CoreDal};
-use zksync_eth_client::{BoundEthInterface, Options};
-use zksync_external_price_api::PriceAPIClient;
-use zksync_node_fee_model::l1_gas_price::TxParamsProvider;
+use zksync_external_price_api::{APIToken, PriceApiClient};
 use zksync_types::{
-    base_token_ratio::BaseTokenAPIRatio,
-    ethabi::{Contract, Token},
-    web3::{contract::Tokenize, BlockNumber},
-    Address, U256,
+    base_token_ratio::BaseTokenApiRatio,
+    fee_model::{BaseTokenConversionRatio, ConversionRatio},
 };
 
-#[derive(Debug, Clone)]
-pub struct BaseTokenRatioPersisterL1Params {
-    pub eth_client: Box<dyn BoundEthInterface>,
-    pub gas_adjuster: Arc<dyn TxParamsProvider>,
-    pub token_multiplier_setter_account_address: Address,
-    pub chain_admin_contract: Contract,
-    pub diamond_proxy_contract_address: Address,
-    pub chain_admin_contract_address: Option<Address>,
+use crate::{
+    base_token_l1_behaviour::BaseTokenL1Behaviour,
+    metrics::{OperationResult, OperationResultLabels, METRICS},
+};
+
+/// When multiplying naivly to ratios based on u64 we can overflow. This function
+/// scales down the ratios to prevent overflow (effectively loosing some precision).
+/// In rare cases it may not be possible to sensible scale down (if ratio would be
+/// more then 2^64 or less then 2^-64). In such cases we return an error.
+fn safe_u64_fraction_mul(
+    a: BaseTokenApiRatio,
+    b: BaseTokenApiRatio,
+) -> anyhow::Result<BaseTokenApiRatio> {
+    let numerator = a.ratio.numerator.get() as u128 * b.ratio.numerator.get() as u128;
+    let denominator = a.ratio.denominator.get() as u128 * b.ratio.denominator.get() as u128;
+
+    // We need to scale if numerator or denominator is bigger then u64.
+    // If not the scaling factor is zero and does nothing
+    let scaling_power = 64_u32.saturating_sub(numerator.max(denominator).leading_zeros());
+
+    // Scale down both values
+    let scaled_numerator = numerator >> scaling_power;
+    let scaled_denominator = denominator >> scaling_power;
+
+    // Ensure we don't have zeros after division
+    let safe_numerator = NonZeroU64::new(
+        scaled_numerator
+            .try_into()
+            .context(anyhow::anyhow!("Bad numerator after scaling down"))?,
+    )
+    .ok_or(anyhow::anyhow!("Scaled down numerator is zero"))?;
+    let safe_denominator = NonZeroU64::new(
+        scaled_denominator
+            .try_into()
+            .context(anyhow::anyhow!("Bad denominator after scaling down"))?,
+    )
+    .ok_or(anyhow::anyhow!("Scaled down denominator is zero"))?;
+
+    Ok(BaseTokenApiRatio {
+        ratio: ConversionRatio {
+            numerator: safe_numerator,
+            denominator: safe_denominator,
+        },
+        ratio_timestamp: a.ratio_timestamp.max(b.ratio_timestamp),
+    })
 }
 
 #[derive(Debug, Clone)]
 pub struct BaseTokenRatioPersister {
     pool: ConnectionPool<Core>,
     config: BaseTokenAdjusterConfig,
-    base_token_address: Address,
-    price_api_client: Arc<dyn PriceAPIClient>,
-    l1_params: Option<BaseTokenRatioPersisterL1Params>,
+    base_token: APIToken,
+    sl_token: APIToken,
+    price_api_client: Arc<dyn PriceApiClient>,
+    l1_behaviour: BaseTokenL1Behaviour,
 }
 
 impl BaseTokenRatioPersister {
@@ -38,23 +72,25 @@ impl BaseTokenRatioPersister {
     pub fn new(
         pool: ConnectionPool<Core>,
         config: BaseTokenAdjusterConfig,
-        base_token_address: Address,
-        price_api_client: Arc<dyn PriceAPIClient>,
-        l1_params: Option<BaseTokenRatioPersisterL1Params>,
+        base_token: APIToken,
+        sl_token: APIToken,
+        price_api_client: Arc<dyn PriceApiClient>,
+        l1_behaviour: BaseTokenL1Behaviour,
     ) -> Self {
         Self {
             pool,
             config,
-            base_token_address,
+            base_token,
+            sl_token,
             price_api_client,
-            l1_params,
+            l1_behaviour,
         }
     }
 
     /// Main loop for the base token ratio persister.
     /// Orchestrates fetching a new ratio, persisting it, and conditionally updating the L1 with it.
     pub async fn run(&mut self, mut stop_receiver: watch::Receiver<bool>) -> anyhow::Result<()> {
-        let mut timer = tokio::time::interval(self.config.price_polling_interval());
+        let mut timer = tokio::time::interval(self.config.price_polling_interval);
 
         while !*stop_receiver.borrow_and_update() {
             tokio::select! {
@@ -74,122 +110,79 @@ impl BaseTokenRatioPersister {
             }
         }
 
-        tracing::info!("Stop signal received, base_token_ratio_persister is shutting down");
+        tracing::info!("Stop request received, base_token_ratio_persister is shutting down");
         Ok(())
     }
 
-    async fn loop_iteration(&self) -> anyhow::Result<()> {
+    async fn loop_iteration(&mut self) -> anyhow::Result<()> {
         // TODO(PE-148): Consider shifting retry upon adding external API redundancy.
-        let new_ratio = self.retry_fetch_ratio().await?;
-        self.persist_ratio(new_ratio).await?;
+        let base_to_eth = self.retry_fetch_ratio(self.base_token).await?;
 
-        let Some(l1_params) = &self.l1_params else {
-            return Ok(());
-        };
+        let sl_to_eth = self.retry_fetch_ratio(self.sl_token).await?;
 
-        let max_attempts = self.config.l1_tx_sending_max_attempts;
-        let sleep_duration = self.config.l1_tx_sending_sleep_duration();
-        let mut result: anyhow::Result<()> = Ok(());
-        let mut prev_base_fee_per_gas: Option<u64> = None;
-        let mut prev_priority_fee_per_gas: Option<u64> = None;
+        let sl_ratio = safe_u64_fraction_mul(base_to_eth, sl_to_eth.reciprocal())?;
+        METRICS.ratio.set(
+            (sl_ratio.ratio.numerator.get() as f64) / (sl_ratio.ratio.denominator.get() as f64),
+        );
 
-        for attempt in 0..max_attempts {
-            let (base_fee_per_gas, priority_fee_per_gas) =
-                self.get_eth_fees(l1_params, prev_base_fee_per_gas, prev_priority_fee_per_gas);
-
-            result = self
-                .send_ratio_to_l1(l1_params, new_ratio, base_fee_per_gas, priority_fee_per_gas)
-                .await;
-            if let Some(err) = result.as_ref().err() {
-                tracing::info!(
-                "Failed to update base token multiplier on L1, attempt {}, base_fee_per_gas {}, priority_fee_per_gas {}: {}",
-                attempt + 1,
-                base_fee_per_gas,
-                priority_fee_per_gas,
-                err
+        // In database we persist the ratio needed for calculating L2 gas price from SL (L1 or Gateway) gas price
+        self.persist_ratio(
+            BaseTokenConversionRatio::new(base_to_eth.ratio, sl_ratio.ratio),
+            sl_ratio.ratio_timestamp,
+        )
+        .await?;
+        if !matches!(self.base_token, APIToken::Eth) {
+            METRICS.ratio_l1.set(
+                (base_to_eth.ratio.numerator.get() as f64)
+                    / (base_to_eth.ratio.denominator.get() as f64),
             );
-                tokio::time::sleep(sleep_duration).await;
-                prev_base_fee_per_gas = Some(base_fee_per_gas);
-                prev_priority_fee_per_gas = Some(priority_fee_per_gas);
-            } else {
-                tracing::info!(
-                "Updated base token multiplier on L1: numerator {}, denominator {}, base_fee_per_gas {}, priority_fee_per_gas {}",
-                new_ratio.numerator.get(),
-                new_ratio.denominator.get(),
-                base_fee_per_gas,
-                priority_fee_per_gas
-            );
-                return result;
-            }
+            self.l1_behaviour.update_l1(base_to_eth).await?
         }
-        result
+        Ok(())
     }
 
-    fn get_eth_fees(
-        &self,
-        l1_params: &BaseTokenRatioPersisterL1Params,
-        prev_base_fee_per_gas: Option<u64>,
-        prev_priority_fee_per_gas: Option<u64>,
-    ) -> (u64, u64) {
-        // Use get_blob_tx_base_fee here instead of get_base_fee to optimise for fast inclusion.
-        // get_base_fee might cause the transaction to be stuck in the mempool for 10+ minutes.
-        let mut base_fee_per_gas = l1_params.gas_adjuster.as_ref().get_blob_tx_base_fee();
-        let mut priority_fee_per_gas = l1_params.gas_adjuster.as_ref().get_priority_fee();
-        if let Some(x) = prev_priority_fee_per_gas {
-            // Increase `priority_fee_per_gas` by at least 20% to prevent "replacement transaction under-priced" error.
-            priority_fee_per_gas = max(priority_fee_per_gas, (x * 6) / 5 + 1);
-        }
+    async fn retry_fetch_ratio(&self, token: APIToken) -> anyhow::Result<BaseTokenApiRatio> {
+        let sleep_duration = self.config.price_fetching_sleep;
+        let max_retries = self.config.price_fetching_max_attempts;
+        let mut last_error = None;
 
-        if let Some(x) = prev_base_fee_per_gas {
-            // same for base_fee_per_gas but 10%
-            base_fee_per_gas = max(base_fee_per_gas, x + (x / 10) + 1);
-        }
-
-        // Extra check to prevent sending transaction will extremely high priority fee.
-        if priority_fee_per_gas > self.config.max_acceptable_priority_fee_in_gwei {
-            panic!(
-                "Extremely high value of priority_fee_per_gas is suggested: {}, while max acceptable is {}",
-                priority_fee_per_gas,
-                self.config.max_acceptable_priority_fee_in_gwei
-            );
-        }
-
-        (base_fee_per_gas, priority_fee_per_gas)
-    }
-
-    async fn retry_fetch_ratio(&self) -> anyhow::Result<BaseTokenAPIRatio> {
-        let sleep_duration = Duration::from_secs(1);
-        let max_retries = 5;
-        let mut attempts = 0;
-
-        loop {
-            match self
-                .price_api_client
-                .fetch_ratio(self.base_token_address)
-                .await
-            {
+        for attempt in 0..max_retries {
+            let start_time = Instant::now();
+            match self.price_api_client.fetch_ratio(token).await {
                 Ok(ratio) => {
+                    METRICS.external_price_api_latency[&OperationResultLabels {
+                        result: OperationResult::Success,
+                    }]
+                        .observe(start_time.elapsed());
                     return Ok(ratio);
                 }
-                Err(err) if attempts < max_retries => {
-                    attempts += 1;
+                Err(err) => {
                     tracing::warn!(
-                        "Attempt {}/{} to fetch ratio from coingecko failed with err: {}. Retrying...",
-                        attempts,
+                        "Attempt {}/{} to fetch ratio from external price api failed with err: {}. Retrying...",
+                        attempt,
                         max_retries,
                         err
                     );
+                    last_error = Some(err);
+                    METRICS.external_price_api_latency[&OperationResultLabels {
+                        result: OperationResult::Failure,
+                    }]
+                        .observe(start_time.elapsed());
                     sleep(sleep_duration).await;
-                }
-                Err(err) => {
-                    return Err(err)
-                        .context("Failed to fetch base token ratio after multiple attempts");
                 }
             }
         }
+        let error_message = "Failed to fetch base token ratio after multiple attempts";
+        Err(last_error
+            .map(|x| x.context(error_message))
+            .unwrap_or_else(|| anyhow::anyhow!(error_message)))
     }
 
-    async fn persist_ratio(&self, api_ratio: BaseTokenAPIRatio) -> anyhow::Result<usize> {
+    async fn persist_ratio(
+        &self,
+        api_ratio: BaseTokenConversionRatio,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<usize> {
         let mut conn = self
             .pool
             .connection_tagged("base_token_ratio_persister")
@@ -198,99 +191,196 @@ impl BaseTokenRatioPersister {
 
         let id = conn
             .base_token_dal()
-            .insert_token_ratio(
-                api_ratio.numerator,
-                api_ratio.denominator,
-                &api_ratio.ratio_timestamp.naive_utc(),
-            )
+            .insert_token_ratio(api_ratio, &timestamp.naive_utc())
             .await
             .context("Failed to insert base token ratio into the database")?;
 
         Ok(id)
     }
+}
 
-    async fn send_ratio_to_l1(
-        &self,
-        l1_params: &BaseTokenRatioPersisterL1Params,
-        api_ratio: BaseTokenAPIRatio,
-        base_fee_per_gas: u64,
-        priority_fee_per_gas: u64,
-    ) -> anyhow::Result<()> {
-        let fn_set_token_multiplier = l1_params
-            .chain_admin_contract
-            .function("setTokenMultiplier")
-            .context("`setTokenMultiplier` function must be present in the ChainAdmin contract")?;
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        num::NonZeroU64,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
-        let calldata = fn_set_token_multiplier
-            .encode_input(
-                &(
-                    Token::Address(l1_params.diamond_proxy_contract_address),
-                    Token::Uint(api_ratio.numerator.get().into()),
-                    Token::Uint(api_ratio.denominator.get().into()),
-                )
-                    .into_tokens(),
-            )
-            .context("failed encoding `setTokenMultiplier` input")?;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use test_casing::test_casing;
+    use zksync_config::configs::base_token_adjuster::BaseTokenAdjusterConfig;
+    use zksync_dal::{ConnectionPool, Core, CoreDal};
+    use zksync_external_price_api::{APIToken, PriceApiClient};
+    use zksync_types::{base_token_ratio::BaseTokenApiRatio, fee_model::ConversionRatio, Address};
 
-        let nonce = (*l1_params.eth_client)
-            .as_ref()
-            .nonce_at_for_account(
-                l1_params.token_multiplier_setter_account_address,
-                BlockNumber::Pending,
-            )
-            .await
-            .with_context(|| "failed getting transaction count")?
-            .as_u64();
+    use crate::*;
 
-        let options = Options {
-            gas: Some(U256::from(self.config.max_tx_gas)),
-            nonce: Some(U256::from(nonce)),
-            max_fee_per_gas: Some(U256::from(base_fee_per_gas + priority_fee_per_gas)),
-            max_priority_fee_per_gas: Some(U256::from(priority_fee_per_gas)),
-            ..Default::default()
-        };
+    // Mock for the PriceApiClient trait
+    #[derive(Debug, Clone, Default)]
+    struct MockPriceApiClient {
+        // Map from token address to the ratio it should return
+        ratios: Arc<Mutex<HashMap<Address, BaseTokenApiRatio>>>,
+        // To simulate failures
+        should_fail_count: Arc<Mutex<u64>>,
+    }
 
-        let signed_tx = l1_params
-            .eth_client
-            .sign_prepared_tx_for_addr(
-                calldata,
-                l1_params.chain_admin_contract_address.unwrap(),
-                options,
-            )
-            .await
-            .context("cannot sign a `setTokenMultiplier` transaction")?;
-
-        let hash = (*l1_params.eth_client)
-            .as_ref()
-            .send_raw_tx(signed_tx.raw_tx)
-            .await
-            .context("failed sending `setTokenMultiplier` transaction")?;
-
-        let max_attempts = self.config.l1_receipt_checking_max_attempts;
-        let sleep_duration = self.config.l1_receipt_checking_sleep_duration();
-        for _i in 0..max_attempts {
-            let maybe_receipt = (*l1_params.eth_client)
-                .as_ref()
-                .tx_receipt(hash)
-                .await
-                .context("failed getting receipt for `setTokenMultiplier` transaction")?;
-            if let Some(receipt) = maybe_receipt {
-                if receipt.status == Some(1.into()) {
-                    return Ok(());
-                }
-                return Err(anyhow::Error::msg(format!(
-                    "`setTokenMultiplier` transaction {:?} failed with status {:?}",
-                    hex::encode(hash),
-                    receipt.status
-                )));
-            } else {
-                tokio::time::sleep(sleep_duration).await;
-            }
+    impl MockPriceApiClient {
+        fn new() -> Self {
+            Self::default()
         }
 
-        Err(anyhow::Error::msg(format!(
-            "Unable to retrieve `setTokenMultiplier` transaction status in {} attempts",
-            max_attempts
-        )))
+        fn set_ratio(&self, token_address: Address, ratio: BaseTokenApiRatio) {
+            self.ratios.lock().unwrap().insert(token_address, ratio);
+        }
+
+        fn set_should_fail_count(&self, should_fail_count: u64) {
+            *self.should_fail_count.lock().unwrap() = should_fail_count;
+        }
+    }
+
+    #[async_trait]
+    impl PriceApiClient for MockPriceApiClient {
+        async fn fetch_ratio(&self, token: APIToken) -> Result<BaseTokenApiRatio> {
+            if *self.should_fail_count.lock().unwrap() > 0 {
+                *self.should_fail_count.lock().unwrap() -= 1;
+                return Err(anyhow::anyhow!("Simulated API failure"));
+            }
+
+            let address = match token {
+                APIToken::ERC20(address) => address,
+                APIToken::ZK => ZK_ADDRESS,
+                APIToken::Eth => return Ok(BaseTokenApiRatio::identity()),
+            };
+
+            self.ratios
+                .lock()
+                .unwrap()
+                .get(&address)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Token ratio not found"))
+        }
+    }
+
+    fn create_test_config() -> BaseTokenAdjusterConfig {
+        BaseTokenAdjusterConfig {
+            price_polling_interval: Duration::from_millis(100),
+            price_fetching_max_attempts: 3,
+            price_fetching_sleep: Duration::ZERO,
+            halt_on_error: true,
+            ..Default::default()
+        }
+    }
+
+    fn create_test_ratio(numerator: u64, denominator: u64) -> BaseTokenApiRatio {
+        BaseTokenApiRatio {
+            ratio: ConversionRatio {
+                numerator: NonZeroU64::new(numerator).unwrap(),
+                denominator: NonZeroU64::new(denominator).unwrap(),
+            },
+            ratio_timestamp: Utc::now(),
+        }
+    }
+
+    /// Check the database for inserted token ratios
+    async fn verify_db_ratios(
+        pool: &ConnectionPool<Core>,
+        expected_num_ratio: u64,
+        expected_denom_ratio: u64,
+    ) {
+        let mut conn = pool.connection().await.unwrap();
+        let ratio = conn.base_token_dal().get_latest_ratio().await.unwrap();
+
+        assert!(ratio.is_some(), "No token ratios found in database");
+
+        // Check the latest ratio matches expected values
+        let ratio = ratio.unwrap();
+        assert_eq!(
+            ratio.ratio.sl_conversion_ratio().numerator.get(),
+            expected_num_ratio
+        );
+        assert_eq!(
+            ratio.ratio.sl_conversion_ratio().denominator.get(),
+            expected_denom_ratio
+        );
+    }
+
+    const TOKEN_1_ADDRESS: Address = Address::repeat_byte(0x01);
+    const TOKEN_1: APIToken = APIToken::ERC20(TOKEN_1_ADDRESS);
+    const TOKEN_1_PRICE: (u64, u64) = (500, 1);
+    const ZK_ADDRESS: Address = Address::repeat_byte(0x03);
+    const ZK_PRICE: (u64, u64) = (1000, 1);
+    const ZK: APIToken = APIToken::ZK;
+    const ETH: APIToken = APIToken::Eth;
+
+    // Test initialization function
+    async fn init_test(
+        base_token: APIToken,
+        sl_token: APIToken,
+    ) -> (
+        ConnectionPool<Core>,
+        Arc<MockPriceApiClient>,
+        BaseTokenRatioPersister,
+    ) {
+        // Setup a real database pool
+        let pool = ConnectionPool::<Core>::test_pool().await;
+
+        // Setup mock for the price API client
+        let mock_client = Arc::new(MockPriceApiClient::new());
+
+        // Set up expected ratios in the mock client
+        let base_to_eth_ratio = create_test_ratio(TOKEN_1_PRICE.0, TOKEN_1_PRICE.1);
+        let sl_to_eth_ratio = create_test_ratio(ZK_PRICE.0, ZK_PRICE.1);
+
+        mock_client.set_ratio(TOKEN_1_ADDRESS, base_to_eth_ratio);
+        mock_client.set_ratio(ZK_ADDRESS, sl_to_eth_ratio);
+
+        // Create the persister with real database pool
+        let persister = BaseTokenRatioPersister::new(
+            pool.clone(),
+            create_test_config(),
+            base_token,
+            sl_token,
+            mock_client.clone() as Arc<dyn PriceApiClient>,
+            BaseTokenL1Behaviour::NoOp,
+        );
+        (pool, mock_client, persister)
+    }
+
+    #[test_casing(3, vec![(TOKEN_1, ZK, (500,1000)), (ETH, ZK, (1,1000)), (TOKEN_1, ETH, (500,1))])]
+    #[tokio::test]
+    async fn test_fetch_and_persist(
+        base_token: APIToken,
+        sl_token: APIToken,
+        expected_db_ratio: (u64, u64),
+    ) {
+        // Setup test environment
+        let (pool, _mock_client, mut persister) = init_test(base_token, sl_token).await;
+
+        persister.loop_iteration().await.unwrap();
+
+        // Verify that the correct ratio was stored in DB
+        verify_db_ratios(&pool, expected_db_ratio.0, expected_db_ratio.1).await;
+    }
+
+    #[test_casing(3, vec![(TOKEN_1, ZK, (500,1000)), (ETH, ZK, (1,1000)), (TOKEN_1, ETH, (500,1))])]
+    #[tokio::test]
+    async fn test_retry_mechanism(
+        base_token: APIToken,
+        sl_token: APIToken,
+        expected_db_ratio: (u64, u64),
+    ) {
+        // Setup test environment
+        let (pool, mock_client, mut persister) = init_test(base_token, sl_token).await;
+
+        mock_client.set_should_fail_count(1); // Fail once
+
+        persister.loop_iteration().await.unwrap();
+
+        // Verify that the correct ratio was eventually stored in DB
+        verify_db_ratios(&pool, expected_db_ratio.0, expected_db_ratio.1).await;
     }
 }

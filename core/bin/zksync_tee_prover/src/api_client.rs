@@ -1,22 +1,18 @@
-use reqwest::Client;
-use secp256k1::{ecdsa::Signature, PublicKey};
-use serde::{de::DeserializeOwned, Serialize};
+use reqwest::{Client, Response, StatusCode};
+use secp256k1::PublicKey;
+use serde::Serialize;
 use url::Url;
-use zksync_basic_types::H256;
-use zksync_prover_interface::{
-    api::{
-        RegisterTeeAttestationRequest, RegisterTeeAttestationResponse, SubmitTeeProofRequest,
-        SubmitTeeProofResponse, TeeProofGenerationDataRequest, TeeProofGenerationDataResponse,
-    },
+use zksync_basic_types::{tee_types::TeeType, L1BatchNumber, H256};
+use zksync_tee_prover_interface::{
+    api::{RegisterTeeAttestationRequest, SubmitTeeProofRequest, TeeProofGenerationDataRequest},
     inputs::TeeVerifierInput,
     outputs::L1BatchTeeProofForL1,
 };
-use zksync_types::{tee_types::TeeType, L1BatchNumber};
 
 use crate::{error::TeeProverError, metrics::METRICS};
 
 /// Implementation of the API client for the proof data handler, run by
-/// [`zksync_proof_data_handler::run_server`].
+/// [`zksync_tee_proof_data_handler::run_server`].
 #[derive(Debug)]
 pub(crate) struct TeeApiClient {
     api_base_url: Url,
@@ -31,10 +27,9 @@ impl TeeApiClient {
         }
     }
 
-    async fn post<Req, Resp, S>(&self, endpoint: S, request: Req) -> Result<Resp, reqwest::Error>
+    async fn post<Req, S>(&self, endpoint: S, request: Req) -> Result<Response, reqwest::Error>
     where
         Req: Serialize + std::fmt::Debug,
-        Resp: DeserializeOwned,
         S: AsRef<str>,
     {
         let url = self.api_base_url.join(endpoint.as_ref()).unwrap();
@@ -46,9 +41,7 @@ impl TeeApiClient {
             .json(&request)
             .send()
             .await?
-            .error_for_status()?
-            .json::<Resp>()
-            .await
+            .error_for_status()
     }
 
     /// Registers the attestation quote with the TEE prover interface API, effectively proving that
@@ -63,8 +56,7 @@ impl TeeApiClient {
             attestation: attestation_quote_bytes,
             pubkey: public_key.serialize().to_vec(),
         };
-        self.post::<_, RegisterTeeAttestationResponse, _>("/tee/register_attestation", request)
-            .await?;
+        self.post("/tee/register_attestation", request).await?;
         tracing::info!(
             "Attestation quote was successfully registered for the public key {}",
             public_key
@@ -77,31 +69,40 @@ impl TeeApiClient {
     pub async fn get_job(
         &self,
         tee_type: TeeType,
-    ) -> Result<Option<Box<TeeVerifierInput>>, TeeProverError> {
+    ) -> Result<Option<TeeVerifierInput>, TeeProverError> {
         let request = TeeProofGenerationDataRequest { tee_type };
-        let response = self
-            .post::<_, TeeProofGenerationDataResponse, _>("/tee/proof_inputs", request)
-            .await?;
-        Ok(response.0)
+        let response = self.post("/tee/proof_inputs", request).await?;
+        match response.status() {
+            StatusCode::OK => Ok(Some(response.json::<TeeVerifierInput>().await?)),
+            StatusCode::NO_CONTENT => Ok(None),
+            _ => response
+                .json::<Option<TeeVerifierInput>>()
+                .await
+                .map_err(TeeProverError::Request),
+        }
     }
 
     /// Submits the successfully verified proof to the TEE prover interface API.
     pub async fn submit_proof(
         &self,
         batch_number: L1BatchNumber,
-        signature: Signature,
+        signature: [u8; 65],
         pubkey: &PublicKey,
         root_hash: H256,
         tee_type: TeeType,
     ) -> Result<(), TeeProverError> {
+        if tee_type == TeeType::None {
+            tracing::info!("Not submitting proof from none TEE.");
+            return Ok(());
+        }
         let request = SubmitTeeProofRequest(Box::new(L1BatchTeeProofForL1 {
-            signature: signature.serialize_compact().into(),
+            signature: signature.into(),
             pubkey: pubkey.serialize().into(),
             proof: root_hash.as_bytes().into(),
             tee_type,
         }));
         let observer = METRICS.proof_submitting_time.start();
-        self.post::<_, SubmitTeeProofResponse, _>(
+        self.post(
             format!("/tee/submit_proofs/{batch_number}").as_str(),
             request,
         )

@@ -6,9 +6,10 @@ use assert_matches::assert_matches;
 use async_trait::async_trait;
 use http::StatusCode;
 use tokio::sync::watch;
-use zksync_config::configs::chain::NetworkConfig;
 use zksync_dal::ConnectionPool;
-use zksync_types::{api, Address, Bloom, L1BatchNumber, H160, H256, U64};
+use zksync_types::{
+    api, settlement::SettlementLayer, Address, Bloom, L1BatchNumber, H160, H256, U64,
+};
 use zksync_web3_decl::{
     client::{WsClient, L2},
     jsonrpsee::{
@@ -24,7 +25,7 @@ use zksync_web3_decl::{
 };
 
 use super::*;
-use crate::web3::metrics::SubscriptionType;
+use crate::web3::{metrics::SubscriptionType, state::InternalApiConfigBase};
 
 async fn wait_for_subscription(
     events: &mut mpsc::UnboundedReceiver<PubSubEvent>,
@@ -109,10 +110,9 @@ async fn notifiers_start_after_snapshot_recovery() {
 
     let (stop_sender, stop_receiver) = watch::channel(false);
     let (events_sender, mut events_receiver) = mpsc::unbounded_channel();
-    let mut subscribe_logic = EthSubscribe::new();
+    let mut subscribe_logic = EthSubscribe::new(POLL_INTERVAL);
     subscribe_logic.set_events_sender(events_sender);
-    let notifier_handles =
-        subscribe_logic.spawn_notifiers(pool.clone(), POLL_INTERVAL, stop_receiver);
+    let notifier_handles = subscribe_logic.spawn_notifiers(pool.clone(), &stop_receiver);
     assert!(!notifier_handles.is_empty());
 
     // Wait a little doing nothing and check that notifier tasks are still active (i.e., have not panicked).
@@ -147,7 +147,7 @@ async fn notifiers_start_after_snapshot_recovery() {
 trait WsTest: Send + Sync {
     /// Prepares the storage before the server is started. The default implementation performs genesis.
     fn storage_initialization(&self) -> StorageInitialization {
-        StorageInitialization::Genesis
+        StorageInitialization::genesis()
     }
 
     async fn test(
@@ -164,26 +164,30 @@ trait WsTest: Send + Sync {
 
 async fn test_ws_server(test: impl WsTest) {
     let pool = ConnectionPool::<Core>::test_pool().await;
-    let network_config = NetworkConfig::for_tests();
     let contracts_config = ContractsConfig::for_tests();
     let web3_config = Web3JsonRpcConfig::for_tests();
     let genesis_config = GenesisConfig::for_tests();
-    let api_config = InternalApiConfig::new(&web3_config, &contracts_config, &genesis_config);
+    let state_keeper_config = StateKeeperConfig::for_tests();
+    let api_config = InternalApiConfig::new(
+        InternalApiConfigBase::new(&genesis_config, &web3_config, &state_keeper_config)
+            .with_l1_to_l2_txs_paused(false),
+        &contracts_config.settlement_layer_specific_contracts(),
+        &contracts_config.l1_specific_contracts(),
+        &contracts_config.l2_contracts(),
+        &genesis_config,
+        SettlementLayer::for_tests(),
+    );
     let mut storage = pool.connection().await.unwrap();
     test.storage_initialization()
-        .prepare_storage(&network_config, &mut storage)
+        .prepare_storage(&mut storage)
         .await
         .expect("Failed preparing storage for test");
     drop(storage);
 
     let (stop_sender, stop_receiver) = watch::channel(false);
-    let (mut server_handles, pub_sub_events) = spawn_ws_server(
-        api_config,
-        pool.clone(),
-        stop_receiver,
-        test.websocket_requests_per_minute_limit(),
-    )
-    .await;
+    let (mut server_handles, pub_sub_events) = TestServerBuilder::new(pool.clone(), api_config)
+        .build_ws(test.websocket_requests_per_minute_limit(), stop_receiver)
+        .await;
 
     let local_addr = server_handles.wait_until_ready().await;
     let client = Client::ws(format!("ws://{local_addr}").parse().unwrap())
@@ -238,7 +242,7 @@ impl WsTest for BasicSubscriptionsTest {
         if self.snapshot_recovery {
             StorageInitialization::empty_recovery()
         } else {
-            StorageInitialization::Genesis
+            StorageInitialization::genesis()
         }
     }
 
@@ -269,7 +273,7 @@ impl WsTest for BasicSubscriptionsTest {
         wait_for_subscription(&mut pub_sub_events, SubscriptionType::Txs).await;
 
         let mut storage = pool.connection().await?;
-        let tx_result = execute_l2_transaction(create_l2_transaction(1, 2));
+        let tx_result = mock_execute_transaction(create_l2_transaction(1, 2).into());
         let new_tx_hash = tx_result.hash;
         let l2_block_number = if self.snapshot_recovery {
             StorageInitialization::SNAPSHOT_RECOVERY_BLOCK + 2
@@ -407,7 +411,7 @@ impl WsTest for LogSubscriptionsTest {
         if self.snapshot_recovery {
             StorageInitialization::empty_recovery()
         } else {
-            StorageInitialization::Genesis
+            StorageInitialization::genesis()
         }
     }
 

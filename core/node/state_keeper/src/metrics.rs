@@ -6,14 +6,11 @@ use std::{
 };
 
 use vise::{
-    Buckets, Counter, EncodeLabelSet, EncodeLabelValue, Family, Gauge, Histogram, LatencyObserver,
-    Metrics,
+    Buckets, Counter, EncodeLabelSet, EncodeLabelValue, Family, Gauge, Histogram, LabeledFamily,
+    LatencyObserver, Metrics, Unit,
 };
 use zksync_mempool::MempoolStore;
-use zksync_multivm::interface::{
-    DeduplicatedWritesMetrics, VmExecutionResultAndLogs, VmRevertReason,
-};
-use zksync_shared_metrics::InteractionType;
+use zksync_multivm::interface::{DeduplicatedWritesMetrics, VmRevertReason};
 use zksync_types::ProtocolVersionId;
 
 use super::seal_criteria::SealResolution;
@@ -67,6 +64,10 @@ pub struct StateKeeperMetrics {
     /// Latency to synchronize the mempool with Postgres.
     #[metrics(buckets = Buckets::LATENCIES)]
     pub mempool_sync: Histogram<Duration>,
+    /// Number of stashed accounts in mempool
+    pub mempool_stashed_accounts: Gauge<usize>,
+    /// Number of purged accounts in mempool
+    pub mempool_purged_accounts: Gauge<usize>,
     /// Latency of the state keeper waiting for a transaction.
     #[metrics(buckets = Buckets::LATENCIES)]
     pub waiting_for_tx: Histogram<Duration>,
@@ -84,13 +85,6 @@ pub struct StateKeeperMetrics {
     /// The time it takes for transactions to be included in a block. Representative of the time user must wait before their transaction is confirmed.
     #[metrics(buckets = INCLUSION_DELAY_BUCKETS)]
     pub transaction_inclusion_delay: Family<TxExecutionType, Histogram<Duration>>,
-    /// Time spent by the state keeper on transaction execution.
-    #[metrics(buckets = Buckets::LATENCIES)]
-    pub tx_execution_time: Family<TxExecutionStage, Histogram<Duration>>,
-    /// Number of times gas price was reported as too high.
-    pub gas_price_too_high: Counter,
-    /// Number of times blob base fee was reported as too high.
-    pub blob_base_fee_too_high: Counter,
     /// The time it takes to match seal resolution for each tx.
     #[metrics(buckets = Buckets::LATENCIES)]
     pub match_seal_resolution: Histogram<Duration>,
@@ -100,9 +94,9 @@ pub struct StateKeeperMetrics {
     /// The time it takes for state keeper to wait for tx execution result from batch executor.
     #[metrics(buckets = Buckets::LATENCIES)]
     pub execute_tx_outer_time: Histogram<Duration>,
-    /// The time it takes for one iteration of the main loop in `process_l1_batch`.
+    /// The time it takes for one iteration of the main loop in `process_block`.
     #[metrics(buckets = Buckets::LATENCIES)]
-    pub process_l1_batch_loop_iteration: Histogram<Duration>,
+    pub process_block_loop_iteration: Histogram<Duration>,
     /// The time it takes to wait for new L2 block parameters
     #[metrics(buckets = Buckets::LATENCIES)]
     pub wait_for_l2_block_params: Histogram<Duration>,
@@ -226,6 +220,8 @@ struct TxAggregationLabels {
 pub(super) struct TxAggregationMetrics {
     reason: Family<TxAggregationLabels, Counter>,
     l2_block_reason: Family<L2BlockSealReason, Counter>,
+    #[metrics(labels = ["criterion"], buckets = Buckets::ZERO_TO_ONE, unit = Unit::Ratios)]
+    criterion_capacity_filled: LabeledFamily<&'static str, Histogram>,
 }
 
 impl TxAggregationMetrics {
@@ -247,6 +243,10 @@ impl TxAggregationMetrics {
 
     pub fn l2_block_reason_inc(&self, reason: &L2BlockSealReason) {
         self.l2_block_reason[reason].inc();
+    }
+
+    pub fn record_criterion_capacity(&self, criterion: &'static str, value: f64) {
+        self.criterion_capacity_filled[&criterion].observe(value)
     }
 }
 
@@ -349,6 +349,7 @@ pub(super) enum L2BlockSealStage {
     InsertL2ToL1Logs,
     ReportTxMetrics,
     CalculateLogsBloom,
+    MarkInteropRootsAsSealed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EncodeLabelSet)]
@@ -439,52 +440,9 @@ impl SealProgress<'_> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EncodeLabelValue, EncodeLabelSet)]
-#[metrics(label = "command", rename_all = "snake_case")]
-pub(super) enum ExecutorCommand {
-    ExecuteTx,
-    #[metrics(name = "start_next_miniblock")]
-    StartNextL2Block,
-    RollbackLastTx,
-    FinishBatch,
-    FinishBatchWithCache,
-}
-
-const GAS_PER_NANOSECOND_BUCKETS: Buckets = Buckets::values(&[
-    0.01, 0.03, 0.1, 0.3, 0.5, 0.75, 1., 1.5, 3., 5., 10., 20., 50.,
-]);
-
-/// Executor-related state keeper metrics.
-#[derive(Debug, Metrics)]
-#[metrics(prefix = "state_keeper")]
-pub(super) struct ExecutorMetrics {
-    /// Latency to process a single command sent to the batch executor.
-    #[metrics(buckets = Buckets::LATENCIES)]
-    pub batch_executor_command_response_time: Family<ExecutorCommand, Histogram<Duration>>,
-    /// Cumulative latency of interacting with the storage when executing a transaction
-    /// in the batch executor.
-    #[metrics(buckets = Buckets::LATENCIES)]
-    pub batch_storage_interaction_duration: Family<InteractionType, Histogram<Duration>>,
-    #[metrics(buckets = GAS_PER_NANOSECOND_BUCKETS)]
-    pub computational_gas_per_nanosecond: Histogram<f64>,
-    #[metrics(buckets = GAS_PER_NANOSECOND_BUCKETS)]
-    pub failed_tx_gas_limit_per_nanosecond: Histogram<f64>,
-}
-
-#[vise::register]
-pub(super) static EXECUTOR_METRICS: vise::Global<ExecutorMetrics> = vise::Global::new();
-
 #[derive(Debug, Metrics)]
 #[metrics(prefix = "batch_tip")]
 pub(crate) struct BatchTipMetrics {
-    #[metrics(buckets = Buckets::exponential(60000.0..=80000000.0, 2.0))]
-    gas_used: Histogram<usize>,
-    #[metrics(buckets = Buckets::exponential(1.0..=60000.0, 2.0))]
-    pubdata_published: Histogram<usize>,
-    #[metrics(buckets = Buckets::exponential(1.0..=4096.0, 2.0))]
-    circuit_statistic: Histogram<usize>,
-    #[metrics(buckets = Buckets::exponential(1.0..=4096.0, 2.0))]
-    execution_metrics_size: Histogram<usize>,
     #[metrics(buckets = Buckets::exponential(1.0..=60000.0, 2.0))]
     block_writes_metrics_positive_size: Histogram<usize>,
     #[metrics(buckets = Buckets::exponential(1.0..=60000.0, 2.0))]
@@ -492,17 +450,6 @@ pub(crate) struct BatchTipMetrics {
 }
 
 impl BatchTipMetrics {
-    pub fn observe(&self, execution_result: &VmExecutionResultAndLogs) {
-        self.gas_used
-            .observe(execution_result.statistics.gas_used as usize);
-        self.pubdata_published
-            .observe(execution_result.statistics.pubdata_published as usize);
-        self.circuit_statistic
-            .observe(execution_result.statistics.circuit_statistic.total());
-        self.execution_metrics_size
-            .observe(execution_result.get_execution_metrics(None).size());
-    }
-
     pub fn observe_writes_metrics(
         &self,
         initial_writes_metrics: &DeduplicatedWritesMetrics,

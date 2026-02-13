@@ -1,4 +1,4 @@
-use zk_evm_1_5_0::aux_structures::Timestamp;
+use zk_evm_1_5_2::aux_structures::Timestamp;
 use zksync_types::{l1::is_l1_tx_type, Transaction};
 
 use crate::{
@@ -6,7 +6,7 @@ use crate::{
     vm_latest::{
         constants::BOOTLOADER_HEAP_PAGE,
         implementation::bytecode::{bytecode_to_factory_dep, compress_bytecodes},
-        types::internals::TransactionData,
+        types::TransactionData,
         vm::Vm,
     },
     HistoryMode,
@@ -40,7 +40,7 @@ impl<S: WriteStorage, H: HistoryMode> Vm<S, H> {
 
         let trusted_ergs_limit = tx.trusted_ergs_limit();
 
-        let memory = self.bootloader_state.push_tx(
+        let (memory, _) = self.bootloader_state.push_tx(
             tx,
             predefined_overhead,
             predefined_refund,
@@ -59,7 +59,12 @@ impl<S: WriteStorage, H: HistoryMode> Vm<S, H> {
         tx: Transaction,
         with_compression: bool,
     ) {
-        let tx: TransactionData = tx.into();
+        let use_evm_emulator = self
+            .system_env
+            .base_system_smart_contracts
+            .evm_emulator
+            .is_some();
+        let tx = TransactionData::new(tx, use_evm_emulator);
         let overhead = tx.overhead_gas();
         self.push_raw_transaction(tx, overhead, 0, with_compression);
     }

@@ -1,19 +1,18 @@
 import * as path from 'path';
 import * as fs from 'fs';
 import * as yaml from 'yaml';
+import fsSync from 'fs';
 
-export function shouldLoadConfigFromFile() {
+export type FileConfig = { loadFromFile: false; chain?: undefined } | { loadFromFile: true; chain: string };
+
+export function shouldLoadConfigFromFile(): FileConfig {
     const chain = process.env.CHAIN_NAME;
-    if (chain) {
-        return {
-            loadFromFile: true,
-            chain
-        } as const;
-    } else {
-        return {
-            loadFromFile: false
-        } as const;
-    }
+    return chain ? { loadFromFile: true, chain } : { loadFromFile: false };
+}
+
+export function getSecondChainConfig(): FileConfig | undefined {
+    const chain = process.env.SECOND_CHAIN_NAME;
+    return chain ? { loadFromFile: true, chain } : undefined;
 }
 
 export const configNames = [
@@ -22,13 +21,27 @@ export const configNames = [
     'genesis.yaml',
     'secrets.yaml',
     'wallets.yaml',
-    'external_node.yaml'
+    'external_node.yaml',
+    'gateway_chain.yaml'
 ] as const;
 
 export type ConfigName = (typeof configNames)[number];
 
 export function loadEcosystem(pathToHome: string) {
     const configPath = path.join(pathToHome, '/ZkStack.yaml');
+    if (!fs.existsSync(configPath)) {
+        return [];
+    }
+    return yaml.parse(
+        fs.readFileSync(configPath, {
+            encoding: 'utf-8'
+        })
+    );
+}
+
+export function loadChainConfig(pathToHome: string, chain: string) {
+    const configPath = path.join(pathToHome, 'chains', chain, '/ZkStack.yaml');
+
     if (!fs.existsSync(configPath)) {
         return [];
     }
@@ -57,7 +70,7 @@ export function loadConfig({
         config
     );
     if (!fs.existsSync(configPath)) {
-        return [];
+        return null;
     }
     return yaml.parse(
         fs.readFileSync(configPath, {
@@ -122,11 +135,15 @@ export function getConfigsFolderPath({
     return path.join(pathToHome, 'chains', chain, configsFolder ?? 'configs', configsFolderSuffix ?? '');
 }
 
-export function replaceAggregatedBlockExecuteDeadline(pathToHome: string, fileConfig: any, value: number) {
-    const generalConfigPath = getConfigPath({ pathToHome, chain: fileConfig.chain, config: 'general.yaml' });
-    const generalConfig = fs.readFileSync(generalConfigPath, 'utf8');
-    const regex = /aggregated_block_execute_deadline:\s*\d+/g;
-    const newGeneralConfig = generalConfig.replace(regex, `aggregated_block_execute_deadline: ${value}`);
-
+export function replaceL1BatchMinAgeBeforeExecuteSeconds(pathToHome: string, chain: string, value: number) {
+    const generalConfigPath = getConfigPath({ pathToHome, chain, config: 'general.yaml' });
+    const generalConfig = fsSync.readFileSync(generalConfigPath, 'utf8');
+    const generalConfigObject = yaml.parse(generalConfig);
+    if (value == 0) {
+        delete generalConfigObject['eth']['sender']['l1_batch_min_age_before_execute_seconds'];
+    } else {
+        generalConfigObject['eth']['sender']['l1_batch_min_age_before_execute_seconds'] = value;
+    }
+    const newGeneralConfig = yaml.stringify(generalConfigObject);
     fs.writeFileSync(generalConfigPath, newGeneralConfig, 'utf8');
 }

@@ -12,8 +12,8 @@ use zksync_node_test_utils::{
     l1_batch_metadata_to_commitment_artifacts,
 };
 use zksync_types::{
-    aggregated_operations::AggregatedActionType, block::L2BlockHeader, Address, L2BlockNumber,
-    ProtocolVersion, H256,
+    aggregated_operations::L1BatchAggregatedActionType, eth_sender::EthTxFinalityStatus,
+    L2BlockNumber, ProtocolVersion, SLChainId, H256, U256,
 };
 
 use super::*;
@@ -95,8 +95,8 @@ async fn is_l1_batch_prunable_works() {
 
 async fn insert_l2_blocks(
     conn: &mut Connection<'_, Core>,
-    l1_batches_count: u64,
-    l2_blocks_per_batch: u64,
+    l1_batches_count: u32,
+    l2_blocks_per_batch: u32,
 ) {
     conn.protocol_versions_dal()
         .save_protocol_version_with_tx(&ProtocolVersion::default())
@@ -104,35 +104,31 @@ async fn insert_l2_blocks(
         .unwrap();
 
     for l1_batch_number in 0..l1_batches_count {
+        let l1_batch_number = L1BatchNumber(l1_batch_number);
         for l2_block_index in 0..l2_blocks_per_batch {
-            let l2_block_number =
-                L2BlockNumber((l1_batch_number * l2_blocks_per_batch + l2_block_index) as u32);
-            let l2_block_header = L2BlockHeader {
-                number: l2_block_number,
-                timestamp: 0,
-                hash: H256::from_low_u64_be(u64::from(l2_block_number.0)),
-                l1_tx_count: 0,
-                l2_tx_count: 0,
-                fee_account_address: Address::repeat_byte(1),
-                base_fee_per_gas: 0,
-                gas_per_pubdata_limit: 0,
-                batch_fee_input: Default::default(),
-                base_system_contracts_hashes: Default::default(),
-                protocol_version: Some(Default::default()),
-                virtual_blocks: 0,
-                gas_limit: 0,
-                logs_bloom: Default::default(),
-            };
+            let l2_block_number = l1_batch_number.0 * l2_blocks_per_batch + l2_block_index;
+            let l2_block_header = create_l2_block(l2_block_number);
 
             conn.blocks_dal()
                 .insert_l2_block(&l2_block_header)
                 .await
                 .unwrap();
             conn.blocks_dal()
-                .mark_l2_blocks_as_executed_in_l1_batch(L1BatchNumber(l1_batch_number as u32))
+                .mark_l2_blocks_as_executed_in_l1_batch(l1_batch_number)
                 .await
                 .unwrap();
         }
+
+        let l1_batch_header = create_l1_batch(l1_batch_number.0);
+        conn.blocks_dal()
+            .insert_mock_l1_batch(&l1_batch_header)
+            .await
+            .unwrap();
+        let root_hash = H256::from_low_u64_be(l1_batch_number.0.into());
+        conn.blocks_dal()
+            .set_l1_batch_hash(l1_batch_number, root_hash)
+            .await
+            .unwrap();
     }
 }
 
@@ -143,7 +139,7 @@ async fn hard_pruning_ignores_conditions_checks() {
 
     insert_l2_blocks(&mut conn, 10, 2).await;
     conn.pruning_dal()
-        .soft_prune_batches_range(L1BatchNumber(2), L2BlockNumber(5))
+        .insert_soft_pruning_log(L1BatchNumber(2), L2BlockNumber(5))
         .await
         .unwrap();
 
@@ -166,24 +162,34 @@ async fn hard_pruning_ignores_conditions_checks() {
         .unwrap();
 
     assert_eq!(
-        PruningInfo {
-            last_soft_pruned_l1_batch: Some(L1BatchNumber(2)),
-            last_soft_pruned_l2_block: Some(L2BlockNumber(5)),
-            last_hard_pruned_l1_batch: Some(L1BatchNumber(2)),
-            last_hard_pruned_l2_block: Some(L2BlockNumber(5)),
-        },
+        test_pruning_info(2, 5),
         conn.pruning_dal().get_pruning_info().await.unwrap()
     );
     let health = health_check.check_health().await;
     assert_matches!(health.status(), HealthStatus::Ready);
 }
+
+fn test_pruning_info(l1_batch: u32, l2_block: u32) -> PruningInfo {
+    PruningInfo {
+        last_soft_pruned: Some(SoftPruningInfo {
+            l1_batch: L1BatchNumber(l1_batch),
+            l2_block: L2BlockNumber(l2_block),
+        }),
+        last_hard_pruned: Some(HardPruningInfo {
+            l1_batch: L1BatchNumber(l1_batch),
+            l2_block: L2BlockNumber(l2_block),
+            l1_batch_root_hash: Some(H256::from_low_u64_be(l1_batch.into())),
+        }),
+    }
+}
+
 #[test(tokio::test)]
 async fn pruner_catches_up_with_hard_pruning_up_to_soft_pruning_boundary_ignoring_chunk_size() {
     let pool = ConnectionPool::<Core>::test_pool().await;
     let mut conn = pool.connection().await.unwrap();
     insert_l2_blocks(&mut conn, 10, 2).await;
     conn.pruning_dal()
-        .soft_prune_batches_range(L1BatchNumber(2), L2BlockNumber(5))
+        .insert_soft_pruning_log(L1BatchNumber(2), L2BlockNumber(5))
         .await
         .unwrap();
 
@@ -204,12 +210,7 @@ async fn pruner_catches_up_with_hard_pruning_up_to_soft_pruning_boundary_ignorin
         .unwrap();
 
     assert_eq!(
-        PruningInfo {
-            last_soft_pruned_l1_batch: Some(L1BatchNumber(2)),
-            last_soft_pruned_l2_block: Some(L2BlockNumber(5)),
-            last_hard_pruned_l1_batch: Some(L1BatchNumber(2)),
-            last_hard_pruned_l2_block: Some(L2BlockNumber(5)),
-        },
+        test_pruning_info(2, 5),
         conn.pruning_dal().get_pruning_info().await.unwrap()
     );
 
@@ -218,12 +219,7 @@ async fn pruner_catches_up_with_hard_pruning_up_to_soft_pruning_boundary_ignorin
         .await
         .unwrap();
     assert_eq!(
-        PruningInfo {
-            last_soft_pruned_l1_batch: Some(L1BatchNumber(7)),
-            last_soft_pruned_l2_block: Some(L2BlockNumber(15)),
-            last_hard_pruned_l1_batch: Some(L1BatchNumber(7)),
-            last_hard_pruned_l2_block: Some(L2BlockNumber(15)),
-        },
+        test_pruning_info(7, 15),
         conn.pruning_dal().get_pruning_info().await.unwrap()
     );
 }
@@ -252,12 +248,7 @@ async fn unconstrained_pruner_with_fresh_database() {
         .unwrap();
 
     assert_eq!(
-        PruningInfo {
-            last_soft_pruned_l1_batch: Some(L1BatchNumber(3)),
-            last_soft_pruned_l2_block: Some(L2BlockNumber(7)),
-            last_hard_pruned_l1_batch: Some(L1BatchNumber(3)),
-            last_hard_pruned_l2_block: Some(L2BlockNumber(7)),
-        },
+        test_pruning_info(3, 7),
         conn.pruning_dal().get_pruning_info().await.unwrap()
     );
 
@@ -266,12 +257,7 @@ async fn unconstrained_pruner_with_fresh_database() {
         .await
         .unwrap();
     assert_eq!(
-        PruningInfo {
-            last_soft_pruned_l1_batch: Some(L1BatchNumber(6)),
-            last_soft_pruned_l2_block: Some(L2BlockNumber(13)),
-            last_hard_pruned_l1_batch: Some(L1BatchNumber(6)),
-            last_hard_pruned_l2_block: Some(L2BlockNumber(13)),
-        },
+        test_pruning_info(6, 13),
         conn.pruning_dal().get_pruning_info().await.unwrap()
     );
 }
@@ -301,12 +287,7 @@ async fn pruning_blocked_after_first_chunk() {
         .unwrap();
 
     assert_eq!(
-        PruningInfo {
-            last_soft_pruned_l1_batch: Some(L1BatchNumber(3)),
-            last_soft_pruned_l2_block: Some(L2BlockNumber(7)),
-            last_hard_pruned_l1_batch: Some(L1BatchNumber(3)),
-            last_hard_pruned_l2_block: Some(L2BlockNumber(7)),
-        },
+        test_pruning_info(3, 7),
         conn.pruning_dal().get_pruning_info().await.unwrap()
     );
 
@@ -317,12 +298,7 @@ async fn pruning_blocked_after_first_chunk() {
     assert_matches!(outcome, PruningIterationOutcome::NoOp);
     // pruning shouldn't have progressed as chunk 6 cannot be pruned
     assert_eq!(
-        PruningInfo {
-            last_soft_pruned_l1_batch: Some(L1BatchNumber(3)),
-            last_soft_pruned_l2_block: Some(L2BlockNumber(7)),
-            last_hard_pruned_l1_batch: Some(L1BatchNumber(3)),
-            last_hard_pruned_l2_block: Some(L2BlockNumber(7)),
-        },
+        test_pruning_info(3, 7),
         conn.pruning_dal().get_pruning_info().await.unwrap()
     );
 }
@@ -409,14 +385,21 @@ async fn save_l1_batch_metadata(storage: &mut Connection<'_, Core>, number: u32)
 }
 
 async fn mark_l1_batch_as_executed(storage: &mut Connection<'_, Core>, number: u32) {
+    let tx_hash = H256::from_low_u64_be(number.into());
     storage
         .eth_sender_dal()
-        .insert_bogus_confirmed_eth_tx(
+        .insert_pending_received_eth_tx(
             L1BatchNumber(number),
-            AggregatedActionType::Execute,
-            H256::from_low_u64_be(number.into()),
-            chrono::Utc::now(),
+            L1BatchAggregatedActionType::Execute,
+            tx_hash,
+            Some(SLChainId(1)),
         )
+        .await
+        .unwrap();
+
+    storage
+        .eth_sender_dal()
+        .confirm_tx(tx_hash, EthTxFinalityStatus::Finalized, U256::zero())
         .await
         .unwrap();
 }
@@ -579,8 +562,8 @@ async fn pruning_iteration_timely_shuts_down() {
     assert!(!pruning_handle.is_finished());
 
     stop_sender.send_replace(true);
-    let outcome = pruning_handle.await.unwrap().unwrap();
-    assert_matches!(outcome, PruningIterationOutcome::Interrupted);
+    let err = pruning_handle.await.unwrap().unwrap_err();
+    assert_matches!(err, OrStopped::Stopped);
 }
 
 #[tokio::test]

@@ -1,7 +1,10 @@
 //! Tests for the `debug` Web3 namespace.
 
 use zksync_multivm::interface::{Call, TransactionExecutionResult};
-use zksync_types::BOOTLOADER_ADDRESS;
+use zksync_types::{
+    api::{CallTracerConfig, SupportedTracers, TracerConfig},
+    ExecuteTransactionCommon, BOOTLOADER_ADDRESS,
+};
 use zksync_web3_decl::{
     client::{DynClient, L2},
     namespaces::DebugNamespaceClient,
@@ -29,7 +32,7 @@ fn execute_l2_transaction_with_traces(index_in_block: u8) -> TransactionExecutio
     };
     TransactionExecutionResult {
         call_traces: vec![first_call_trace, second_call_trace],
-        ..execute_l2_transaction(create_l2_transaction(1, 2))
+        ..mock_execute_transaction(create_l2_transaction(1, 2).into())
     }
 }
 
@@ -58,18 +61,19 @@ impl HttpTest for TraceBlockTest {
             let block_traces = match block_id {
                 api::BlockId::Number(number) => client.trace_block_by_number(number, None).await?,
                 api::BlockId::Hash(hash) => client.trace_block_by_hash(hash, None).await?,
-            };
+            }
+            .unwrap_default();
 
             assert_eq!(block_traces.len(), tx_results.len()); // equals to the number of transactions in the block
             for (trace, tx_result) in block_traces.iter().zip(&tx_results) {
-                let api::ResultDebugCall { result } = trace;
+                let result = &trace.result;
                 assert_eq!(result.from, Address::zero());
                 assert_eq!(result.to, BOOTLOADER_ADDRESS);
                 assert_eq!(result.gas, tx_result.transaction.gas_limit());
                 let expected_calls: Vec<_> = tx_result
                     .call_traces
                     .iter()
-                    .map(|call| DebugNamespace::map_call(call.clone(), false))
+                    .map(|call| DebugNamespace::map_default_call(call.clone(), false, None))
                     .collect();
                 assert_eq!(result.calls, expected_calls);
             }
@@ -122,34 +126,40 @@ impl HttpTest for TraceBlockFlatTest {
 
         for block_id in block_ids {
             if let api::BlockId::Number(number) = block_id {
-                let block_traces = client.trace_block_by_number_flat(number, None).await?;
+                let block_traces = client
+                    .trace_block_by_number(
+                        number,
+                        Some(TracerConfig {
+                            tracer: SupportedTracers::FlatCallTracer,
+                            tracer_config: CallTracerConfig {
+                                only_top_call: false,
+                            },
+                        }),
+                    )
+                    .await?
+                    .unwrap_flat();
 
-                // A transaction with 2 nested calls will convert into 3 Flattened calls.
-                // Also in this test, all tx have the same # of nested calls
-                assert_eq!(
-                    block_traces.len(),
-                    tx_results.len() * (tx_results[0].call_traces.len() + 1)
-                );
+                assert_eq!(block_traces.len(), tx_results.len());
+
+                let tx_traces = &block_traces.first().unwrap().result;
 
                 // First tx has 2 nested calls, thus 2 sub-traces
-                assert_eq!(block_traces[0].subtraces, 2);
-                assert_eq!(block_traces[0].traceaddress, [0]);
+                assert_eq!(tx_traces[0].subtraces, 2);
+                assert_eq!(tx_traces[0].trace_address, [0]);
                 // Second flat-call (fist nested call) do not have nested calls
-                assert_eq!(block_traces[1].subtraces, 0);
-                assert_eq!(block_traces[1].traceaddress, [0, 0]);
+                assert_eq!(tx_traces[1].subtraces, 0);
+                assert_eq!(tx_traces[1].trace_address, [0, 0]);
 
-                let top_level_call_indexes = [0, 3, 6];
+                let top_level_call_indexes = [0, 1, 2];
                 let top_level_traces = top_level_call_indexes
                     .iter()
                     .map(|&i| block_traces[i].clone());
 
                 for (top_level_trace, tx_result) in top_level_traces.zip(&tx_results) {
-                    assert_eq!(top_level_trace.action.from, Address::zero());
-                    assert_eq!(top_level_trace.action.to, BOOTLOADER_ADDRESS);
-                    assert_eq!(
-                        top_level_trace.action.gas,
-                        tx_result.transaction.gas_limit()
-                    );
+                    let trace = top_level_trace.result.first().unwrap();
+                    assert_eq!(trace.action.from, Address::zero());
+                    assert_eq!(trace.action.to, BOOTLOADER_ADDRESS);
+                    assert_eq!(trace.action.gas, tx_result.transaction.gas_limit());
                 }
                 // TODO: test inner calls
             }
@@ -157,7 +167,15 @@ impl HttpTest for TraceBlockFlatTest {
 
         let missing_block_number = api::BlockNumber::from(*self.0 + 100);
         let error = client
-            .trace_block_by_number_flat(missing_block_number, None)
+            .trace_block_by_number(
+                missing_block_number,
+                Some(TracerConfig {
+                    tracer: SupportedTracers::FlatCallTracer,
+                    tracer_config: CallTracerConfig {
+                        only_top_call: false,
+                    },
+                }),
+            )
             .await
             .unwrap_err();
         if let ClientError::Call(error) = error {
@@ -198,13 +216,14 @@ impl HttpTest for TraceTransactionTest {
         let expected_calls: Vec<_> = tx_results[0]
             .call_traces
             .iter()
-            .map(|call| DebugNamespace::map_call(call.clone(), false))
+            .map(|call| DebugNamespace::map_default_call(call.clone(), false, None))
             .collect();
 
         let result = client
             .trace_transaction(tx_results[0].hash, None)
             .await?
-            .context("no transaction traces")?;
+            .context("no transaction traces")?
+            .unwrap_default();
         assert_eq!(result.from, Address::zero());
         assert_eq!(result.to, BOOTLOADER_ADDRESS);
         assert_eq!(result.gas, tx_results[0].transaction.gas_limit());
@@ -258,4 +277,98 @@ impl HttpTest for TraceBlockTestWithSnapshotRecovery {
 #[tokio::test]
 async fn tracing_block_after_snapshot_recovery() {
     test_http_server(TraceBlockTestWithSnapshotRecovery).await;
+}
+
+#[derive(Debug)]
+struct GetRawTransactionTest;
+
+#[async_trait]
+impl HttpTest for GetRawTransactionTest {
+    async fn test(
+        &self,
+        client: &DynClient<L2>,
+        pool: &ConnectionPool<Core>,
+    ) -> anyhow::Result<()> {
+        let tx_results = [execute_l2_transaction_with_traces(0)];
+        let mut storage = pool.connection().await?;
+        store_l2_block(&mut storage, L2BlockNumber(1), &tx_results).await?;
+        drop(storage);
+
+        let result = client
+            .get_raw_transaction(tx_results[0].hash)
+            .await?
+            .context("no raw transaction")?;
+        let ExecuteTransactionCommon::L2(common_data) = &tx_results[0].transaction.common_data
+        else {
+            panic!("non-L2 tx")
+        };
+        assert_eq!(result.0, common_data.input.as_ref().unwrap().data);
+
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn get_raw_transaction() {
+    test_http_server(GetRawTransactionTest).await;
+}
+
+#[derive(Debug)]
+struct GetRawTransactionsTest(L2BlockNumber);
+
+#[async_trait]
+impl HttpTest for GetRawTransactionsTest {
+    async fn test(
+        &self,
+        client: &DynClient<L2>,
+        pool: &ConnectionPool<Core>,
+    ) -> anyhow::Result<()> {
+        let tx_results = [0, 1, 2].map(execute_l2_transaction_with_traces);
+        let mut storage = pool.connection().await?;
+        let new_l2_block = store_l2_block(&mut storage, self.0, &tx_results).await?;
+        drop(storage);
+
+        let block_ids = [
+            api::BlockId::Number((*self.0).into()),
+            api::BlockId::Number(BlockNumber::Latest),
+            api::BlockId::Hash(new_l2_block.hash),
+        ];
+        for block_id in block_ids {
+            let raw_transactions = client
+                .get_raw_transactions(block_id)
+                .await
+                .context("no raw transactions")?;
+            assert_eq!(raw_transactions.len(), tx_results.len()); // equals to the number of transactions in the block
+            for (raw_transaction, tx_result) in raw_transactions.iter().zip(&tx_results) {
+                let ExecuteTransactionCommon::L2(common_data) = &tx_result.transaction.common_data
+                else {
+                    panic!("non-L2 tx")
+                };
+                assert_eq!(raw_transaction.0, common_data.input.as_ref().unwrap().data);
+            }
+        }
+
+        let missing_block_number = api::BlockNumber::from(*self.0 + 100);
+        let error = client
+            .get_raw_transactions(api::BlockId::Number(missing_block_number))
+            .await
+            .unwrap_err();
+        if let ClientError::Call(error) = error {
+            assert_eq!(error.code(), ErrorCode::InvalidParams.code());
+            assert!(
+                error.message().contains("Block") && error.message().contains("doesn't exist"),
+                "{error:?}"
+            );
+            assert!(error.data().is_none(), "{error:?}");
+        } else {
+            panic!("Unexpected error: {error:?}");
+        }
+
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn get_raw_transactions() {
+    test_http_server(GetRawTransactionsTest(L2BlockNumber(1))).await;
 }

@@ -1,32 +1,47 @@
-use serde::Deserialize;
+use std::time::Duration;
 
-/// Configuration for the house keeper.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
+use smart_config::{DescribeConfig, DeserializeConfig};
+
+/// Configuration for the housekeeper.
+#[derive(Debug, Clone, PartialEq, DescribeConfig, DeserializeConfig)]
+#[config(derive(Default))]
 pub struct HouseKeeperConfig {
-    pub l1_batch_metrics_reporting_interval_ms: u64,
-    pub gpu_prover_queue_reporting_interval_ms: u64,
-    pub prover_job_retrying_interval_ms: u64,
-    pub prover_stats_reporting_interval_ms: u64,
-    pub witness_job_moving_interval_ms: u64,
-    pub witness_generator_stats_reporting_interval_ms: u64,
-    pub witness_generator_job_retrying_interval_ms: u64,
-    pub prover_db_pool_size: u32,
-    pub proof_compressor_job_retrying_interval_ms: u64,
-    pub proof_compressor_stats_reporting_interval_ms: u64,
-    pub prover_job_archiver_archiving_interval_ms: Option<u64>,
-    pub prover_job_archiver_archive_after_secs: Option<u64>,
-    pub fri_gpu_prover_archiver_archiving_interval_ms: Option<u64>,
-    pub fri_gpu_prover_archiver_archive_after_secs: Option<u64>,
+    #[config(default_t = Duration::from_secs(10))]
+    pub l1_batch_metrics_reporting_interval: Duration,
 }
 
-impl HouseKeeperConfig {
-    pub fn prover_job_archiver_params(&self) -> Option<(u64, u64)> {
-        self.prover_job_archiver_archiving_interval_ms
-            .zip(self.prover_job_archiver_archive_after_secs)
+#[cfg(test)]
+mod tests {
+    use smart_config::{testing::test_complete, Environment, Yaml};
+
+    use super::*;
+
+    fn expected_config() -> HouseKeeperConfig {
+        HouseKeeperConfig {
+            l1_batch_metrics_reporting_interval: Duration::from_secs(10),
+        }
     }
 
-    pub fn fri_gpu_prover_archiver_params(&self) -> Option<(u64, u64)> {
-        self.fri_gpu_prover_archiver_archiving_interval_ms
-            .zip(self.fri_gpu_prover_archiver_archive_after_secs)
+    #[test]
+    fn parsing_from_env() {
+        let env = r#"
+            HOUSE_KEEPER_L1_BATCH_METRICS_REPORTING_INTERVAL_MS="10000"
+        "#;
+        let env = Environment::from_dotenv("test.env", env)
+            .unwrap()
+            .strip_prefix("HOUSE_KEEPER_");
+
+        let config: HouseKeeperConfig = test_complete(env).unwrap();
+        assert_eq!(config, expected_config());
+    }
+
+    #[test]
+    fn parsing_from_yaml() {
+        let yaml = r#"
+          l1_batch_metrics_reporting_interval_ms: 10000
+        "#;
+        let yaml = Yaml::new("test.yml", serde_yaml::from_str(yaml).unwrap()).unwrap();
+        let config: HouseKeeperConfig = test_complete(yaml).unwrap();
+        assert_eq!(config, expected_config());
     }
 }

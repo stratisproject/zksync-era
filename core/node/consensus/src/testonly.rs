@@ -1,5 +1,5 @@
 //! Utilities for testing the consensus module.
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use rand::Rng;
@@ -7,52 +7,53 @@ use zksync_concurrency::{ctx, error::Wrap as _, scope, sync, time};
 use zksync_config::{
     configs,
     configs::{
-        chain::{OperationsManagerConfig, StateKeeperConfig},
+        chain::SharedStateKeeperConfig,
         consensus as config,
+        consensus::RpcConfig,
         database::{MerkleTreeConfig, MerkleTreeMode},
+        snapshot_recovery::TreeRecoveryConfig,
     },
 };
 use zksync_consensus_crypto::TextFmt as _;
 use zksync_consensus_network as network;
-use zksync_consensus_roles::{attester, validator, validator::testonly::Setup};
+use zksync_consensus_roles::{validator, validator::testonly::Setup};
 use zksync_dal::{CoreDal, DalError};
-use zksync_l1_contract_interface::i_executor::structures::StoredBatchInfo;
-use zksync_metadata_calculator::{
-    LazyAsyncTreeReader, MetadataCalculator, MetadataCalculatorConfig,
+use zksync_metadata_calculator::{MetadataCalculator, MetadataCalculatorConfig};
+use zksync_node_api_server::web3::{
+    state::{InternalApiConfig, InternalApiConfigBase},
+    testonly::TestServerBuilder,
 };
-use zksync_node_api_server::web3::{state::InternalApiConfig, testonly::spawn_http_server};
 use zksync_node_genesis::GenesisParams;
 use zksync_node_sync::{
     fetcher::{FetchedTransaction, IoCursorExt as _},
     sync_action::{ActionQueue, ActionQueueSender, SyncAction},
     testonly::MockMainNodeClient,
-    ExternalIO, MainNodeClient, SyncState,
+    ExternalIO, MainNodeClient,
 };
 use zksync_node_test_utils::{create_l1_batch_metadata, l1_batch_metadata_to_commitment_artifacts};
+use zksync_shared_resources::api::SyncState;
 use zksync_state_keeper::{
+    executor::MainBatchExecutorFactory,
     io::{IoCursor, L1BatchParams, L2BlockParams},
     seal_criteria::NoopSealer,
-    testonly::{
-        fund, l1_transaction, l2_transaction, test_batch_executor::MockReadStorageFactory,
-        MockBatchExecutor,
-    },
-    AsyncRocksdbCache, MainBatchExecutor, OutputHandler, StateKeeperPersistence,
-    TreeWritesPersistence, ZkSyncStateKeeper,
+    testonly::{fee, fund, test_batch_executor::MockReadStorageFactory, MockBatchExecutor},
+    AsyncRocksdbCache, OutputHandler, StateKeeperBuilder, StateKeeperPersistence,
+    TreeWritesPersistence,
 };
-use zksync_test_account::Account;
+use zksync_test_contracts::Account;
 use zksync_types::{
+    ethabi,
     fee_model::{BatchFeeInput, L1PeggedBatchFeeModelInput},
-    Address, L1BatchNumber, L2BlockNumber, L2ChainId, PriorityOpId, ProtocolVersionId,
+    settlement::SettlementLayer,
+    Address, Execute, L1BatchNumber, L2BlockNumber, L2ChainId, PriorityOpId, ProtocolVersionId,
+    Transaction,
 };
 use zksync_web3_decl::client::{Client, DynClient, L2};
 
-use crate::{
-    batch::{L1BatchCommit, L1BatchWithWitness, LastBlockCommit},
-    en,
-    storage::ConnectionPool,
-};
+use crate::{en, storage::ConnectionPool};
 
 /// Fake StateKeeper for tests.
+#[derive(Debug)]
 pub(super) struct StateKeeper {
     protocol_version: ProtocolVersionId,
     // Batch of the `last_block`.
@@ -61,15 +62,12 @@ pub(super) struct StateKeeper {
     // timestamp of the last block.
     last_timestamp: u64,
     batch_sealed: bool,
-    // test L2 account
-    account: Account,
     next_priority_op: PriorityOpId,
 
     actions_sender: ActionQueueSender,
     sync_state: SyncState,
     addr: sync::watch::Receiver<Option<std::net::SocketAddr>>,
     pool: ConnectionPool,
-    tree_reader: LazyAsyncTreeReader,
 }
 
 #[derive(Clone)]
@@ -84,60 +82,50 @@ impl ConfigSet {
         let net = network::testonly::new_fullnode(rng, &self.net);
         ConfigSet {
             config: make_config(&net, None),
-            secrets: make_secrets(&net, None),
+            secrets: make_secrets(&net),
             net,
         }
     }
 }
 
-pub(super) fn new_configs(
-    rng: &mut impl Rng,
-    setup: &Setup,
-    gossip_peers: usize,
-) -> Vec<ConfigSet> {
+pub(super) fn new_configs(rng: &mut impl Rng, setup: &Setup, seed_peers: usize) -> Vec<ConfigSet> {
+    let net_cfgs = network::testonly::new_configs(rng, setup, 0);
     let genesis_spec = config::GenesisSpec {
         chain_id: setup.genesis.chain_id.0.try_into().unwrap(),
         protocol_version: config::ProtocolVersion(setup.genesis.protocol_version.0),
         validators: setup
             .validator_keys
             .iter()
-            .map(|k| config::WeightedValidator {
-                key: config::ValidatorPublicKey(k.public().encode()),
-                weight: 1,
-            })
+            .map(|k| (config::ValidatorPublicKey(k.public().encode()), 1))
             .collect(),
-        attesters: setup
-            .attester_keys
+        leader: Some(config::ValidatorPublicKey(
+            setup.validator_keys[0].public().encode(),
+        )),
+        registry_address: None,
+        seed_peers: net_cfgs[..seed_peers]
             .iter()
-            .map(|k| config::WeightedAttester {
-                key: config::AttesterPublicKey(k.public().encode()),
-                weight: 1,
+            .map(|c| {
+                (
+                    config::NodePublicKey(c.gossip.key.public().encode()),
+                    config::Host(c.public_addr.0.clone()),
+                )
             })
             .collect(),
-        leader: config::ValidatorPublicKey(setup.validator_keys[0].public().encode()),
     };
-    network::testonly::new_configs(rng, setup, gossip_peers)
+    net_cfgs
         .into_iter()
-        .enumerate()
-        .map(|(i, net)| ConfigSet {
+        .map(|net| ConfigSet {
             config: make_config(&net, Some(genesis_spec.clone())),
-            secrets: make_secrets(&net, setup.attester_keys.get(i).cloned()),
+            secrets: make_secrets(&net),
             net,
         })
         .collect()
 }
 
-fn make_secrets(
-    cfg: &network::Config,
-    attester_key: Option<attester::SecretKey>,
-) -> config::ConsensusSecrets {
+fn make_secrets(cfg: &network::Config) -> config::ConsensusSecrets {
     config::ConsensusSecrets {
-        node_key: Some(config::NodeSecretKey(cfg.gossip.key.encode().into())),
-        validator_key: cfg
-            .validator_key
-            .as_ref()
-            .map(|k| config::ValidatorSecretKey(k.encode().into())),
-        attester_key: attester_key.map(|k| config::AttesterSecretKey(k.encode().into())),
+        node_key: Some(cfg.gossip.key.encode().into()),
+        validator_key: cfg.validator_key.as_ref().map(|k| k.encode().into()),
     }
 }
 
@@ -146,10 +134,13 @@ fn make_config(
     genesis_spec: Option<config::GenesisSpec>,
 ) -> config::ConsensusConfig {
     config::ConsensusConfig {
+        port: Some(cfg.server_addr.port()),
         server_addr: *cfg.server_addr,
         public_addr: config::Host(cfg.public_addr.0.clone()),
-        max_payload_size: usize::MAX,
-        max_batch_size: usize::MAX,
+        max_payload_size: u64::MAX.into(),
+        max_transaction_size: u64::MAX.into(),
+        max_batch_size: u64::MAX.into(),
+        view_timeout: Duration::from_secs(2),
         gossip_dynamic_inbound_limit: cfg.gossip.dynamic_inbound_limit,
         gossip_static_inbound: cfg
             .gossip
@@ -169,7 +160,9 @@ fn make_config(
         // TODO: this might be misleading, so it would be better to write some more custom
         // genesis generator for zksync-era tests.
         genesis_spec,
-        rpc: None,
+        rpc: RpcConfig::default(),
+        debug_page_addr: None,
+        consensus_registry_read_rate: Duration::from_secs(1),
     }
 }
 
@@ -182,7 +175,6 @@ pub(super) struct StateKeeperRunner {
     addr: sync::watch::Sender<Option<std::net::SocketAddr>>,
     rocksdb_dir: tempfile::TempDir,
     metadata_calculator: MetadataCalculator,
-    account: Account,
 }
 
 impl StateKeeper {
@@ -217,31 +209,21 @@ impl StateKeeper {
 
         let rocksdb_dir = tempfile::tempdir().context("tempdir()")?;
         let merkle_tree_config = MerkleTreeConfig {
-            path: rocksdb_dir
-                .path()
-                .join("merkle_tree")
-                .to_string_lossy()
-                .into(),
             mode: MerkleTreeMode::Lightweight,
-            ..Default::default()
+            ..MerkleTreeConfig::for_tests(rocksdb_dir.path().join("merkle_tree"))
         };
-        let operation_manager_config = OperationsManagerConfig {
-            delay_interval: 100, //`100ms`
-        };
-        let state_keeper_config = StateKeeperConfig {
+        let state_keeper_config = SharedStateKeeperConfig {
             protective_reads_persistence_enabled: true,
-            ..Default::default()
+            ..SharedStateKeeperConfig::default()
         };
-        let config = MetadataCalculatorConfig::for_main_node(
+        let config = MetadataCalculatorConfig::from_configs(
             &merkle_tree_config,
-            &operation_manager_config,
             &state_keeper_config,
+            &TreeRecoveryConfig::default(),
         );
         let metadata_calculator = MetadataCalculator::new(config, None, pool.0.clone())
             .await
             .context("MetadataCalculator::new()")?;
-        let tree_reader = metadata_calculator.tree_reader();
-        let account = Account::random();
         Ok((
             Self {
                 protocol_version,
@@ -254,8 +236,6 @@ impl StateKeeper {
                 sync_state: sync_state.clone(),
                 addr: addr.subscribe(),
                 pool: pool.clone(),
-                tree_reader,
-                account: account.clone(),
             },
             StateKeeperRunner {
                 actions_queue,
@@ -264,7 +244,6 @@ impl StateKeeper {
                 addr,
                 rocksdb_dir,
                 metadata_calculator,
-                account,
             },
         ))
     }
@@ -284,10 +263,10 @@ impl StateKeeper {
                         fair_l2_gas_price: 10,
                         l1_gas_price: 100,
                     }),
-                    first_l2_block: L2BlockParams {
-                        timestamp: self.last_timestamp,
-                        virtual_blocks: 1,
-                    },
+                    first_l2_block: L2BlockParams::new(self.last_timestamp * 1000),
+                    pubdata_params: Default::default(),
+                    pubdata_limit: (self.protocol_version >= ProtocolVersionId::Version29)
+                        .then_some(100_000),
                 },
                 number: self.last_batch,
                 first_l2_block_number: self.last_block,
@@ -296,31 +275,38 @@ impl StateKeeper {
             self.last_block += 1;
             self.last_timestamp += 2;
             SyncAction::L2Block {
-                params: L2BlockParams {
-                    timestamp: self.last_timestamp,
-                    virtual_blocks: 0,
-                },
+                params: L2BlockParams::new(self.last_timestamp * 1000),
                 number: self.last_block,
             }
         }
     }
 
-    /// Pushes a new L2 block with `transactions` transactions to the `StateKeeper`.
-    pub async fn push_random_block(&mut self, rng: &mut impl Rng) {
+    pub async fn push_block(&mut self, txs: &[Transaction]) {
         let mut actions = vec![self.open_block()];
-        for _ in 0..rng.gen_range(3..8) {
-            let tx = match rng.gen() {
-                true => l2_transaction(&mut self.account, 1_000_000),
-                false => {
-                    let tx = l1_transaction(&mut self.account, self.next_priority_op);
-                    self.next_priority_op += 1;
-                    tx
-                }
-            };
-            actions.push(FetchedTransaction::new(tx).into());
-        }
+        actions.extend(
+            txs.iter()
+                .map(|tx| FetchedTransaction::new(tx.clone()).into()),
+        );
         actions.push(SyncAction::SealL2Block);
         self.actions_sender.push_actions(actions).await.unwrap();
+    }
+
+    /// Pushes a new L2 block with `transactions` transactions to the `StateKeeper`.
+    pub async fn push_random_block(&mut self, rng: &mut impl Rng, account: &mut Account) {
+        let txs: Vec<_> = (0..rng.gen_range(3..8))
+            .map(|_| {
+                let execute = Execute::transfer(Address::random(), 0.into());
+                match rng.gen() {
+                    true => account.get_l2_tx_for_execute(execute, Some(fee(1_000_000))),
+                    false => {
+                        let tx = account.get_l1_tx(execute, self.next_priority_op.0);
+                        self.next_priority_op += 1;
+                        tx
+                    }
+                }
+            })
+            .collect();
+        self.push_block(&txs).await;
     }
 
     /// Pushes `SealBatch` command to the `StateKeeper`.
@@ -333,14 +319,19 @@ impl StateKeeper {
     }
 
     /// Pushes `count` random L2 blocks to the StateKeeper.
-    pub async fn push_random_blocks(&mut self, rng: &mut impl Rng, count: usize) {
+    pub async fn push_random_blocks(
+        &mut self,
+        rng: &mut impl Rng,
+        account: &mut Account,
+        count: usize,
+    ) {
         for _ in 0..count {
             // 20% chance to seal an L1 batch.
             // `seal_batch()` also produces a (fictive) block.
             if rng.gen_range(0..100) < 20 {
                 self.seal_batch().await;
             } else {
-                self.push_random_block(rng).await;
+                self.push_random_block(rng, account).await;
             }
         }
     }
@@ -351,52 +342,14 @@ impl StateKeeper {
         validator::BlockNumber(self.last_block.0.into())
     }
 
-    /// Batch of the `last_block`.
-    pub fn last_batch(&self) -> L1BatchNumber {
-        self.last_batch
-    }
-
     /// Last L1 batch that has been sealed and will have
     /// metadata computed eventually.
     pub fn last_sealed_batch(&self) -> L1BatchNumber {
-        self.last_batch - (!self.batch_sealed) as u32
-    }
-
-    /// Loads a commitment to L1 batch directly from the database.
-    // TODO: ideally, we should rather fake fetching it from Ethereum.
-    // We can use `zksync_eth_client::clients::MockEthereum` for that,
-    // which implements `EthInterface`. It should be enough to use
-    // `MockEthereum.with_call_handler()`.
-    pub async fn load_batch_commit(
-        &self,
-        ctx: &ctx::Ctx,
-        number: L1BatchNumber,
-    ) -> ctx::Result<L1BatchCommit> {
-        // TODO: we should mock the `eth_sender` as well.
-        let mut conn = self.pool.connection(ctx).await?;
-        let this = conn.batch(ctx, number).await?.context("missing batch")?;
-        let prev = conn
-            .batch(ctx, number - 1)
-            .await?
-            .context("missing batch")?;
-        Ok(L1BatchCommit {
-            number,
-            this_batch: LastBlockCommit {
-                info: StoredBatchInfo::from(&this).hash(),
-            },
-            prev_batch: LastBlockCommit {
-                info: StoredBatchInfo::from(&prev).hash(),
-            },
-        })
-    }
-
-    /// Loads an `L1BatchWithWitness`.
-    pub async fn load_batch_with_witness(
-        &self,
-        ctx: &ctx::Ctx,
-        n: L1BatchNumber,
-    ) -> ctx::Result<L1BatchWithWitness> {
-        L1BatchWithWitness::load(ctx, n, &self.pool, &self.tree_reader).await
+        if self.batch_sealed {
+            self.last_batch
+        } else {
+            self.last_batch - 1
+        }
     }
 
     /// Connects to the json RPC endpoint exposed by the state keeper.
@@ -413,7 +366,7 @@ impl StateKeeper {
             let res = ctx.wait(client.fetch_l2_block_number()).await?;
             match res {
                 Ok(_) => return Ok(client),
-                Err(err) if err.is_retriable() => {
+                Err(err) if err.is_retryable() => {
                     ctx.sleep(time::Duration::seconds(5)).await?;
                 }
                 Err(err) => {
@@ -450,7 +403,13 @@ impl StateKeeper {
             client,
             sync_state: self.sync_state.clone(),
         }
-        .run(ctx, self.actions_sender, cfgs.config, cfgs.secrets)
+        .run(
+            ctx,
+            self.actions_sender,
+            cfgs.config,
+            cfgs.secrets,
+            cfgs.net.build_version,
+        )
         .await
     }
 }
@@ -533,14 +492,23 @@ async fn mock_metadata_calculator_step(ctx: &ctx::Ctx, pool: &ConnectionPool) ->
 impl StateKeeperRunner {
     // Executes the state keeper task with real metadata calculator task
     // and fake commitment generator (because real one is too slow).
-    pub async fn run_real(self, ctx: &ctx::Ctx) -> anyhow::Result<()> {
+    pub async fn run_real(
+        self,
+        ctx: &ctx::Ctx,
+        addrs_to_fund: &[ethabi::Address],
+    ) -> anyhow::Result<()> {
         let res = scope::run!(ctx, |ctx, s| async {
-            // Fund the test account. Required for L2 transactions to succeed.
-            fund(&self.pool.0, &[self.account.address]).await;
+            // Fund the test accounts. Required for L2 transactions to succeed.
+            fund(&self.pool.0, addrs_to_fund).await;
 
             let (stop_send, stop_recv) = sync::watch::channel(false);
-            let (persistence, l2_block_sealer) =
-                StateKeeperPersistence::new(self.pool.0.clone(), Address::repeat_byte(11), 5);
+            let (persistence, l2_block_sealer) = StateKeeperPersistence::new(
+                self.pool.0.clone(),
+                Some(ethabi::Address::repeat_byte(11)),
+                5,
+            )
+            .await
+            .unwrap();
 
             let io = ExternalIO::new(
                 self.pool.0.clone(),
@@ -568,13 +536,23 @@ impl StateKeeperRunner {
             // Caching shouldn't be needed for tests.
             let (async_cache, async_catchup_task) = AsyncRocksdbCache::new(
                 self.pool.0.clone(),
-                self.rocksdb_dir
-                    .path()
-                    .join("cache")
-                    .to_string_lossy()
-                    .into(),
+                self.rocksdb_dir.path().join("cache"),
                 Default::default(),
             );
+            let executor_factory = MainBatchExecutorFactory::<()>::new(false);
+            let state_keeper = StateKeeperBuilder::new(
+                Box::new(io),
+                Box::new(executor_factory),
+                OutputHandler::new(Box::new(persistence.with_tx_insertion()))
+                    .with_handler(Box::new(self.sync_state.clone())),
+                Arc::new(NoopSealer),
+                Arc::new(async_cache),
+                None,
+            )
+            .build(&stop_recv)
+            .await
+            .unwrap();
+
             s.spawn_bg({
                 let stop_recv = stop_recv.clone();
                 async {
@@ -594,36 +572,31 @@ impl StateKeeperRunner {
             s.spawn_bg({
                 let stop_recv = stop_recv.clone();
                 async {
-                    ZkSyncStateKeeper::new(
-                        stop_recv,
-                        Box::new(io),
-                        Box::new(MainBatchExecutor::new(false, false)),
-                        OutputHandler::new(Box::new(persistence.with_tx_insertion()))
-                            .with_handler(Box::new(self.sync_state.clone())),
-                        Arc::new(NoopSealer),
-                        Arc::new(async_cache),
-                    )
-                    .run()
-                    .await
-                    .context("ZkSyncStateKeeper::run()")?;
+                    state_keeper
+                        .run(stop_recv)
+                        .await
+                        .context("StateKeeper::run()")?;
                     Ok(())
                 }
             });
             s.spawn_bg(async {
                 // Spawn HTTP server.
+                let contracts_config = configs::ContractsConfig::for_tests();
+                let state_keeper_config = configs::chain::StateKeeperConfig::for_tests();
+                let genesis_config = configs::GenesisConfig::for_tests();
+                let web3_config = &configs::api::Web3JsonRpcConfig::for_tests();
                 let cfg = InternalApiConfig::new(
-                    &configs::api::Web3JsonRpcConfig::for_tests(),
-                    &configs::contracts::ContractsConfig::for_tests(),
-                    &configs::GenesisConfig::for_tests(),
+                    InternalApiConfigBase::new(&genesis_config, web3_config, &state_keeper_config)
+                        .with_l1_to_l2_txs_paused(false),
+                    &contracts_config.settlement_layer_specific_contracts(),
+                    &contracts_config.l1_specific_contracts(),
+                    &contracts_config.l2_contracts(),
+                    &genesis_config,
+                    SettlementLayer::for_tests(),
                 );
-                let mut server = spawn_http_server(
-                    cfg,
-                    self.pool.0.clone(),
-                    Default::default(),
-                    Arc::default(),
-                    stop_recv,
-                )
-                .await;
+                let mut server = TestServerBuilder::new(self.pool.0.clone(), cfg)
+                    .build_http(stop_recv)
+                    .await;
                 if let Ok(addr) = ctx.wait(server.wait_until_ready()).await {
                     self.addr.send_replace(Some(addr));
                     tracing::info!("API server ready!");
@@ -647,8 +620,13 @@ impl StateKeeperRunner {
     pub async fn run(self, ctx: &ctx::Ctx) -> anyhow::Result<()> {
         let res = scope::run!(ctx, |ctx, s| async {
             let (stop_send, stop_recv) = sync::watch::channel(false);
-            let (persistence, l2_block_sealer) =
-                StateKeeperPersistence::new(self.pool.0.clone(), Address::repeat_byte(11), 5);
+            let (persistence, l2_block_sealer) = StateKeeperPersistence::new(
+                self.pool.0.clone(),
+                Some(ethabi::Address::repeat_byte(11)),
+                5,
+            )
+            .await
+            .unwrap();
             let tree_writes_persistence = TreeWritesPersistence::new(self.pool.0.clone());
 
             let io = ExternalIO::new(
@@ -657,6 +635,21 @@ impl StateKeeperRunner {
                 Box::<MockMainNodeClient>::default(),
                 L2ChainId::default(),
             )?;
+
+            let state_keeper = StateKeeperBuilder::new(
+                Box::new(io),
+                Box::new(MockBatchExecutor),
+                OutputHandler::new(Box::new(persistence.with_tx_insertion()))
+                    .with_handler(Box::new(tree_writes_persistence))
+                    .with_handler(Box::new(self.sync_state.clone())),
+                Arc::new(NoopSealer),
+                Arc::new(MockReadStorageFactory),
+                None,
+            )
+            .build(&stop_recv)
+            .await
+            .unwrap();
+
             s.spawn_bg(async {
                 Ok(l2_block_sealer
                     .run()
@@ -675,37 +668,31 @@ impl StateKeeperRunner {
             s.spawn_bg({
                 let stop_recv = stop_recv.clone();
                 async {
-                    ZkSyncStateKeeper::new(
-                        stop_recv,
-                        Box::new(io),
-                        Box::new(MockBatchExecutor),
-                        OutputHandler::new(Box::new(persistence.with_tx_insertion()))
-                            .with_handler(Box::new(tree_writes_persistence))
-                            .with_handler(Box::new(self.sync_state.clone())),
-                        Arc::new(NoopSealer),
-                        Arc::new(MockReadStorageFactory),
-                    )
-                    .run()
-                    .await
-                    .context("ZkSyncStateKeeper::run()")?;
+                    state_keeper
+                        .run(stop_recv)
+                        .await
+                        .context("StateKeeper::run()")?;
                     Ok(())
                 }
             });
             s.spawn_bg(async {
                 // Spawn HTTP server.
+                let contracts_config = configs::ContractsConfig::for_tests();
+                let state_keeper_config = configs::chain::StateKeeperConfig::for_tests();
+                let genesis_config = configs::GenesisConfig::for_tests();
+                let web3_config = &configs::api::Web3JsonRpcConfig::for_tests();
                 let cfg = InternalApiConfig::new(
-                    &configs::api::Web3JsonRpcConfig::for_tests(),
-                    &configs::contracts::ContractsConfig::for_tests(),
-                    &configs::GenesisConfig::for_tests(),
+                    InternalApiConfigBase::new(&genesis_config, web3_config, &state_keeper_config)
+                        .with_l1_to_l2_txs_paused(false),
+                    &contracts_config.settlement_layer_specific_contracts(),
+                    &contracts_config.l1_specific_contracts(),
+                    &contracts_config.l2_contracts(),
+                    &genesis_config,
+                    SettlementLayer::for_tests(),
                 );
-                let mut server = spawn_http_server(
-                    cfg,
-                    self.pool.0.clone(),
-                    Default::default(),
-                    Arc::default(),
-                    stop_recv,
-                )
-                .await;
+                let mut server = TestServerBuilder::new(self.pool.0.clone(), cfg)
+                    .build_http(stop_recv)
+                    .await;
                 if let Ok(addr) = ctx.wait(server.wait_until_ready()).await {
                     self.addr.send_replace(Some(addr));
                     tracing::info!("API server ready!");

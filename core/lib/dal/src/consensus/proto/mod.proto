@@ -3,6 +3,25 @@ syntax = "proto3";
 package zksync.dal;
 
 import "zksync/roles/validator.proto";
+import "zksync/roles/node.proto";
+
+message BlockCertificate {
+  // required
+  oneof t {
+    roles.validator.CommitQC v1 = 1;
+    roles.validator.CommitQCV2 v2 = 2;
+  }
+}
+
+message BlockMetadata {
+  optional roles.validator.PayloadHash payload_hash = 1; // required
+}
+
+message InteropRoot {
+  optional uint32 chain_id = 1; // required; u32
+  optional uint32 block_number = 2; // required; u32
+  repeated bytes sides = 3; // required; Vec<U256>
+}
 
 message Payload {
   // zksync-era ProtocolVersionId
@@ -20,6 +39,15 @@ message Payload {
   // Set for protocol_version >= 25.
   repeated TransactionV25 transactions_v25 = 12;
   optional bool last_in_batch = 10; // required
+  optional PubdataParams pubdata_params = 13; // optional
+  optional uint64 pubdata_limit = 14; // required since v29
+  repeated InteropRoot interop_roots = 15; // optional; set for protocol_version >= 29
+}
+
+message PubdataParams {
+  optional bytes l2_da_validator_address = 1; // required; H160
+  optional PubdataType pubdata_info = 3; // required
+  reserved 2; reserved "pubdata_type";
 }
 
 message L1Transaction {
@@ -101,7 +129,7 @@ message ProtocolUpgradeTxCommonData {
 }
 
 message Execute {
-  optional bytes contract_address = 1; // required; H160
+  optional bytes contract_address = 1; // optional; H160
   optional bytes calldata = 2; // required
   optional bytes value = 3; // required; U256
   repeated bytes factory_deps = 4;
@@ -117,7 +145,22 @@ message PaymasterParams {
   optional bytes paymaster_input = 2; // required
 }
 
-message AttestationStatus {
-  optional roles.validator.GenesisHash genesis = 1; // required
-  optional uint64 next_batch_to_attest = 2; // required
+message NodeAddr {
+  optional roles.node.PublicKey key = 1; // required
+  optional string addr = 2; // required; Host
+}
+
+message GlobalConfig {
+  optional roles.validator.Genesis genesis = 1; // required
+  optional bytes registry_address = 2; // optional; H160
+  repeated NodeAddr seed_peers = 3;
+}
+
+enum PubdataType {
+  Rollup = 0;
+  NoDA = 1;
+  Avail = 2;
+  Celestia = 3;
+  Eigen = 4;
+  ObjectStore = 5;
 }

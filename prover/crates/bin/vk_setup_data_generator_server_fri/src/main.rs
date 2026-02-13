@@ -1,35 +1,35 @@
+#![feature(allocator_api, generic_const_exprs)]
+#![allow(incomplete_features)]
+
 //! Tool to generate different types of keys used by the proving system.
 //!
 //! It can generate verification keys, setup keys, and also commitments.
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use commitment_generator::read_and_update_contract_toml;
 use indicatif::{ProgressBar, ProgressStyle};
+#[cfg(feature = "gpu")]
+use proof_compression_gpu::{
+    precompute_proof_chain_with_fflonk, precompute_proof_chain_with_plonk,
+};
 use tracing::level_filters::LevelFilter;
 use zkevm_test_harness::{
     compute_setups::{
         basic_vk_count, generate_base_layer_vks, generate_recursive_layer_vks,
         recursive_layer_vk_count,
     },
-    data_source::{in_memory_data_source::InMemoryDataSource, SetupDataSource},
-    proof_wrapper_utils::{
-        check_trusted_setup_file_existace, get_wrapper_setup_and_vk_from_scheduler_vk,
-        WrapperConfig,
-    },
+    data_source::in_memory_data_source::InMemoryDataSource,
 };
-use zksync_prover_fri_types::{
-    circuit_definitions::circuit_definitions::recursion_layer::ZkSyncRecursionLayerStorageType,
-    ProverServiceDataKey,
-};
-use zksync_vk_setup_data_server_fri::{
-    commitment_utils::generate_commitments,
+use zksync_prover_fri_types::ProverServiceDataKey;
+use zksync_prover_keystore::{
     keystore::Keystore,
     setup_data_generator::{CPUSetupDataGenerator, GPUSetupDataGenerator, SetupDataGenerator},
 };
 
 mod commitment_generator;
+mod vk_commitment_helper;
 
 #[cfg(test)]
 mod tests;
@@ -38,19 +38,14 @@ mod tests;
 /// Jobs describe how many generators can run in parallel (each one is around 30 GB).
 /// If quiet is true, it doesn't display any progress bar.
 fn generate_vks(keystore: &Keystore, jobs: usize, quiet: bool) -> anyhow::Result<()> {
-    // Start by checking the trusted setup existence.
-    // This is used at the last step, but we want to fail early if user didn't configure everything
-    // correctly.
-    check_trusted_setup_file_existace();
-
     let progress_bar = if quiet {
         None
     } else {
-        let count = basic_vk_count() + recursive_layer_vk_count() + 1;
+        let count = basic_vk_count() + recursive_layer_vk_count() + 2;
         let progress_bar = ProgressBar::new(count as u64);
         progress_bar.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos:>7}/{len:7} ({eta})")
-        .progress_chars("#>-"));
+            .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos:>7}/{len:7} ({eta})")
+            .progress_chars("#>-"));
         Some(progress_bar)
     };
 
@@ -74,30 +69,7 @@ fn generate_vks(keystore: &Keystore, jobs: usize, quiet: bool) -> anyhow::Result
     })
     .map_err(|err| anyhow::anyhow!("Failed generating recursive vk's: {err}"))?;
 
-    tracing::info!("Saving keys & hints");
-
-    keystore.save_keys_from_data_source(&in_memory_source)?;
-
-    // Generate snark VK
-    let scheduler_vk = in_memory_source
-        .get_recursion_layer_vk(ZkSyncRecursionLayerStorageType::SchedulerCircuit as u8)
-        .map_err(|err| anyhow::anyhow!("Failed to get scheduler vk: {err}"))?;
-    tracing::info!("Generating verification keys for snark wrapper.");
-
-    // Compression mode is 1
-    let config = WrapperConfig::new(1);
-
-    let (_, vk) = get_wrapper_setup_and_vk_from_scheduler_vk(scheduler_vk, config);
-    keystore
-        .save_snark_verification_key(vk)
-        .context("save_snark_vk")?;
-
-    if let Some(p) = pb.lock().unwrap().as_ref() {
-        p.inc(1)
-    }
-
-    // Let's also update the commitments file.
-    keystore.save_commitments(&generate_commitments(keystore)?)
+    keystore.save_keys_from_data_source(&in_memory_source)
 }
 
 #[derive(Debug, Parser)]
@@ -161,6 +133,10 @@ enum Command {
         #[arg(long)]
         quiet: bool,
     },
+    #[command(name = "generate-compressor-data")]
+    GenerateCompressorPrecomputations,
+    #[command(name = "generate-crs")]
+    GenerateCompactCrs,
     /// Generates setup keys (used by the CPU prover).
     #[command(name = "generate-sk")]
     GenerateSetupKeys {
@@ -195,14 +171,14 @@ fn print_stats(digests: HashMap<String, String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn keystore_from_optional_path(path: Option<String>, setup_path: Option<String>) -> Keystore {
+fn keystore_from_optional_path(path: Option<String>, setup_data_path: Option<String>) -> Keystore {
     if let Some(path) = path {
-        return Keystore::new_with_optional_setup_path(path.into(), setup_path);
+        return Keystore::new(path.into()).with_setup_path(setup_data_path.map(PathBuf::from));
     }
-    if setup_path.is_some() {
+    if setup_data_path.is_some() {
         panic!("--setup_path must not be set when --path is not set");
     }
-    Keystore::default()
+    Keystore::locate()
 }
 
 fn generate_setup_keys(
@@ -260,7 +236,6 @@ fn main() -> anyhow::Result<()> {
 
             read_and_update_contract_toml(&keystore, dryrun)
         }
-
         Command::GenerateSetupKeys { options } => {
             let generator = CPUSetupDataGenerator {
                 keystore: keystore_from_optional_path(
@@ -278,6 +253,45 @@ fn main() -> anyhow::Result<()> {
                 ),
             };
             generate_setup_keys(&generator, &options)
+        }
+        Command::GenerateCompressorPrecomputations => {
+            #[cfg(not(feature = "gpu"))]
+            {
+                anyhow::bail!("Must compile with --gpu feature to use this option.")
+            }
+            #[cfg(feature = "gpu")]
+            {
+                let keystore = Keystore::locate();
+                precompute_proof_chain_with_plonk(std::sync::Arc::new(keystore.clone()))?;
+                precompute_proof_chain_with_fflonk(std::sync::Arc::new(keystore.clone()))?;
+
+                let commitments = keystore.generate_commitments()?;
+                keystore.save_commitments(&commitments)
+            }
+        }
+        Command::GenerateCompactCrs => {
+            #[cfg(not(feature = "gpu"))]
+            {
+                anyhow::bail!("Must compile with --gpu feature to use this option.")
+            }
+            #[cfg(feature = "gpu")]
+            {
+                let keystore = Keystore::locate();
+
+                if std::env::var("COMPACT_CRS_FILE").is_err() {
+                    return Err(anyhow::anyhow!("COMPACT_CRS_FILE env variable is not set"));
+                }
+
+                if std::env::var("IGNITION_TRANSCRIPT_PATH").is_err() {
+                    return Err(anyhow::anyhow!(
+                        "IGNITION_TRANSCRIPT_PATH env variable is not set"
+                    ));
+                }
+
+                Ok(proof_compression_gpu::create_compact_raw_crs(
+                    keystore.write_compact_raw_crs()?,
+                ))
+            }
         }
     }
 }

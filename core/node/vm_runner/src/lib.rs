@@ -5,18 +5,19 @@
 
 pub mod impls;
 mod io;
+mod metrics;
+pub mod node;
 mod output_handler;
 mod process;
 mod storage;
-
-mod metrics;
 #[cfg(test)]
 mod tests;
 
 pub use self::{
     io::VmRunnerIo,
     output_handler::{
-        ConcurrentOutputHandlerFactory, ConcurrentOutputHandlerFactoryTask, OutputHandlerFactory,
+        ConcurrentOutputHandlerFactory, ConcurrentOutputHandlerFactoryTask, L1BatchOutput,
+        L2BlockOutput, OutputHandler, OutputHandlerFactory,
     },
     process::VmRunner,
     storage::{BatchExecuteData, StorageSyncTask, VmRunnerStorage},

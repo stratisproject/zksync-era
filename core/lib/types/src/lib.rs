@@ -5,7 +5,7 @@
 
 #![allow(clippy::upper_case_acronyms, clippy::derive_partial_eq_without_eq)]
 
-use std::{fmt, fmt::Debug};
+use std::{fmt, ops::Range};
 
 use anyhow::Context as _;
 use fee::encoding_len;
@@ -15,17 +15,15 @@ pub use protocol_upgrade::{ProtocolUpgrade, ProtocolVersion};
 use serde::{Deserialize, Serialize};
 pub use storage::*;
 pub use tx::Execute;
+use zksync_basic_types::bytecode::BytecodeHash;
 pub use zksync_basic_types::{protocol_version::ProtocolVersionId, vm, *};
 pub use zksync_crypto_primitives::*;
-use zksync_utils::{
-    address_to_u256, bytecode::hash_bytecode, h256_to_u256, u256_to_account_address,
-};
 
+pub use crate::{interop_root::InteropRoot, Nonce, H256, U256, U64};
 use crate::{
     l2::{L2Tx, TransactionType},
     protocol_upgrade::ProtocolUpgradeTxCommonData,
 };
-pub use crate::{Nonce, H256, U256, U64};
 
 pub type SerialId = u64;
 
@@ -34,16 +32,17 @@ pub mod aggregated_operations;
 pub mod blob;
 pub mod block;
 pub mod commitment;
-pub mod contract_verification_api;
+#[cfg(feature = "contract-verification")]
+pub mod contract_verification;
 pub mod debug_flat_call;
 pub mod fee;
 pub mod fee_model;
+pub mod interop_root;
 pub mod l1;
 pub mod l2;
 pub mod l2_to_l1_log;
 pub mod priority_op_onchain_data;
 pub mod protocol_upgrade;
-pub mod pubdata_da;
 pub mod snapshots;
 pub mod storage;
 pub mod system_contracts;
@@ -55,8 +54,11 @@ pub mod api;
 pub mod base_token_ratio;
 pub mod eth_sender;
 pub mod helpers;
+#[cfg(feature = "protobuf")]
 pub mod proto;
+pub mod server_notification;
 pub mod transaction_request;
+pub mod transaction_status_commitment;
 pub mod utils;
 
 /// Denotes the first byte of the special ZKsync's EIP-712-signed transaction.
@@ -88,9 +90,16 @@ pub struct Transaction {
     pub raw_bytes: Option<web3::Bytes>,
 }
 
-impl std::fmt::Debug for Transaction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Transaction").field(&self.hash()).finish()
+impl fmt::Debug for Transaction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(hash) = self.hash_for_debugging() {
+            f.debug_tuple("Transaction").field(&hash).finish()
+        } else {
+            f.debug_struct("Transaction")
+                .field("initiator_account", &self.initiator_account())
+                .field("nonce", &self.nonce())
+                .finish()
+        }
     }
 }
 
@@ -104,7 +113,7 @@ impl Eq for Transaction {}
 
 impl Transaction {
     /// Returns recipient account of the transaction.
-    pub fn recipient_account(&self) -> Address {
+    pub fn recipient_account(&self) -> Option<Address> {
         self.execute.contract_address
     }
 
@@ -120,6 +129,13 @@ impl Transaction {
         matches!(self.common_data, ExecuteTransactionCommon::L1(_))
     }
 
+    pub fn is_protocol_upgrade(&self) -> bool {
+        matches!(
+            self.common_data,
+            ExecuteTransactionCommon::ProtocolUpgrade(_)
+        )
+    }
+
     pub fn tx_format(&self) -> TransactionType {
         match &self.common_data {
             ExecuteTransactionCommon::L1(tx) => tx.tx_format(),
@@ -133,6 +149,15 @@ impl Transaction {
             ExecuteTransactionCommon::L1(data) => data.hash(),
             ExecuteTransactionCommon::L2(data) => data.hash(),
             ExecuteTransactionCommon::ProtocolUpgrade(data) => data.hash(),
+        }
+    }
+
+    fn hash_for_debugging(&self) -> Option<H256> {
+        match &self.common_data {
+            ExecuteTransactionCommon::L1(data) => Some(data.hash()),
+            ExecuteTransactionCommon::L2(data) if data.input.is_some() => Some(data.hash()),
+            ExecuteTransactionCommon::L2(_) => None,
+            ExecuteTransactionCommon::ProtocolUpgrade(data) => Some(data.hash()),
         }
     }
 
@@ -209,6 +234,7 @@ impl Transaction {
 }
 
 /// Optional input `Ethereum`-like encoded transaction if submitted via Web3 API.
+///
 /// If exists, its hash will be used to identify transaction.
 /// Note, that for EIP712-type transactions, `hash` is not equal to the hash
 /// of the `data`, but rather calculated by special formula.
@@ -253,7 +279,7 @@ impl TryFrom<Transaction> for abi::Transaction {
                 tx: abi::L2CanonicalTransaction {
                     tx_type: PRIORITY_OPERATION_L2_TX_TYPE.into(),
                     from: address_to_u256(&data.sender),
-                    to: address_to_u256(&tx.execute.contract_address),
+                    to: address_to_u256(&tx.execute.contract_address.unwrap_or_default()),
                     gas_limit: data.gas_limit,
                     gas_per_pubdata_byte_limit: data.gas_per_pubdata_limit,
                     max_fee_per_gas: data.max_fee_per_gas,
@@ -271,7 +297,7 @@ impl TryFrom<Transaction> for abi::Transaction {
                     signature: vec![],
                     factory_deps: factory_deps
                         .iter()
-                        .map(|b| h256_to_u256(hash_bytecode(b)))
+                        .map(|b| BytecodeHash::for_bytecode(b).value_u256())
                         .collect(),
                     paymaster_input: vec![],
                     reserved_dynamic: vec![],
@@ -284,7 +310,7 @@ impl TryFrom<Transaction> for abi::Transaction {
                 tx: abi::L2CanonicalTransaction {
                     tx_type: PROTOCOL_UPGRADE_TX_TYPE.into(),
                     from: address_to_u256(&data.sender),
-                    to: address_to_u256(&tx.execute.contract_address),
+                    to: address_to_u256(&tx.execute.contract_address.unwrap_or_default()),
                     gas_limit: data.gas_limit,
                     gas_per_pubdata_byte_limit: data.gas_per_pubdata_limit,
                     max_fee_per_gas: data.max_fee_per_gas,
@@ -302,7 +328,7 @@ impl TryFrom<Transaction> for abi::Transaction {
                     signature: vec![],
                     factory_deps: factory_deps
                         .iter()
-                        .map(|b| h256_to_u256(hash_bytecode(b)))
+                        .map(|b| BytecodeHash::for_bytecode(b).value_u256())
                         .collect(),
                     paymaster_input: vec![],
                     reserved_dynamic: vec![],
@@ -315,9 +341,14 @@ impl TryFrom<Transaction> for abi::Transaction {
     }
 }
 
-impl TryFrom<abi::Transaction> for Transaction {
-    type Error = anyhow::Error;
-    fn try_from(tx: abi::Transaction) -> anyhow::Result<Self> {
+impl Transaction {
+    /// Converts a transaction from its ABI representation.
+    ///
+    /// # Arguments
+    ///
+    /// - `allow_no_target` enables / disables L2 transactions without target (i.e., `to` field).
+    ///   This field can only be absent for EVM deployment transactions.
+    pub fn from_abi(tx: abi::Transaction, allow_no_target: bool) -> anyhow::Result<Self> {
         Ok(match tx {
             abi::Transaction::L1 {
                 tx,
@@ -326,7 +357,7 @@ impl TryFrom<abi::Transaction> for Transaction {
             } => {
                 let factory_deps_hashes: Vec<_> = factory_deps
                     .iter()
-                    .map(|b| h256_to_u256(hash_bytecode(b)))
+                    .map(|b| BytecodeHash::for_bytecode(b).value_u256())
                     .collect();
                 anyhow::ensure!(tx.factory_deps == factory_deps_hashes);
                 for item in &tx.reserved[2..] {
@@ -348,10 +379,10 @@ impl TryFrom<abi::Transaction> for Transaction {
                                         .map_err(|err| anyhow::format_err!("{err}"))?,
                                 ),
                                 canonical_tx_hash: hash,
-                                sender: u256_to_account_address(&tx.from),
+                                sender: u256_to_address(&tx.from),
                                 layer_2_tip_fee: U256::zero(),
                                 to_mint: tx.reserved[0],
-                                refund_recipient: u256_to_account_address(&tx.reserved[1]),
+                                refund_recipient: u256_to_address(&tx.reserved[1]),
                                 full_fee: U256::zero(),
                                 gas_limit: tx.gas_limit,
                                 max_fee_per_gas: tx.max_fee_per_gas,
@@ -365,9 +396,9 @@ impl TryFrom<abi::Transaction> for Transaction {
                             ExecuteTransactionCommon::ProtocolUpgrade(ProtocolUpgradeTxCommonData {
                                 upgrade_id: tx.nonce.try_into().unwrap(),
                                 canonical_tx_hash: hash,
-                                sender: u256_to_account_address(&tx.from),
+                                sender: u256_to_address(&tx.from),
                                 to_mint: tx.reserved[0],
-                                refund_recipient: u256_to_account_address(&tx.reserved[1]),
+                                refund_recipient: u256_to_address(&tx.reserved[1]),
                                 gas_limit: tx.gas_limit,
                                 max_fee_per_gas: tx.max_fee_per_gas,
                                 gas_per_pubdata_limit: tx.gas_per_pubdata_byte_limit,
@@ -377,7 +408,7 @@ impl TryFrom<abi::Transaction> for Transaction {
                         unknown_type => anyhow::bail!("unknown tx type {unknown_type}"),
                     },
                     execute: Execute {
-                        contract_address: u256_to_account_address(&tx.to),
+                        contract_address: Some(u256_to_address(&tx.to)),
                         calldata: tx.data,
                         factory_deps,
                         value: tx.value,
@@ -389,10 +420,15 @@ impl TryFrom<abi::Transaction> for Transaction {
             abi::Transaction::L2(raw) => {
                 let (req, hash) =
                     transaction_request::TransactionRequest::from_bytes_unverified(&raw)?;
-                let mut tx = L2Tx::from_request_unverified(req)?;
+                let mut tx = L2Tx::from_request_unverified(req, allow_no_target)?;
                 tx.set_input(raw, hash);
                 tx.into()
             }
         })
     }
+}
+
+#[derive(Clone, Serialize, Debug, Default, Eq, PartialEq, Hash)]
+pub struct TransactionTimeRangeConstraint {
+    pub timestamp_asserter_range: Option<Range<u64>>,
 }

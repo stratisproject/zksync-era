@@ -81,39 +81,41 @@ impl StorageLogsDedupDal<'_, '_> {
     pub async fn insert_initial_writes(
         &mut self,
         l1_batch_number: L1BatchNumber,
-        written_hashed_keys: &[H256],
+        hashed_keys: &[H256],
     ) -> DalResult<()> {
-        let hashed_keys: Vec<_> = written_hashed_keys.iter().map(H256::as_bytes).collect();
-
         let last_index = self.max_enumeration_index().await?.unwrap_or(0);
-        let indices: Vec<_> = ((last_index + 1)..=(last_index + hashed_keys.len() as u64))
-            .map(|x| x as i64)
-            .collect();
+        self.insert_initial_writes_inner(l1_batch_number, hashed_keys, last_index)
+            .await
+    }
 
-        sqlx::query!(
-            r#"
-            INSERT INTO
-                initial_writes (hashed_key, INDEX, l1_batch_number, created_at, updated_at)
-            SELECT
-                u.hashed_key,
-                u.index,
-                $3,
-                NOW(),
-                NOW()
-            FROM
-                UNNEST($1::bytea[], $2::BIGINT[]) AS u (hashed_key, INDEX)
-            "#,
-            &hashed_keys as &[&[u8]],
-            &indices,
-            i64::from(l1_batch_number.0)
+    async fn insert_initial_writes_inner(
+        &mut self,
+        l1_batch_number: L1BatchNumber,
+        hashed_keys: &[H256],
+        last_index: u64,
+    ) -> DalResult<()> {
+        let hashed_keys_len = hashed_keys.len();
+        let copy = CopyStatement::new(
+            "COPY initial_writes (hashed_key, index, l1_batch_number, created_at, updated_at) \
+             FROM STDIN WITH (DELIMITER '|')",
         )
         .instrument("insert_initial_writes")
         .with_arg("l1_batch_number", &l1_batch_number)
-        .with_arg("hashed_keys.len", &hashed_keys.len())
-        .execute(self.storage)
+        .with_arg("hashed_keys.len", &hashed_keys_len)
+        .start(self.storage)
         .await?;
 
-        Ok(())
+        let mut bytes: Vec<u8> = Vec::new();
+        let now = Utc::now().naive_utc().to_string();
+        for (i, hashed_key) in hashed_keys.iter().enumerate() {
+            let enum_index = last_index + i as u64 + 1;
+            let row = format!(
+                "\\\\x{:x}|{}|{}|{}|{}\n",
+                hashed_key, enum_index, l1_batch_number, now, now,
+            );
+            bytes.extend_from_slice(row.as_bytes());
+        }
+        copy.send(&bytes).await
     }
 
     pub async fn get_protective_reads_for_l1_batch(
@@ -151,10 +153,9 @@ impl StorageLogsDedupDal<'_, '_> {
     async fn max_enumeration_index(&mut self) -> DalResult<Option<u64>> {
         Ok(sqlx::query!(
             r#"
-            SELECT
-                MAX(INDEX) AS "max?"
-            FROM
-                initial_writes
+            SELECT MAX(index) AS "max?"
+            FROM initial_writes
+            WHERE l1_batch_number = (SELECT MAX(l1_batch_number) FROM initial_writes)
             "#,
         )
         .instrument("max_enumeration_index")
@@ -174,15 +175,15 @@ impl StorageLogsDedupDal<'_, '_> {
             SELECT
                 MAX(INDEX) AS "max?"
             FROM
-                initial_writes
+                INITIAL_WRITES
             WHERE
-                l1_batch_number = (
+                L1_BATCH_NUMBER = (
                     SELECT
-                        MAX(l1_batch_number) AS "max?"
+                        MAX(L1_BATCH_NUMBER) AS "max?"
                     FROM
-                        initial_writes
+                        INITIAL_WRITES
                     WHERE
-                        l1_batch_number <= $1
+                        L1_BATCH_NUMBER <= $1
                 )
             "#,
             i64::from(l1_batch_number.0)
@@ -202,13 +203,13 @@ impl StorageLogsDedupDal<'_, '_> {
             r#"
             SELECT
                 hashed_key,
-                INDEX
+                index
             FROM
                 initial_writes
             WHERE
                 l1_batch_number = $1
             ORDER BY
-                INDEX
+                index
             "#,
             i64::from(l1_batch_number.0)
         )
@@ -230,9 +231,9 @@ impl StorageLogsDedupDal<'_, '_> {
             SELECT
                 INDEX
             FROM
-                initial_writes
+                INITIAL_WRITES
             WHERE
-                hashed_key = $1
+                HASHED_KEY = $1
             "#,
             hashed_key.as_bytes()
         )
@@ -253,10 +254,10 @@ impl StorageLogsDedupDal<'_, '_> {
             SELECT
                 INDEX
             FROM
-                initial_writes
+                INITIAL_WRITES
             WHERE
-                hashed_key = $1
-                AND l1_batch_number <= $2
+                HASHED_KEY = $1
+                AND L1_BATCH_NUMBER <= $2
             "#,
             hashed_key.as_bytes(),
             l1_batch_number.0 as i32,
@@ -279,7 +280,7 @@ impl StorageLogsDedupDal<'_, '_> {
             FROM
                 initial_writes
             WHERE
-                hashed_key = ANY ($1)
+                hashed_key = ANY($1)
             "#,
             &hashed_keys as &[&[u8]],
         )
@@ -299,7 +300,7 @@ impl StorageLogsDedupDal<'_, '_> {
             SELECT
                 hashed_key,
                 l1_batch_number,
-                INDEX
+                index
             FROM
                 initial_writes
             "#
@@ -315,6 +316,36 @@ impl StorageLogsDedupDal<'_, '_> {
                 index: row.index as u64,
             })
             .collect()
+    }
+
+    // Should only be used in tests.
+    #[doc(hidden)]
+    async fn max_enumeration_index_naive(&mut self) -> DalResult<Option<u64>> {
+        Ok(sqlx::query!(
+            r#"
+            SELECT
+                MAX(index) AS "max?"
+            FROM
+                initial_writes
+            "#,
+        )
+        .instrument("max_enumeration_index_naive")
+        .fetch_one(self.storage)
+        .await?
+        .max
+        .map(|max| max as u64))
+    }
+
+    // Should only be used in tests.
+    #[doc(hidden)]
+    pub async fn insert_initial_writes_non_sequential(
+        &mut self,
+        l1_batch_number: L1BatchNumber,
+        hashed_keys: &[H256],
+    ) -> DalResult<()> {
+        let last_index = self.max_enumeration_index_naive().await?.unwrap_or(0);
+        self.insert_initial_writes_inner(l1_batch_number, hashed_keys, last_index)
+            .await
     }
 }
 

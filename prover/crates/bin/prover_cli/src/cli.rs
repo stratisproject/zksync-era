@@ -2,7 +2,8 @@ use clap::{command, Args, Parser, Subcommand};
 use zksync_types::url::SensitiveUrl;
 
 use crate::commands::{
-    config, debug_proof, delete, get_file_info, requeue, restart, stats, status::StatusCommand,
+    config, debug_proof, delete, get_file_info, insert_batch, insert_version, requeue, restart,
+    stats, status::StatusCommand,
 };
 
 pub const VERSION_STRING: &str = env!("CARGO_PKG_VERSION");
@@ -27,6 +28,8 @@ impl ProverCLI {
             ProverCommand::Restart(args) => restart::run(args).await?,
             ProverCommand::DebugProof(args) => debug_proof::run(args).await?,
             ProverCommand::Stats(args) => stats::run(args, self.config).await?,
+            ProverCommand::InsertVersion(args) => insert_version::run(args, self.config).await?,
+            ProverCommand::InsertBatch(args) => insert_batch::run(args, self.config).await?,
         };
         Ok(())
     }
@@ -41,6 +44,8 @@ pub struct ProverCLIConfig {
         env("PLI__DB_URL")
     )]
     pub db_url: SensitiveUrl,
+    #[clap(default_value = "10")]
+    pub max_failure_attempts: u32,
 }
 
 #[derive(Subcommand)]
@@ -55,4 +60,6 @@ pub enum ProverCommand {
     Restart(restart::Args),
     #[command(about = "Displays L1 Batch proving stats for a given period")]
     Stats(stats::Options),
+    InsertVersion(insert_version::Args),
+    InsertBatch(insert_batch::Args),
 }

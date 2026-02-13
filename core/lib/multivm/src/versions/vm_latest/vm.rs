@@ -1,25 +1,33 @@
-use circuit_sequencer_api_1_5_0::sort_storage_access::sort_storage_access_queries;
-use zksync_types::{
-    l2_to_l1_log::{SystemL2ToL1Log, UserL2ToL1Log},
-    vm::VmVersion,
-    Transaction,
+use std::{
+    collections::{HashMap, VecDeque},
+    rc::Rc,
 };
+
+use circuit_sequencer_api::sort_storage_access::sort_storage_access_queries;
+use zksync_types::{
+    h256_to_u256,
+    l2_to_l1_log::{SystemL2ToL1Log, UserL2ToL1Log},
+    u256_to_h256,
+    vm::VmVersion,
+    Transaction, H256,
+};
+use zksync_vm_interface::{pubdata::PubdataBuilder, InspectExecutionMode};
 
 use crate::{
     glue::GlueInto,
     interface::{
         storage::{StoragePtr, WriteStorage},
-        BootloaderMemory, BytecodeCompressionError, CompressedBytecodeInfo, CurrentExecutionState,
-        FinishedL1Batch, L1BatchEnv, L2BlockEnv, SystemEnv, VmExecutionMode,
+        BytecodeCompressionError, BytecodeCompressionResult, CurrentExecutionState,
+        FinishedL1Batch, L1BatchEnv, L2BlockEnv, PushTransactionResult, SystemEnv, VmExecutionMode,
         VmExecutionResultAndLogs, VmFactory, VmInterface, VmInterfaceHistoryEnabled,
-        VmMemoryMetrics,
+        VmTrackingContracts,
     },
-    utils::events::extract_l2tol1logs_from_l1_messenger,
+    utils::{bytecode::be_words_to_bytes, events::extract_l2tol1logs_from_l1_messenger},
     vm_latest::{
-        bootloader_state::BootloaderState,
+        bootloader::BootloaderState,
         old_vm::{events::merge_events, history_recorder::HistoryEnabled},
-        tracers::dispatcher::TracerDispatcher,
-        types::internals::{new_vm_state, VmSnapshot, ZkSyncVmState},
+        tracers::{dispatcher::TracerDispatcher, PubdataTracer},
+        types::{new_vm_state, VmSnapshot, ZkSyncVmState},
     },
     HistoryMode,
 };
@@ -29,29 +37,40 @@ use crate::{
 /// In the first version of the v1.5.0 release, the bootloader memory was too small, so a new
 /// version was released with increased bootloader memory. The version with the small bootloader memory
 /// is available only on internal staging environments.
-#[derive(Debug, Copy, Clone)]
-pub(crate) enum MultiVMSubversion {
+#[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd)]
+pub(crate) enum MultiVmSubversion {
     /// The initial version of v1.5.0, available only on staging environments.
     SmallBootloaderMemory,
     /// The final correct version of v1.5.0
     IncreasedBootloaderMemory,
+    /// VM for post-gateway versions.
+    Gateway,
+    EvmEmulator,
+    EcPrecompiles,
+    Interop,
 }
 
-impl MultiVMSubversion {
-    #[cfg(test)]
+#[cfg(test)]
+impl MultiVmSubversion {
     pub(crate) fn latest() -> Self {
-        Self::IncreasedBootloaderMemory
+        Self::Interop
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct VmVersionIsNotVm150Error;
-impl TryFrom<VmVersion> for MultiVMSubversion {
+
+impl TryFrom<VmVersion> for MultiVmSubversion {
     type Error = VmVersionIsNotVm150Error;
+
     fn try_from(value: VmVersion) -> Result<Self, Self::Error> {
         match value {
             VmVersion::Vm1_5_0SmallBootloaderMemory => Ok(Self::SmallBootloaderMemory),
             VmVersion::Vm1_5_0IncreasedBootloaderMemory => Ok(Self::IncreasedBootloaderMemory),
+            VmVersion::VmGateway => Ok(Self::Gateway),
+            VmVersion::VmEvmEmulator => Ok(Self::EvmEmulator),
+            VmVersion::VmEcPrecompiles => Ok(Self::EcPrecompiles),
+            VmVersion::VmInterop => Ok(Self::Interop),
             _ => Err(VmVersionIsNotVm150Error),
         }
     }
@@ -63,51 +82,45 @@ impl TryFrom<VmVersion> for MultiVMSubversion {
 pub struct Vm<S: WriteStorage, H: HistoryMode> {
     pub(crate) bootloader_state: BootloaderState,
     // Current state and oracles of virtual machine
-    pub(crate) state: ZkSyncVmState<S, H::Vm1_5_0>,
+    pub(crate) state: ZkSyncVmState<S, H::Vm1_5_2>,
     pub(crate) storage: StoragePtr<S>,
     pub(crate) system_env: SystemEnv,
     pub(crate) batch_env: L1BatchEnv,
     // Snapshots for the current run
-    pub(crate) snapshots: Vec<VmSnapshot>,
-    pub(crate) subversion: MultiVMSubversion,
+    pub(crate) snapshots: VecDeque<VmSnapshot>,
+    pub(crate) subversion: MultiVmSubversion,
     _phantom: std::marker::PhantomData<H>,
 }
 
-impl<S: WriteStorage, H: HistoryMode> VmInterface for Vm<S, H> {
-    type TracerDispatcher = TracerDispatcher<S, H::Vm1_5_0>;
-
-    /// Push tx into memory for the future execution
-    fn push_transaction(&mut self, tx: Transaction) {
-        self.push_transaction_with_compression(tx, true);
+impl<S: WriteStorage, H: HistoryMode> Vm<S, H> {
+    pub(super) fn gas_remaining(&self) -> u32 {
+        self.state.local_state.callstack.current.ergs_remaining
     }
 
-    /// Execute VM with custom tracers.
-    fn inspect(
-        &mut self,
-        tracer: Self::TracerDispatcher,
-        execution_mode: VmExecutionMode,
-    ) -> VmExecutionResultAndLogs {
-        self.inspect_inner(tracer, execution_mode, None)
+    pub(crate) fn decommit_dynamic_bytecodes(
+        &self,
+        candidate_hashes: impl Iterator<Item = H256>,
+    ) -> HashMap<H256, Vec<u8>> {
+        let decommitter = &self.state.decommittment_processor;
+        let bytecodes = candidate_hashes.filter_map(|hash| {
+            let int_hash = h256_to_u256(hash);
+            if !decommitter.dynamic_bytecode_hashes.contains(&int_hash) {
+                return None;
+            }
+            let bytecode = decommitter
+                .known_bytecodes
+                .inner()
+                .get(&int_hash)
+                .unwrap_or_else(|| {
+                    panic!("Bytecode with hash {hash:?} not found");
+                });
+            Some((hash, be_words_to_bytes(bytecode)))
+        });
+        bytecodes.collect()
     }
 
-    /// Get current state of bootloader memory.
-    fn get_bootloader_memory(&self) -> BootloaderMemory {
-        self.bootloader_state.bootloader_memory()
-    }
-
-    /// Get compressed bytecodes of the last executed transaction
-    fn get_last_tx_compressed_bytecodes(&self) -> Vec<CompressedBytecodeInfo> {
-        self.bootloader_state.get_last_tx_compressed_bytecodes()
-    }
-
-    fn start_new_l2_block(&mut self, l2_block_env: L2BlockEnv) {
-        self.bootloader_state.start_new_l2_block(l2_block_env);
-    }
-
-    /// Get current state of virtual machine.
-    /// This method should be used only after the batch execution.
-    /// Otherwise it can panic.
-    fn get_current_execution_state(&self) -> CurrentExecutionState {
+    // visible for testing
+    pub(super) fn get_current_execution_state(&self) -> CurrentExecutionState {
         let (raw_events, l1_messages) = self.state.event_sink.flatten();
         let events: Vec<_> = merge_events(raw_events)
             .into_iter()
@@ -122,7 +135,7 @@ impl<S: WriteStorage, H: HistoryMode> VmInterface for Vm<S, H> {
 
         let storage_log_queries = self.state.storage.get_final_log_queries();
         let deduped_storage_log_queries =
-            sort_storage_access_queries(storage_log_queries.iter().map(|log| &log.log_query)).1;
+            sort_storage_access_queries(storage_log_queries.iter().map(|log| log.log_query)).1;
 
         CurrentExecutionState {
             events,
@@ -140,19 +153,41 @@ impl<S: WriteStorage, H: HistoryMode> VmInterface for Vm<S, H> {
             pubdata_costs: self.state.storage.returned_pubdata_costs.inner().clone(),
         }
     }
+}
 
-    /// Execute transaction with optional bytecode compression.
+impl<S: WriteStorage, H: HistoryMode> VmInterface for Vm<S, H> {
+    type TracerDispatcher = TracerDispatcher<S, H::Vm1_5_2>;
+
+    fn push_transaction(&mut self, tx: Transaction) -> PushTransactionResult<'_> {
+        self.push_transaction_with_compression(tx, true);
+        PushTransactionResult {
+            compressed_bytecodes: self
+                .bootloader_state
+                .get_last_tx_compressed_bytecodes()
+                .into(),
+        }
+    }
+
+    /// Execute VM with custom tracers.
+    fn inspect(
+        &mut self,
+        tracer: &mut Self::TracerDispatcher,
+        execution_mode: InspectExecutionMode,
+    ) -> VmExecutionResultAndLogs {
+        self.inspect_inner(tracer, execution_mode.into(), None)
+    }
+
+    fn start_new_l2_block(&mut self, l2_block_env: L2BlockEnv) {
+        self.bootloader_state.start_new_l2_block(l2_block_env);
+    }
 
     /// Inspect transaction with optional bytecode compression.
     fn inspect_transaction_with_bytecode_compression(
         &mut self,
-        tracer: Self::TracerDispatcher,
+        tracer: &mut Self::TracerDispatcher,
         tx: Transaction,
         with_compression: bool,
-    ) -> (
-        Result<(), BytecodeCompressionError>,
-        VmExecutionResultAndLogs,
-    ) {
+    ) -> (BytecodeCompressionResult<'_>, VmExecutionResultAndLogs) {
         self.push_transaction_with_compression(tx, with_compression);
         let result = self.inspect_inner(tracer, VmExecutionMode::OneTx, None);
         if self.has_unpublished_bytecodes() {
@@ -161,31 +196,40 @@ impl<S: WriteStorage, H: HistoryMode> VmInterface for Vm<S, H> {
                 result,
             )
         } else {
-            (Ok(()), result)
+            (
+                Ok(self
+                    .bootloader_state
+                    .get_last_tx_compressed_bytecodes()
+                    .into()),
+                result,
+            )
         }
     }
 
-    fn record_vm_memory_metrics(&self) -> VmMemoryMetrics {
-        self.record_vm_memory_metrics_inner()
-    }
+    fn finish_batch(&mut self, pubdata_builder: Rc<dyn PubdataBuilder>) -> FinishedL1Batch {
+        let pubdata_tracer = Some(PubdataTracer::new(
+            self.batch_env.clone(),
+            VmExecutionMode::Batch,
+            self.subversion,
+            Some(pubdata_builder.clone()),
+        ));
 
-    fn gas_remaining(&self) -> u32 {
-        self.state.local_state.callstack.current.ergs_remaining
-    }
-
-    fn finish_batch(&mut self) -> FinishedL1Batch {
-        let result = self.execute(VmExecutionMode::Batch);
+        let result = self.inspect_inner(
+            &mut TracerDispatcher::default(),
+            VmExecutionMode::Batch,
+            pubdata_tracer,
+        );
         let execution_state = self.get_current_execution_state();
-        let bootloader_memory = self.get_bootloader_memory();
+        let bootloader_memory = self
+            .bootloader_state
+            .bootloader_memory(pubdata_builder.as_ref());
         FinishedL1Batch {
             block_tip_execution_result: result,
             final_execution_state: execution_state,
             final_bootloader_memory: Some(bootloader_memory),
             pubdata_input: Some(
                 self.bootloader_state
-                    .get_pubdata_information()
-                    .clone()
-                    .build_pubdata(false),
+                    .settlement_layer_pubdata(pubdata_builder.as_ref()),
             ),
             state_diffs: Some(
                 self.bootloader_state
@@ -214,9 +258,10 @@ impl<S: WriteStorage, H: HistoryMode> Vm<S, H> {
         batch_env: L1BatchEnv,
         system_env: SystemEnv,
         storage: StoragePtr<S>,
-        subversion: MultiVMSubversion,
+        subversion: MultiVmSubversion,
     ) -> Self {
-        let (state, bootloader_state) = new_vm_state(storage.clone(), &system_env, &batch_env);
+        let (state, bootloader_state) =
+            new_vm_state(storage.clone(), &system_env, &batch_env, subversion);
         Self {
             bootloader_state,
             state,
@@ -224,7 +269,7 @@ impl<S: WriteStorage, H: HistoryMode> Vm<S, H> {
             system_env,
             batch_env,
             subversion,
-            snapshots: vec![],
+            snapshots: VecDeque::new(),
             _phantom: Default::default(),
         }
     }
@@ -238,12 +283,25 @@ impl<S: WriteStorage> VmInterfaceHistoryEnabled for Vm<S, HistoryEnabled> {
     fn rollback_to_the_latest_snapshot(&mut self) {
         let snapshot = self
             .snapshots
-            .pop()
+            .pop_back()
             .expect("Snapshot should be created before rolling it back");
         self.rollback_to_snapshot(snapshot);
     }
 
     fn pop_snapshot_no_rollback(&mut self) {
-        self.snapshots.pop();
+        self.snapshots.pop_back();
+    }
+
+    fn pop_front_snapshot_no_rollback(&mut self) {
+        self.snapshots.pop_front();
+    }
+}
+
+impl<S: WriteStorage, H: HistoryMode> VmTrackingContracts for Vm<S, H> {
+    fn used_contract_hashes(&self) -> Vec<H256> {
+        self.get_used_contracts()
+            .into_iter()
+            .map(u256_to_h256)
+            .collect()
     }
 }

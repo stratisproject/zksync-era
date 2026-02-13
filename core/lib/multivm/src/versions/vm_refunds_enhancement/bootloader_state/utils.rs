@@ -1,10 +1,9 @@
-use zksync_types::U256;
-use zksync_utils::{bytes_to_be_words, h256_to_u256};
+use zksync_types::{h256_to_u256, U256};
 
 use super::tx::BootloaderTx;
 use crate::{
     interface::{BootloaderMemory, CompressedBytecodeInfo, TxExecutionMode},
-    utils::bytecode,
+    utils::{bytecode, bytecode::bytes_to_be_words},
     vm_refunds_enhancement::{
         bootloader_state::l2_block::BootloaderL2Block,
         constants::{
@@ -23,8 +22,7 @@ pub(super) fn get_memory_for_compressed_bytecodes(
         .iter()
         .flat_map(bytecode::encode_call)
         .collect();
-
-    bytes_to_be_words(memory_addition)
+    bytes_to_be_words(&memory_addition)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -119,10 +117,10 @@ pub(crate) fn apply_l2_block(
 /// # Current layout
 ///
 /// - 0 byte (MSB): server-side tx execution mode
-///     In the server, we may want to execute different parts of the transaction in the different context
-///     For example, when checking validity, we don't want to actually execute transaction and have side effects.
+///   In the server, we may want to execute different parts of the transaction in the different context
+///   For example, when checking validity, we don't want to actually execute transaction and have side effects.
 ///
-///     Possible values:
+///   Possible values:
 ///     - 0x00: validate & execute (normal mode)
 ///     - 0x02: execute but DO NOT validate
 ///
@@ -133,8 +131,8 @@ pub(super) fn assemble_tx_meta(execution_mode: TxExecutionMode, execute_tx: bool
     // Set 0 byte (execution mode)
     output[0] = match execution_mode {
         TxExecutionMode::VerifyExecute => 0x00,
-        TxExecutionMode::EstimateFee { .. } => 0x00,
-        TxExecutionMode::EthCall { .. } => 0x02,
+        TxExecutionMode::EstimateFee => 0x00,
+        TxExecutionMode::EthCall => 0x02,
     };
 
     // Set 31 byte (marker for tx execution)

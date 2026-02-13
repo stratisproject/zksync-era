@@ -1,50 +1,66 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, rc::Rc};
 
-use circuit_sequencer_api_1_3_3::sort_storage_access::sort_storage_access_queries;
-use zksync_types::{
-    l2_to_l1_log::{L2ToL1Log, UserL2ToL1Log},
-    Transaction,
-};
-use zksync_utils::{bytecode::hash_bytecode, h256_to_u256, u256_to_h256};
+use zksync_types::{bytecode::BytecodeHash, h256_to_u256, Transaction};
+use zksync_vm_interface::{pubdata::PubdataBuilder, InspectExecutionMode};
 
 use crate::{
     glue::{history_mode::HistoryMode, GlueInto},
     interface::{
         storage::{StoragePtr, WriteStorage},
-        BootloaderMemory, BytecodeCompressionError, CompressedBytecodeInfo, CurrentExecutionState,
-        FinishedL1Batch, L1BatchEnv, L2BlockEnv, SystemEnv, TxExecutionMode, VmExecutionMode,
-        VmExecutionResultAndLogs, VmFactory, VmInterface, VmInterfaceHistoryEnabled,
-        VmMemoryMetrics,
+        BytecodeCompressionError, BytecodeCompressionResult, FinishedL1Batch, L1BatchEnv,
+        L2BlockEnv, PushTransactionResult, SystemEnv, TxExecutionMode, VmExecutionResultAndLogs,
+        VmFactory, VmInterface, VmInterfaceHistoryEnabled, VmMemoryMetrics,
     },
     tracers::old::TracerDispatcher,
     utils::bytecode,
-    vm_1_3_2::{events::merge_events, VmInstance},
+    vm_1_3_2::VmInstance,
 };
 
 #[derive(Debug)]
 pub struct Vm<S: WriteStorage, H: HistoryMode> {
     pub(crate) vm: VmInstance<S, H::Vm1_3_2Mode>,
     pub(crate) system_env: SystemEnv,
-    pub(crate) batch_env: L1BatchEnv,
-    pub(crate) last_tx_compressed_bytecodes: Vec<CompressedBytecodeInfo>,
+}
+
+impl<S: WriteStorage, H: HistoryMode> Vm<S, H> {
+    pub(crate) fn record_vm_memory_metrics(&self) -> VmMemoryMetrics {
+        VmMemoryMetrics {
+            event_sink_inner: self.vm.state.event_sink.get_size(),
+            event_sink_history: self.vm.state.event_sink.get_history_size(),
+            memory_inner: self.vm.state.memory.get_size(),
+            memory_history: self.vm.state.memory.get_history_size(),
+            decommittment_processor_inner: self.vm.state.decommittment_processor.get_size(),
+            decommittment_processor_history: self
+                .vm
+                .state
+                .decommittment_processor
+                .get_history_size(),
+            storage_inner: self.vm.state.storage.get_size(),
+            storage_history: self.vm.state.storage.get_history_size(),
+        }
+    }
 }
 
 impl<S: WriteStorage, H: HistoryMode> VmInterface for Vm<S, H> {
     type TracerDispatcher = TracerDispatcher;
 
-    fn push_transaction(&mut self, tx: Transaction) {
-        crate::vm_1_3_2::vm_with_bootloader::push_transaction_to_bootloader_memory(
-            &mut self.vm,
-            &tx,
-            self.system_env.execution_mode.glue_into(),
-            None,
-        )
+    fn push_transaction(&mut self, tx: Transaction) -> PushTransactionResult<'_> {
+        let compressed_bytecodes =
+            crate::vm_1_3_2::vm_with_bootloader::push_transaction_to_bootloader_memory(
+                &mut self.vm,
+                &tx,
+                self.system_env.execution_mode.glue_into(),
+                None,
+            );
+        PushTransactionResult {
+            compressed_bytecodes: compressed_bytecodes.into(),
+        }
     }
 
     fn inspect(
         &mut self,
-        tracer: Self::TracerDispatcher,
-        execution_mode: VmExecutionMode,
+        tracer: &mut Self::TracerDispatcher,
+        execution_mode: InspectExecutionMode,
     ) -> VmExecutionResultAndLogs {
         if let Some(storage_invocations) = tracer.storage_invocations {
             self.vm
@@ -53,7 +69,7 @@ impl<S: WriteStorage, H: HistoryMode> VmInterface for Vm<S, H> {
         }
 
         match execution_mode {
-            VmExecutionMode::OneTx => {
+            InspectExecutionMode::OneTx => {
                 match self.system_env.execution_mode {
                     TxExecutionMode::VerifyExecute => {
                         let enable_call_tracer = tracer
@@ -76,94 +92,33 @@ impl<S: WriteStorage, H: HistoryMode> VmInterface for Vm<S, H> {
                         .glue_into(),
                 }
             }
-            VmExecutionMode::Batch => self.finish_batch().block_tip_execution_result,
-            VmExecutionMode::Bootloader => self.vm.execute_block_tip().glue_into(),
+            InspectExecutionMode::Bootloader => self.vm.execute_block_tip().glue_into(),
         }
-    }
-
-    fn get_bootloader_memory(&self) -> BootloaderMemory {
-        vec![]
-    }
-
-    fn get_last_tx_compressed_bytecodes(&self) -> Vec<CompressedBytecodeInfo> {
-        self.last_tx_compressed_bytecodes.clone()
     }
 
     fn start_new_l2_block(&mut self, _l2_block_env: L2BlockEnv) {
         // Do nothing, because vm 1.3.2 doesn't support L2 blocks
     }
 
-    fn get_current_execution_state(&self) -> CurrentExecutionState {
-        let (raw_events, l1_messages) = self.vm.state.event_sink.flatten();
-        let events = merge_events(raw_events)
-            .into_iter()
-            .map(|e| e.into_vm_event(self.batch_env.number))
-            .collect();
-        let l2_to_l1_logs = l1_messages
-            .into_iter()
-            .map(|m| {
-                UserL2ToL1Log(L2ToL1Log {
-                    shard_id: m.shard_id,
-                    is_service: m.is_first,
-                    tx_number_in_block: m.tx_number_in_block,
-                    sender: m.address,
-                    key: u256_to_h256(m.key),
-                    value: u256_to_h256(m.value),
-                })
-            })
-            .collect();
-
-        let used_contract_hashes = self
-            .vm
-            .state
-            .decommittment_processor
-            .known_bytecodes
-            .inner()
-            .keys()
-            .cloned()
-            .collect();
-
-        let storage_log_queries = self.vm.state.storage.get_final_log_queries();
-
-        let deduped_storage_log_queries =
-            sort_storage_access_queries(storage_log_queries.iter().map(|log| &log.log_query)).1;
-
-        CurrentExecutionState {
-            events,
-            deduplicated_storage_logs: deduped_storage_log_queries
-                .into_iter()
-                .map(GlueInto::glue_into)
-                .collect(),
-            used_contract_hashes,
-            user_l2_to_l1_logs: l2_to_l1_logs,
-            system_logs: vec![],
-            // Fields below are not produced by VM 1.3.2
-            storage_refunds: vec![],
-            pubdata_costs: Vec::new(),
-        }
-    }
-
     fn inspect_transaction_with_bytecode_compression(
         &mut self,
-        tracer: Self::TracerDispatcher,
+        tracer: &mut Self::TracerDispatcher,
         tx: Transaction,
         with_compression: bool,
-    ) -> (
-        Result<(), BytecodeCompressionError>,
-        VmExecutionResultAndLogs,
-    ) {
+    ) -> (BytecodeCompressionResult<'_>, VmExecutionResultAndLogs) {
         if let Some(storage_invocations) = tracer.storage_invocations {
             self.vm
                 .execution_mode
                 .set_invocation_limit(storage_invocations);
         }
-        self.last_tx_compressed_bytecodes = vec![];
+
+        let compressed_bytecodes: Vec<_>;
         let bytecodes = if with_compression {
             let deps = &tx.execute.factory_deps;
             let mut deps_hashes = HashSet::with_capacity(deps.len());
             let mut bytecode_hashes = vec![];
             let filtered_deps = deps.iter().filter_map(|bytecode| {
-                let bytecode_hash = hash_bytecode(bytecode);
+                let bytecode_hash = BytecodeHash::for_bytecode(bytecode).value();
                 let is_known =
                     !deps_hashes.insert(bytecode_hash) || self.vm.is_bytecode_known(&bytecode_hash);
 
@@ -174,18 +129,17 @@ impl<S: WriteStorage, H: HistoryMode> VmInterface for Vm<S, H> {
                     bytecode::compress(bytecode.clone()).ok()
                 }
             });
-            let compressed_bytecodes: Vec<_> = filtered_deps.collect();
+            compressed_bytecodes = filtered_deps.collect();
 
-            self.last_tx_compressed_bytecodes
-                .clone_from(&compressed_bytecodes);
             crate::vm_1_3_2::vm_with_bootloader::push_transaction_to_bootloader_memory(
                 &mut self.vm,
                 &tx,
                 self.system_env.execution_mode.glue_into(),
-                Some(compressed_bytecodes),
+                Some(compressed_bytecodes.clone()),
             );
             bytecode_hashes
         } else {
+            compressed_bytecodes = vec![];
             crate::vm_1_3_2::vm_with_bootloader::push_transaction_to_bootloader_memory(
                 &mut self.vm,
                 &tx,
@@ -224,32 +178,11 @@ impl<S: WriteStorage, H: HistoryMode> VmInterface for Vm<S, H> {
                 result,
             )
         } else {
-            (Ok(()), result)
+            (Ok(compressed_bytecodes.into()), result)
         }
     }
 
-    fn record_vm_memory_metrics(&self) -> VmMemoryMetrics {
-        VmMemoryMetrics {
-            event_sink_inner: self.vm.state.event_sink.get_size(),
-            event_sink_history: self.vm.state.event_sink.get_history_size(),
-            memory_inner: self.vm.state.memory.get_size(),
-            memory_history: self.vm.state.memory.get_history_size(),
-            decommittment_processor_inner: self.vm.state.decommittment_processor.get_size(),
-            decommittment_processor_history: self
-                .vm
-                .state
-                .decommittment_processor
-                .get_history_size(),
-            storage_inner: self.vm.state.storage.get_size(),
-            storage_history: self.vm.state.storage.get_history_size(),
-        }
-    }
-
-    fn gas_remaining(&self) -> u32 {
-        self.vm.gas_remaining()
-    }
-
-    fn finish_batch(&mut self) -> FinishedL1Batch {
+    fn finish_batch(&mut self, _pubdata_builder: Rc<dyn PubdataBuilder>) -> FinishedL1Batch {
         self.vm
             .execute_till_block_end(
                 crate::vm_1_3_2::vm_with_bootloader::BootloaderJobType::BlockPostprocessing,
@@ -270,7 +203,7 @@ impl<S: WriteStorage, H: HistoryMode> VmFactory<S> for Vm<S, H> {
         let inner_vm: VmInstance<S, H::Vm1_3_2Mode> =
             crate::vm_1_3_2::vm_with_bootloader::init_vm_with_gas_limit(
                 oracle_tools,
-                batch_env.clone().glue_into(),
+                batch_env.glue_into(),
                 block_properties,
                 system_env.execution_mode.glue_into(),
                 &system_env.base_system_smart_contracts.clone().glue_into(),
@@ -279,8 +212,6 @@ impl<S: WriteStorage, H: HistoryMode> VmFactory<S> for Vm<S, H> {
         Self {
             vm: inner_vm,
             system_env,
-            batch_env,
-            last_tx_compressed_bytecodes: vec![],
         }
     }
 }
@@ -296,5 +227,9 @@ impl<S: WriteStorage> VmInterfaceHistoryEnabled for Vm<S, crate::vm_latest::Hist
 
     fn pop_snapshot_no_rollback(&mut self) {
         self.vm.pop_snapshot_no_rollback();
+    }
+
+    fn pop_front_snapshot_no_rollback(&mut self) {
+        self.vm.pop_front_snapshot_no_rollback();
     }
 }

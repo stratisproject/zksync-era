@@ -48,6 +48,14 @@ pub enum Web3Error {
     TreeApiUnavailable,
     #[error("Internal error")]
     InternalError(#[from] anyhow::Error),
+    #[error("Server is shutting down")]
+    ServerShuttingDown,
+    #[error("Transaction {0:?} timeout waiting for receipt")]
+    TransactionTimeout(zksync_types::H256),
+    #[error("Transaction processing error: {0}")]
+    TransactionUnready(String),
+    #[error("Invalid timeout. Max timeout is {0}ms")]
+    InvalidTimeout(u64),
 }
 
 /// Client RPC error with additional details: the method name and arguments of the called method.
@@ -58,6 +66,20 @@ pub struct EnrichedClientError {
     inner_error: ClientError,
     method: &'static str,
     args: HashMap<&'static str, String>,
+}
+
+/// Whether the error should be considered retriable.
+pub fn is_retryable(err: &ClientError) -> bool {
+    match err {
+        ClientError::Transport(_) | ClientError::RequestTimeout => true,
+        ClientError::Call(err) => {
+            // At least some RPC providers use "internal error" in case of the server being overloaded
+
+            err.code() == ErrorCode::ServerIsBusy.code()
+                || err.code() == ErrorCode::InternalError.code()
+        }
+        _ => false,
+    }
 }
 
 /// Alias for a result with enriched client RPC error.
@@ -85,17 +107,13 @@ impl EnrichedClientError {
         self
     }
 
-    /// Whether the error should be considered retriable.
-    pub fn is_retriable(&self) -> bool {
-        match self.as_ref() {
-            ClientError::Transport(_) | ClientError::RequestTimeout => true,
-            ClientError::Call(err) => {
-                // At least some RPC providers use "internal error" in case of the server being overloaded
-                err.code() == ErrorCode::ServerIsBusy.code()
-                    || err.code() == ErrorCode::InternalError.code()
-            }
-            _ => false,
-        }
+    /// Whether the error should be considered retryable.
+    pub fn is_retryable(&self) -> bool {
+        is_retryable(&self.inner_error)
+    }
+
+    pub fn is_timeout(&self) -> bool {
+        matches!(self.inner_error, ClientError::RequestTimeout)
     }
 }
 
@@ -196,14 +214,14 @@ where
 /// Extension trait allowing to add context to client RPC calls. Can be used on any future resolving to `Result<_, ClientError>`.
 pub trait ClientRpcContext: Sized {
     /// Adds basic context information: the name of the invoked RPC method.
-    fn rpc_context(self, method: &'static str) -> ClientCallWrapper<Self>;
+    fn rpc_context(self, method: &'static str) -> ClientCallWrapper<'static, Self>;
 }
 
 impl<T, F> ClientRpcContext for F
 where
     F: Future<Output = Result<T, ClientError>>,
 {
-    fn rpc_context(self, method: &'static str) -> ClientCallWrapper<Self> {
+    fn rpc_context(self, method: &'static str) -> ClientCallWrapper<'static, Self> {
         ClientCallWrapper {
             inner: self,
             method,

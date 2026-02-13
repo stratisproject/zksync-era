@@ -191,11 +191,11 @@ impl BootloaderState {
         l2_block.first_tx_index + l2_block.txs.len()
     }
 
-    pub(crate) fn get_last_tx_compressed_bytecodes(&self) -> Vec<CompressedBytecodeInfo> {
+    pub(crate) fn get_last_tx_compressed_bytecodes(&self) -> &[CompressedBytecodeInfo] {
         if let Some(tx) = self.last_l2_block().txs.last() {
-            tx.compressed_bytecodes.clone()
+            &tx.compressed_bytecodes
         } else {
-            vec![]
+            &[]
         }
     }
 
@@ -233,6 +233,7 @@ impl BootloaderState {
                 number: block.number + 1,
                 prev_block_hash: block.get_hash(),
                 max_virtual_blocks_to_create: 1,
+                interop_roots: vec![],
             });
         }
         self.last_l2_block()

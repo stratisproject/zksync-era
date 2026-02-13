@@ -1,10 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use zksync_types::{
-    writes::compression::compress_with_best_strategy, StorageKey, StorageLogKind,
-    StorageLogWithPreviousValue, H256,
+    h256_to_u256, writes::compression::compress_with_best_strategy, StorageKey, StorageLog,
+    StorageLogKind, StorageLogWithPreviousValue, H256,
 };
-use zksync_utils::h256_to_u256;
 
 use crate::interface::DeduplicatedWritesMetrics;
 
@@ -37,6 +36,7 @@ pub struct StorageWritesDeduplicator {
     // stores the mapping of storage-slot key to its values and the tx number in block
     modified_key_values: HashMap<StorageKey, ModifiedSlot>,
     metrics: DeduplicatedWritesMetrics,
+    snapshots: VecDeque<Vec<UpdateItem>>,
 }
 
 impl StorageWritesDeduplicator {
@@ -52,9 +52,26 @@ impl StorageWritesDeduplicator {
         self.modified_key_values
     }
 
+    /// Deduplicates the provided logs in isolation.
+    pub fn deduplicate_logs<'a>(
+        logs: impl Iterator<Item = &'a StorageLogWithPreviousValue>,
+    ) -> Vec<StorageLog> {
+        let mut deduplicator = Self::new();
+        deduplicator.apply(logs);
+        let deduplicated_logs = deduplicator.into_modified_key_values();
+
+        deduplicated_logs
+            .into_iter()
+            .map(|(key, ModifiedSlot { value, .. })| StorageLog::new_write_log(key, value))
+            .collect()
+    }
+
     /// Applies storage logs to the state.
     pub fn apply<'a, I: IntoIterator<Item = &'a StorageLogWithPreviousValue>>(&mut self, logs: I) {
-        self.process_storage_logs(logs);
+        let updates = self.process_storage_logs(logs);
+        if let Some(snapshot) = self.snapshots.back_mut() {
+            snapshot.extend(updates);
+        }
     }
 
     /// Returns metrics as if provided storage logs are applied to the state.
@@ -207,12 +224,24 @@ impl StorageWritesDeduplicator {
             }
         }
     }
+
+    pub fn make_snapshot(&mut self) {
+        self.snapshots.push_back(Vec::new());
+    }
+
+    pub fn rollback_to_latest_snapshot_popping(&mut self) {
+        let snapshot = self.snapshots.pop_back().unwrap();
+        self.rollback(snapshot);
+    }
+
+    pub fn pop_front_snapshot_no_rollback(&mut self) {
+        self.snapshots.pop_front();
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use zksync_types::{AccountTreeId, StorageLog, H160, U256};
-    use zksync_utils::u256_to_h256;
+    use zksync_types::{u256_to_h256, AccountTreeId, StorageLog, H160, U256};
 
     use super::*;
 

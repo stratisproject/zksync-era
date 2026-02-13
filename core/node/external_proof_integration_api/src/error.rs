@@ -2,85 +2,40 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use zksync_basic_types::L1BatchNumber;
-use zksync_dal::DalError;
-use zksync_object_store::ObjectStoreError;
+use zksync_proof_data_handler::ProcessorError;
 
-pub(crate) enum ProcessorError {
-    ObjectStore(ObjectStoreError),
-    Dal(DalError),
-    Serialization(bincode::Error),
-    InvalidProof,
-    BatchNotReady(L1BatchNumber),
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ApiError {
+    #[error("Processor error: {0}")]
+    Processor(#[from] ProcessorError),
+    #[error("Invalid file: {0}")]
+    InvalidFile(#[from] FileError),
 }
 
-impl From<ObjectStoreError> for ProcessorError {
-    fn from(err: ObjectStoreError) -> Self {
-        Self::ObjectStore(err)
+impl ApiError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            Self::Processor(err) => err.status_code(),
+            Self::InvalidFile(_) => StatusCode::BAD_REQUEST,
+        }
     }
 }
 
-impl From<DalError> for ProcessorError {
-    fn from(err: DalError) -> Self {
-        Self::Dal(err)
-    }
-}
-
-impl From<bincode::Error> for ProcessorError {
-    fn from(err: bincode::Error) -> Self {
-        Self::Serialization(err)
-    }
-}
-
-impl IntoResponse for ProcessorError {
+impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status_code, message) = match self {
-            ProcessorError::ObjectStore(err) => {
-                tracing::error!("GCS error: {:?}", err);
-                match err {
-                    ObjectStoreError::KeyNotFound(_) => (
-                        StatusCode::NOT_FOUND,
-                        "Proof verification not possible anymore, batch is too old.".to_owned(),
-                    ),
-                    _ => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed fetching from GCS".to_owned(),
-                    ),
-                }
-            }
-            ProcessorError::Dal(err) => {
-                tracing::error!("Sqlx error: {:?}", err);
-                match err.inner() {
-                    zksync_dal::SqlxError::RowNotFound => {
-                        (StatusCode::NOT_FOUND, "Non existing L1 batch".to_owned())
-                    }
-                    _ => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed fetching/saving from db".to_owned(),
-                    ),
-                }
-            }
-            ProcessorError::Serialization(err) => {
-                tracing::error!("Serialization error: {:?}", err);
-                (
-                    StatusCode::BAD_REQUEST,
-                    "Failed to deserialize proof data".to_owned(),
-                )
-            }
-            ProcessorError::BatchNotReady(l1_batch_number) => {
-                tracing::error!(
-                "Batch {l1_batch_number:?} is not yet ready for proving. Most likely our proof for this batch is not generated yet"
-                );
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Batch {l1_batch_number:?} is not yet ready for proving. Most likely our proof for this batch is not generated yet, try again later"),
-                )
-            }
-            ProcessorError::InvalidProof => {
-                tracing::error!("Invalid proof data");
-                (StatusCode::BAD_REQUEST, "Invalid proof data".to_owned())
-            }
-        };
-        (status_code, message).into_response()
+        (self.status_code(), self.to_string()).into_response()
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum FileError {
+    #[error("Multipart error: {0}")]
+    MultipartRejection(#[from] axum::extract::multipart::MultipartRejection),
+    #[error("Multipart error: {0}")]
+    Multipart(#[from] axum::extract::multipart::MultipartError),
+    #[error("File not found in request. It was expected to be in the field {field_name} with the content type {content_type}")]
+    FileNotFound {
+        field_name: &'static str,
+        content_type: &'static str,
+    },
 }

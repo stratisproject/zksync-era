@@ -4,8 +4,6 @@ use anyhow::Context as _;
 use circuit_definitions::zkevm_circuits::scheduler::aux::BaseLayerCircuitType;
 use clap::Args as ClapArgs;
 use colored::*;
-use zksync_config::configs::FriProverConfig;
-use zksync_env_config::FromEnv;
 use zksync_prover_dal::{Connection, ConnectionPool, Prover, ProverDal};
 use zksync_types::{
     basic_fri_types::AggregationRound,
@@ -15,7 +13,7 @@ use zksync_types::{
         RecursionTipWitnessGeneratorJobInfo, SchedulerWitnessGeneratorJobInfo,
     },
     url::SensitiveUrl,
-    L1BatchNumber,
+    L1BatchId, L1BatchNumber, L2ChainId,
 };
 
 use super::utils::{get_prover_job_status, BatchData, StageInfo, Status};
@@ -57,9 +55,9 @@ pub(crate) async fn run(args: Args, config: ProverCLIConfig) -> anyhow::Result<(
         }
 
         if !args.verbose {
-            display_batch_status(batch_data);
+            display_batch_status(batch_data, config.max_failure_attempts);
         } else {
-            display_batch_info(batch_data);
+            display_batch_info(batch_data, config.max_failure_attempts);
         }
     }
 
@@ -142,7 +140,10 @@ async fn get_prover_jobs_info_for_batch<'a>(
     conn: &mut Connection<'a, Prover>,
 ) -> Vec<ProverJobFriInfo> {
     conn.fri_prover_jobs_dal()
-        .get_prover_jobs_stats_for_batch(batch_number, aggregation_round)
+        .get_prover_jobs_stats_for_batch(
+            L1BatchId::new(L2ChainId::zero(), batch_number),
+            aggregation_round,
+        )
         .await
 }
 
@@ -150,8 +151,8 @@ async fn get_proof_basic_witness_generator_into_for_batch<'a>(
     batch_number: L1BatchNumber,
     conn: &mut Connection<'a, Prover>,
 ) -> Option<BasicWitnessGeneratorJobInfo> {
-    conn.fri_witness_generator_dal()
-        .get_basic_witness_generator_job_for_batch(batch_number)
+    conn.fri_basic_witness_generator_dal()
+        .get_basic_witness_generator_job_for_batch(L1BatchId::new(L2ChainId::zero(), batch_number))
         .await
 }
 
@@ -159,8 +160,8 @@ async fn get_proof_leaf_witness_generator_info_for_batch<'a>(
     batch_number: L1BatchNumber,
     conn: &mut Connection<'a, Prover>,
 ) -> Vec<LeafWitnessGeneratorJobInfo> {
-    conn.fri_witness_generator_dal()
-        .get_leaf_witness_generator_jobs_for_batch(batch_number)
+    conn.fri_leaf_witness_generator_dal()
+        .get_leaf_witness_generator_jobs_for_batch(L1BatchId::new(L2ChainId::zero(), batch_number))
         .await
 }
 
@@ -168,8 +169,8 @@ async fn get_proof_node_witness_generator_info_for_batch<'a>(
     batch_number: L1BatchNumber,
     conn: &mut Connection<'a, Prover>,
 ) -> Vec<NodeWitnessGeneratorJobInfo> {
-    conn.fri_witness_generator_dal()
-        .get_node_witness_generator_jobs_for_batch(batch_number)
+    conn.fri_node_witness_generator_dal()
+        .get_node_witness_generator_jobs_for_batch(L1BatchId::new(L2ChainId::zero(), batch_number))
         .await
 }
 
@@ -177,8 +178,11 @@ async fn get_proof_recursion_tip_witness_generator_info_for_batch<'a>(
     batch_number: L1BatchNumber,
     conn: &mut Connection<'a, Prover>,
 ) -> Option<RecursionTipWitnessGeneratorJobInfo> {
-    conn.fri_witness_generator_dal()
-        .get_recursion_tip_witness_generator_jobs_for_batch(batch_number)
+    conn.fri_recursion_tip_witness_generator_dal()
+        .get_recursion_tip_witness_generator_jobs_for_batch(L1BatchId::new(
+            L2ChainId::zero(),
+            batch_number,
+        ))
         .await
 }
 
@@ -186,8 +190,11 @@ async fn get_proof_scheduler_witness_generator_info_for_batch<'a>(
     batch_number: L1BatchNumber,
     conn: &mut Connection<'a, Prover>,
 ) -> Option<SchedulerWitnessGeneratorJobInfo> {
-    conn.fri_witness_generator_dal()
-        .get_scheduler_witness_generator_jobs_for_batch(batch_number)
+    conn.fri_scheduler_witness_generator_dal()
+        .get_scheduler_witness_generator_jobs_for_batch(L1BatchId::new(
+            L2ChainId::zero(),
+            batch_number,
+        ))
         .await
 }
 
@@ -196,23 +203,23 @@ async fn get_proof_compression_job_info_for_batch<'a>(
     conn: &mut Connection<'a, Prover>,
 ) -> Option<ProofCompressionJobInfo> {
     conn.fri_proof_compressor_dal()
-        .get_proof_compression_job_for_batch(batch_number)
+        .get_proof_compression_job_for_batch(L1BatchId::new(L2ChainId::zero(), batch_number))
         .await
 }
 
-fn display_batch_status(batch_data: BatchData) {
-    display_status_for_stage(batch_data.basic_witness_generator);
-    display_status_for_stage(batch_data.leaf_witness_generator);
-    display_status_for_stage(batch_data.node_witness_generator);
-    display_status_for_stage(batch_data.recursion_tip_witness_generator);
-    display_status_for_stage(batch_data.scheduler_witness_generator);
-    display_status_for_stage(batch_data.compressor);
+fn display_batch_status(batch_data: BatchData, max_failure_attempts: u32) {
+    display_status_for_stage(batch_data.basic_witness_generator, max_failure_attempts);
+    display_status_for_stage(batch_data.leaf_witness_generator, max_failure_attempts);
+    display_status_for_stage(batch_data.node_witness_generator, max_failure_attempts);
+    display_status_for_stage(
+        batch_data.recursion_tip_witness_generator,
+        max_failure_attempts,
+    );
+    display_status_for_stage(batch_data.scheduler_witness_generator, max_failure_attempts);
+    display_status_for_stage(batch_data.compressor, max_failure_attempts);
 }
 
-fn display_status_for_stage(stage_info: StageInfo) {
-    let max_attempts = FriProverConfig::from_env()
-        .expect("Fail to read prover config.")
-        .max_attempts;
+fn display_status_for_stage(stage_info: StageInfo, max_attempts: u32) {
     display_aggregation_round(&stage_info);
     let status = stage_info.witness_generator_jobs_status(max_attempts);
     match status {
@@ -231,19 +238,19 @@ fn display_status_for_stage(stage_info: StageInfo) {
     }
 }
 
-fn display_batch_info(batch_data: BatchData) {
-    display_info_for_stage(batch_data.basic_witness_generator);
-    display_info_for_stage(batch_data.leaf_witness_generator);
-    display_info_for_stage(batch_data.node_witness_generator);
-    display_info_for_stage(batch_data.recursion_tip_witness_generator);
-    display_info_for_stage(batch_data.scheduler_witness_generator);
-    display_info_for_stage(batch_data.compressor);
+fn display_batch_info(batch_data: BatchData, max_failure_attempts: u32) {
+    display_info_for_stage(batch_data.basic_witness_generator, max_failure_attempts);
+    display_info_for_stage(batch_data.leaf_witness_generator, max_failure_attempts);
+    display_info_for_stage(batch_data.node_witness_generator, max_failure_attempts);
+    display_info_for_stage(
+        batch_data.recursion_tip_witness_generator,
+        max_failure_attempts,
+    );
+    display_info_for_stage(batch_data.scheduler_witness_generator, max_failure_attempts);
+    display_info_for_stage(batch_data.compressor, max_failure_attempts);
 }
 
-fn display_info_for_stage(stage_info: StageInfo) {
-    let max_attempts = FriProverConfig::from_env()
-        .expect("Fail to read prover config.")
-        .max_attempts;
+fn display_info_for_stage(stage_info: StageInfo, max_attempts: u32) {
     display_aggregation_round(&stage_info);
     let status = stage_info.witness_generator_jobs_status(max_attempts);
     match status {

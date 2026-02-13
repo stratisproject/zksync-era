@@ -12,29 +12,28 @@ concurrency: vm-benchmarks
 jobs:
   vm-benchmarks:
     name: Run VM benchmarks
-    runs-on: [matterlabs-ci-runner]
+    runs-on: [ matterlabs-ci-runner-highmem-long ]
 
     steps:
-      - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
           submodules: "recursive"
 
       - name: setup-env
         run: |
-          echo PUSH_VM_BENCHMARKS_TO_PROMETHEUS=1 >> .env
+          echo BENCHMARK_PROMETHEUS_PUSHGATEWAY_URL=${{ secrets.BENCHMARK_PROMETHEUS_PUSHGATEWAY_URL }} >> .env
 
-          echo ZKSYNC_HOME=$(pwd) >> $GITHUB_ENV
-          echo $(pwd)/bin >> $GITHUB_PATH
+      - name: Setup Environment
+        uses: ./.github/actions/setup-env
 
-      - name: init
+      - name: build contracts
         run: |
-          run_retried docker compose pull zk
-          docker compose up -d zk
-          ci_run zk
-          ci_run zk compiler system-contracts
+          ci_run zkstack dev contracts
 
       - name: run benchmarks
         run: |
-          ci_run cargo bench --package vm-benchmark --bench diy_benchmark
-          ci_run cargo bench --package vm-benchmark --bench iai | tee iai-result
-          ci_run cargo run --package vm-benchmark --bin iai_results_to_prometheus --release < iai-result
+          ci_run cargo bench --manifest-path ./core/Cargo.toml --package vm-benchmark --bench oneshot
+          # Run only benches with 1,000 transactions per batch to not spend too much time
+          ci_run cargo bench --manifest-path ./core/Cargo.toml --package vm-benchmark --bench batch '/1000$'
+          ci_run cargo bench --manifest-path ./core/Cargo.toml --package vm-benchmark --bench instructions -- --verbose
+          ci_run cargo bench --manifest-path ./core/Cargo.toml --package vm-benchmark --bench instructions -- --print

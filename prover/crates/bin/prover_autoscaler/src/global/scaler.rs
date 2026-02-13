@@ -1,0 +1,2605 @@
+use std::{collections::HashMap, fmt::Debug, hash::Hash, str::FromStr, sync::Arc};
+
+use chrono::{DateTime, Utc};
+use debug_map_sorted::SortedOutputExt;
+
+use crate::{
+    agent::{ScaleDeploymentRequest, ScaleRequest},
+    cluster_types::{Cluster, ClusterName, Clusters, DeploymentName, NamespaceName, PodStatus},
+    config::{PriorityConfig, QueueReportFields},
+    key::{Gpu, GpuKey, Key},
+    metrics::{JobLabels, AUTOSCALER_METRICS},
+};
+
+const DEFAULT_SPEED: usize = 500;
+
+/// Operation mode for the scaler
+#[derive(Debug, Clone)]
+enum OperationMode {
+    /// Normal operation - sequential pool allocation by priority
+    Regular,
+    /// Aggressive mode - allocate to ALL pools simultaneously (no cooldown started yet)
+    Aggressive,
+    /// Aggressive mode with cooldown - resources obtained, waiting for cooldown to expire
+    AggressiveCooldown(DateTime<Utc>),
+}
+
+impl Default for OperationMode {
+    fn default() -> Self {
+        Self::Regular
+    }
+}
+
+#[derive(Debug, Eq, Hash, PartialEq)]
+pub struct PoolKey<K: Eq + Hash + Copy> {
+    pub cluster: ClusterName,
+    pub key: K,
+}
+
+#[derive(Default, Debug, PartialEq, Eq)]
+struct Pool<K: Eq + Hash + Copy> {
+    name: ClusterName,
+    key: K,
+    pods: HashMap<PodStatus, usize>, // TODO: consider using i64 everywhere to avoid type casts.
+    scale_errors: usize,
+    max_pool_size: usize,
+}
+
+impl<K: Eq + Hash + Copy> Pool<K> {
+    fn sum_by_pod_status(&self, ps: PodStatus) -> usize {
+        self.pods.get(&ps).cloned().unwrap_or(0)
+    }
+
+    fn to_key(&self) -> PoolKey<K> {
+        PoolKey {
+            cluster: self.name.clone(),
+            key: self.key,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ScalerConfig {
+    /// Cluster usage priority when there is no other strong signal. Smaller value is used first.
+    pub cluster_priorities: HashMap<ClusterName, u32>,
+    pub apply_min_to_namespace: Option<NamespaceName>,
+    pub long_pending_duration: chrono::Duration,
+    pub scale_errors_duration: chrono::Duration,
+    /// Percentage (0-100) of pools with GCE out of resources errors to trigger aggressive mode.
+    pub aggressive_mode_threshold: usize,
+    /// Duration to stay in aggressive mode after successfully getting resources.
+    pub aggressive_mode_cooldown: chrono::Duration,
+}
+
+#[derive(Debug)]
+pub struct Scaler<K> {
+    pub queue_report_field: QueueReportFields,
+    pub deployment: DeploymentName,
+    min_replicas: usize,
+    max_replicas: HashMap<ClusterName, HashMap<K, usize>>,
+    // TODO Add default speed for default K
+    speed: HashMap<K, usize>,
+    hysteresis: usize,
+    config: Arc<ScalerConfig>,
+    target_priority: Option<PriorityConfig>,
+    operation_mode: Arc<std::sync::Mutex<OperationMode>>,
+}
+
+impl<K: Key> Scaler<K> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        queue_report_field: QueueReportFields,
+        deployment: DeploymentName,
+        min_replicas: usize,
+        max_replicas: HashMap<ClusterName, HashMap<K, usize>>,
+        speed: HashMap<K, usize>,
+        hysteresis: usize,
+        config: Arc<ScalerConfig>,
+        target_priority: Option<PriorityConfig>,
+    ) -> Self {
+        Self {
+            queue_report_field,
+            deployment,
+            min_replicas,
+            max_replicas,
+            speed,
+            hysteresis,
+            config,
+            target_priority,
+            operation_mode: Arc::new(std::sync::Mutex::new(OperationMode::Regular)),
+        }
+    }
+
+    fn convert_to_pool(&self, namespace: &NamespaceName, cluster: &Cluster) -> Vec<Pool<K>> {
+        let Some(namespace_value) = &cluster.namespaces.get(namespace) else {
+            // No namespace in config, ignoring.
+            return vec![];
+        };
+
+        let mut pool_map = HashMap::new(); // <key, Pool>
+        for deployment in namespace_value.deployments.keys() {
+            // Processing only selected deployment(s).
+            let Some(key) = K::new(self.deployment.to_str(), deployment) else {
+                continue;
+            };
+            let e = pool_map.entry(key).or_insert(Pool {
+                name: cluster.name.clone(),
+                key,
+                max_pool_size: self
+                    .max_replicas
+                    .get(&cluster.name)
+                    .and_then(|inner_map| inner_map.get(&key))
+                    .copied()
+                    .unwrap_or(0),
+                scale_errors: namespace_value
+                    .scale_errors
+                    .iter()
+                    .filter(|v| {
+                        v.time > Utc::now() - self.config.scale_errors_duration
+                            && K::new(self.deployment.to_str(), &(v.name.clone().into()))
+                                == Some(key)
+                    })
+                    .count(),
+                ..Default::default()
+            });
+
+            // Initialize pool only if we have ready deployments.
+            e.pods.insert(PodStatus::Running, 0);
+        }
+
+        for (pod, pod_value) in namespace_value.pods.iter() {
+            let Some(key) = K::new(self.deployment.to_str(), &(pod.clone().into())) else {
+                continue;
+            };
+            let pool = pool_map.entry(key).or_insert(Pool {
+                // TODO: if the pool entry doesn't exists log an error
+                name: cluster.name.clone(),
+                key,
+                ..Default::default()
+            });
+            let mut status = PodStatus::from_str(&pod_value.status).unwrap_or_default();
+            if status == PodStatus::Pending {
+                if pod_value.out_of_resources {
+                    // This counts this scale error twice (see piil initialization above), but it's
+                    // consistent across all pools and guarantee that no error will be missed.
+                    pool.scale_errors += 1;
+                    status = PodStatus::NeedToMove;
+                } else if pod_value.changed < Utc::now() - self.config.long_pending_duration {
+                    status = PodStatus::LongPending;
+                }
+            }
+            tracing::info!(
+                "pod {}: status: {}, real status: {}",
+                pod,
+                status,
+                pod_value.status
+            );
+            pool.pods.entry(status).and_modify(|n| *n += 1).or_insert(1);
+        }
+
+        tracing::debug!("From pods {:?}", pool_map.sorted_debug());
+
+        pool_map.into_values().collect()
+    }
+
+    fn sorted_clusters(&self, namespace: &NamespaceName, clusters: &Clusters) -> Vec<Pool<K>> {
+        let mut pools: Vec<Pool<K>> = clusters
+            .clusters
+            .values()
+            .flat_map(|c| self.convert_to_pool(namespace, c))
+            .collect();
+
+        // If a pool has NeedToMove pod, max_pool_size is set to number of Running+Pending pods.
+        for pool in &mut pools {
+            if pool.sum_by_pod_status(PodStatus::NeedToMove) > 0 {
+                pool.max_pool_size = pool.sum_by_pod_status(PodStatus::Running)
+                    + pool.sum_by_pod_status(PodStatus::Pending);
+                tracing::debug!(
+                    "Pool {}:{:?} has NeedToMove pods, max_pool_size adjusted to {}",
+                    pool.name,
+                    pool.key,
+                    pool.max_pool_size
+                );
+            }
+        }
+
+        let priority_cmp = |a: &Pool<K>, b: &Pool<K>| {
+            match &self.target_priority {
+                Some(PriorityConfig::Gpu(gpu_priorities)) => {
+                    let get_pos = |pool_key: &K, pool_name: &ClusterName| -> Option<usize> {
+                        if let Some(gpu_val) = pool_key.gpu() {
+                            let current_gpu_key = GpuKey(gpu_val);
+                            gpu_priorities.iter().position(|(c, gk_prio)| {
+                                *c == *pool_name && *gk_prio == current_gpu_key
+                            })
+                        } else {
+                            None // Not a GPU key.
+                        }
+                    };
+                    let pos_a = get_pos(&a.key, &a.name);
+                    let pos_b = get_pos(&b.key, &b.name);
+
+                    match (pos_a, pos_b) {
+                        (Some(p_a), Some(p_b)) => p_a.cmp(&p_b),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    }
+                }
+                Some(PriorityConfig::Simple(simple_priorities)) => {
+                    let pos_a = simple_priorities.iter().position(|c| *c == a.name);
+                    let pos_b = simple_priorities.iter().position(|c| *c == b.name);
+                    match (pos_a, pos_b) {
+                        (Some(p_a), Some(p_b)) => p_a.cmp(&p_b),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    }
+                }
+                None => {
+                    // No target_priority, use global cluster_priorities.
+                    self.config
+                        .cluster_priorities
+                        .get(&a.name)
+                        .unwrap_or(&u32::MAX)
+                        .cmp(
+                            self.config
+                                .cluster_priorities
+                                .get(&b.name)
+                                .unwrap_or(&u32::MAX),
+                        )
+                }
+            }
+        };
+
+        pools.sort_by(|a, b| {
+            if self.target_priority.is_some() {
+                // Use target_priority for sorting, which includes GPU key.
+                // This is needed to keep old behavior and use a new one if target_priority is set.
+                std::cmp::Ordering::Equal
+            } else {
+                a.key.cmp(&b.key) // Sort by Key first.
+            }
+            .then(
+                a.sum_by_pod_status(PodStatus::NeedToMove)
+                    .cmp(&b.sum_by_pod_status(PodStatus::NeedToMove)),
+            ) // Sort by need to evict.
+            .then(
+                a.sum_by_pod_status(PodStatus::LongPending)
+                    .cmp(&b.sum_by_pod_status(PodStatus::LongPending)),
+            ) // Sort by long Pending pods.
+            .then(a.scale_errors.cmp(&b.scale_errors)) // Sort by scale_errors in the cluster.
+            .then(priority_cmp(a, b)) // Sort by priority.
+            .then(b.max_pool_size.cmp(&a.max_pool_size)) // Reverse sort by cluster size.
+        });
+
+        // TODO move to better place
+        pools.iter().for_each(|p| {
+            AUTOSCALER_METRICS.scale_errors[&p.name.clone()].set(p.scale_errors as u64);
+        });
+
+        pools
+    }
+
+    fn speed(&self, key: K) -> usize {
+        *self.speed.get(&key).unwrap_or(&DEFAULT_SPEED)
+    }
+
+    fn pods_to_speed(&self, key: K, n: usize) -> usize {
+        self.speed(key) * n
+    }
+
+    fn normalize_queue(&self, key: K, queue: usize) -> usize {
+        let speed = self.speed(key);
+        // Divide and round up if there's any remainder.
+        queue.div_ceil(speed) * speed
+    }
+
+    /// Check if we should enter/stay in aggressive mode based on percentage of pools with errors
+    /// Also handles state transitions between Regular, Aggressive, and AggressiveCooldown
+    fn is_aggressive_mode(&self, pools: &[Pool<K>], total_running: usize, queue: usize) -> bool {
+        // If threshold is 0, aggressive mode is disabled
+        if self.config.aggressive_mode_threshold == 0 {
+            return false;
+        }
+
+        let mut mode = self
+            .operation_mode
+            .lock()
+            .expect("operation_mode mutex is poisoned");
+
+        match *mode {
+            OperationMode::Regular => {
+                // Check if we should enter aggressive mode
+                if pools.is_empty() {
+                    return false;
+                }
+
+                // Count ALL pools with out_of_resources issues (NeedToMove or scale_errors)
+                let pools_with_errors = pools
+                    .iter()
+                    .filter(|p| {
+                        p.sum_by_pod_status(PodStatus::NeedToMove) > 0 || p.scale_errors > 0
+                    })
+                    .count();
+
+                let total_pools = pools.len();
+                let error_percentage = (pools_with_errors * 100) / total_pools;
+
+                if error_percentage >= self.config.aggressive_mode_threshold {
+                    tracing::warn!(
+                        "Resource shortage detected: {}/{} pools ({}%) have resource errors (threshold: {}%). Entering AGGRESSIVE MODE.",
+                        pools_with_errors,
+                        total_pools,
+                        error_percentage,
+                        self.config.aggressive_mode_threshold
+                    );
+                    *mode = OperationMode::Aggressive;
+                    return true;
+                } else if pools_with_errors > 0 {
+                    tracing::debug!(
+                        "Resource errors detected: {}/{} pools ({}%) have errors, but threshold {}% not reached",
+                        pools_with_errors,
+                        total_pools,
+                        error_percentage,
+                        self.config.aggressive_mode_threshold
+                    );
+                }
+                false
+            }
+            OperationMode::Aggressive => {
+                // Stay in aggressive mode
+                true
+            }
+            OperationMode::AggressiveCooldown(cooldown_start) => {
+                // Check if we still have enough resources
+                if total_running < queue {
+                    // Lost resources - go back to Aggressive mode
+                    tracing::warn!("Lost resources during cooldown, returning to Aggressive mode");
+                    *mode = OperationMode::Aggressive;
+                    return true;
+                }
+
+                // Check if cooldown period has passed
+                if Utc::now() >= cooldown_start + self.config.aggressive_mode_cooldown {
+                    tracing::info!(
+                        "Aggressive mode cooldown complete after having sufficient resources for {:?}, returning to Regular mode",
+                        self.config.aggressive_mode_cooldown
+                    );
+                    *mode = OperationMode::Regular;
+                    return false;
+                }
+
+                // Still in cooldown with enough resources
+                true
+            }
+        }
+    }
+
+    /// Update operation mode based on current resource availability
+    fn update_operation_mode(&self, total_running: usize, queue: usize) {
+        let mut mode = self
+            .operation_mode
+            .lock()
+            .expect("operation_mode mutex is poisoned");
+
+        match *mode {
+            OperationMode::Aggressive => {
+                if total_running >= queue {
+                    // Got enough resources - start cooldown
+                    let now = Utc::now();
+                    tracing::info!(
+                        "Resources obtained (Running: {}, Queue: {}), entering AggressiveCooldown mode",
+                        total_running,
+                        queue
+                    );
+                    *mode = OperationMode::AggressiveCooldown(now);
+                } else {
+                    tracing::debug!(
+                        "Still need more resources (Running: {}, Queue: {})",
+                        total_running,
+                        queue
+                    );
+                }
+            }
+            OperationMode::AggressiveCooldown(_) => {
+                // Just log that we're still in cooldown
+                tracing::debug!(
+                    "AggressiveCooldown mode continues (Running: {}, Queue: {})",
+                    total_running,
+                    queue
+                );
+            }
+            OperationMode::Regular => {
+                // Nothing to update in regular mode
+            }
+        }
+    }
+
+    /// Remove excess pods with hysteresis to avoid oscillation
+    fn remove_excess_pods(
+        &self,
+        pods: &mut HashMap<PoolKey<K>, usize>,
+        sorted_clusters: &[Pool<K>],
+        mut total: i64,
+        queue: usize,
+    ) -> i64 {
+        let mut total_hysteresis = total - total * self.hysteresis as i64 / 100;
+
+        if total_hysteresis > queue as i64 {
+            for cluster in sorted_clusters.iter().rev() {
+                // Special case: if queue is 0 we want to remove all pods.
+                let mut excess_queue = if queue > 0 { total_hysteresis } else { total }
+                    - self.normalize_queue(cluster.key, queue) as i64;
+                if excess_queue <= 0 {
+                    continue;
+                }
+                let mut excess_replicas = excess_queue as usize / self.speed(cluster.key);
+                let replicas = pods.entry(cluster.to_key()).or_default();
+                if *replicas == 0 {
+                    continue;
+                }
+                if *replicas < excess_replicas {
+                    excess_replicas = *replicas;
+                    excess_queue = (*replicas * self.speed(cluster.key)) as i64;
+                }
+
+                tracing::debug!(
+                    "Removing excess pods in pool {}:{:?}: {} → {} (-{})",
+                    cluster.name,
+                    cluster.key,
+                    *replicas,
+                    *replicas - excess_replicas,
+                    excess_replicas
+                );
+
+                *replicas -= excess_replicas;
+                total -= excess_queue;
+                total_hysteresis -= excess_queue;
+
+                if *replicas == 0 {
+                    pods.remove(&cluster.to_key());
+                }
+
+                if total_hysteresis <= 0 {
+                    break;
+                }
+            }
+        }
+
+        total
+    }
+
+    /// Aggressive mode calculation: add pods to ALL pools simultaneously
+    fn calculate_aggressive(
+        &self,
+        queue: usize,
+        sorted_clusters: Vec<Pool<K>>,
+    ) -> HashMap<PoolKey<K>, usize> {
+        let mut pods: HashMap<PoolKey<K>, usize> = HashMap::new();
+        let mut total_running: usize = 0;
+        let mut total_capacity: usize = 0; // Running + Pending (only from healthy pools)
+
+        // Step 1: Count existing pods
+        for cluster in &sorted_clusters {
+            let running = cluster.sum_by_pod_status(PodStatus::Running);
+            let pending = cluster.sum_by_pod_status(PodStatus::Pending);
+
+            // In aggressive mode, ignore Pending pods from pools with errors (they're likely stuck)
+            let has_errors =
+                cluster.sum_by_pod_status(PodStatus::NeedToMove) > 0 || cluster.scale_errors > 0;
+            let total_in_pool = if has_errors {
+                running // Only count Running pods from pools with errors
+            } else {
+                running + pending // Count both Running and Pending from healthy pools
+            };
+
+            if total_in_pool > 0 {
+                pods.insert(cluster.to_key(), total_in_pool);
+            }
+
+            total_running += self.pods_to_speed(cluster.key, running);
+            total_capacity += self.pods_to_speed(cluster.key, total_in_pool);
+        }
+
+        // Update operation mode based on resource availability
+        self.update_operation_mode(total_running, queue);
+
+        tracing::info!(
+            "Aggressive mode: Running capacity = {}, Total capacity (Running+Pending) = {}, Queue = {}",
+            total_running,
+            total_capacity,
+            queue
+        );
+
+        // Step 2: Check if we got enough Running pods
+        if total_running >= queue {
+            tracing::warn!("SUCCESS! Got enough Running pods. Removing all Pending pods and scaling down excess Running pods.");
+
+            // Remove ALL pending pods, keep only Running
+            pods.clear();
+            for cluster in &sorted_clusters {
+                let running = cluster.sum_by_pod_status(PodStatus::Running);
+                if running > 0 {
+                    pods.insert(cluster.to_key(), running);
+                }
+            }
+
+            self.remove_excess_pods(&mut pods, &sorted_clusters, total_running as i64, queue);
+
+            return pods;
+        }
+
+        // Step 3: Still need more capacity - add missing pods to ALL pools
+        if total_capacity < queue {
+            let missing_capacity = queue - total_capacity;
+
+            tracing::warn!(
+                "Need {} more capacity. Adding pods to ALL available pools simultaneously!",
+                missing_capacity
+            );
+
+            // Add pods to ALL pools that have capacity
+            for cluster in &sorted_clusters {
+                if cluster.max_pool_size == 0 {
+                    continue;
+                }
+
+                // Calculate how many pods we'd need in THIS pool to cover the entire missing capacity
+                let needed_for_full_coverage =
+                    self.normalize_queue(cluster.key, missing_capacity) / self.speed(cluster.key);
+
+                let current = pods.entry(cluster.to_key()).or_default();
+                let available_capacity = cluster.max_pool_size.saturating_sub(*current);
+
+                if available_capacity > 0 {
+                    let to_add = needed_for_full_coverage.min(available_capacity);
+                    let previous = *current;
+                    *current += to_add;
+
+                    tracing::warn!(
+                        "  Pool {}:{:?}: {} → {} pods (+{})",
+                        cluster.name,
+                        cluster.key,
+                        previous,
+                        current,
+                        to_add
+                    );
+                }
+            }
+        }
+
+        // Step 4: Apply max_pool_size limits
+        for cluster in &sorted_clusters {
+            if let Some(replicas) = pods.get_mut(&cluster.to_key()) {
+                if *replicas > cluster.max_pool_size {
+                    tracing::debug!(
+                        "Capping pool {}:{:?} from {} to {} (max_pool_size)",
+                        cluster.name,
+                        cluster.key,
+                        *replicas,
+                        cluster.max_pool_size
+                    );
+                    *replicas = cluster.max_pool_size;
+                }
+            }
+        }
+
+        pods
+    }
+
+    pub fn calculate(
+        &self,
+        namespace: &NamespaceName,
+        queue: usize,
+        clusters: &Clusters,
+    ) -> HashMap<PoolKey<K>, usize> {
+        let sorted_clusters = self.sorted_clusters(namespace, clusters);
+        tracing::debug!(
+            "Sorted clusters for namespace {}: {:?}",
+            namespace,
+            &sorted_clusters
+        );
+
+        // Increase queue size, if it's too small, to make sure that required min_replicas are
+        // running.
+        let queue: usize = if self.config.apply_min_to_namespace == Some(namespace.clone())
+            && self.min_replicas > 0
+        {
+            self.normalize_queue(K::default(), queue)
+                .max(self.pods_to_speed(K::default(), self.min_replicas))
+        } else {
+            queue
+        };
+
+        let mut total: i64 = 0;
+        let mut total_running: usize = 0;
+        let mut pods: HashMap<PoolKey<K>, usize> = HashMap::new();
+        for cluster in &sorted_clusters {
+            for (status, replicas) in &cluster.pods {
+                match status {
+                    PodStatus::Running | PodStatus::Pending => {
+                        total += self.pods_to_speed(cluster.key, *replicas) as i64;
+                        if *status == PodStatus::Running {
+                            total_running += self.pods_to_speed(cluster.key, *replicas);
+                        }
+                        pods.entry(cluster.to_key())
+                            .and_modify(|x| *x += replicas)
+                            .or_insert(*replicas);
+                    }
+                    _ => (), // Ignore LongPending as not running here.
+                }
+            }
+        }
+
+        if self.is_aggressive_mode(&sorted_clusters, total_running, queue) {
+            return self.calculate_aggressive(queue, sorted_clusters);
+        }
+
+        tracing::debug!("Queue already covered with pods: {}", total);
+        total = self.remove_excess_pods(&mut pods, &sorted_clusters, total, queue);
+
+        // Reduce load in over capacity pools.
+        for cluster in &sorted_clusters {
+            let replicas = pods.entry(cluster.to_key()).or_default();
+            if cluster.max_pool_size < *replicas {
+                let excess = *replicas - cluster.max_pool_size;
+                total -= (excess * self.speed(cluster.key)) as i64;
+                *replicas -= excess;
+            }
+        }
+
+        tracing::debug!("Queue covered with pods: {}", total);
+        // Add required pods.
+        if (total as usize) < queue {
+            for cluster in &sorted_clusters {
+                let mut required_queue = queue - total as usize;
+                let mut required_replicas =
+                    self.normalize_queue(cluster.key, required_queue) / self.speed(cluster.key);
+                let replicas = pods.entry(cluster.to_key()).or_default();
+                if *replicas + required_replicas > cluster.max_pool_size {
+                    required_replicas = cluster.max_pool_size - *replicas;
+                    required_queue = required_replicas * self.speed(cluster.key);
+                }
+                *replicas += required_replicas;
+                total += required_queue as i64;
+            }
+        }
+
+        tracing::debug!(
+            "run result for namespace {}: pods {:?}, total: {}",
+            namespace,
+            &pods,
+            total
+        );
+
+        pods
+    }
+
+    pub fn diff(
+        &self,
+        namespace: &NamespaceName,
+        pods: HashMap<PoolKey<K>, usize>,
+        clusters: &Clusters,
+        requests: &mut HashMap<ClusterName, ScaleRequest>,
+    ) {
+        pods.into_iter()
+            .for_each(|(PoolKey { cluster, key }, replicas)| {
+                let deployment_name = key.to_deployment(self.deployment.to_str());
+                clusters
+                    .clusters
+                    .get(&cluster)
+                    .and_then(|c| c.namespaces.get(namespace))
+                    .and_then(|ns| ns.deployments.get(&deployment_name))
+                    .map_or_else(
+                        || {
+                            tracing::error!(
+                                "Wasn't able to find deployment {} in cluster {}, namespace {}",
+                                deployment_name,
+                                cluster,
+                                namespace
+                            )
+                        },
+                        |deployment| {
+                            if deployment.desired != replicas {
+                                requests
+                                    .entry(cluster.clone())
+                                    .or_default()
+                                    .deployments
+                                    .push(ScaleDeploymentRequest {
+                                        namespace: namespace.clone(),
+                                        name: deployment_name.clone(),
+                                        size: replicas,
+                                    });
+                            }
+                        },
+                    );
+            })
+    }
+}
+
+pub trait ScalerTrait {
+    fn deployment(&self) -> DeploymentName;
+    fn queue_report_field(&self) -> QueueReportFields;
+    fn run(
+        &self,
+        namespace: &NamespaceName,
+        queue: usize,
+        clusters: &Clusters,
+        requests: &mut HashMap<ClusterName, ScaleRequest>,
+    );
+}
+
+impl<K: Key> ScalerTrait for Scaler<K> {
+    fn deployment(&self) -> DeploymentName {
+        self.deployment.clone()
+    }
+    fn queue_report_field(&self) -> QueueReportFields {
+        self.queue_report_field
+    }
+
+    fn run(
+        &self,
+        namespace: &NamespaceName,
+        queue: usize,
+        clusters: &Clusters,
+        requests: &mut HashMap<ClusterName, ScaleRequest>,
+    ) {
+        let replicas = self.calculate(namespace, queue, clusters);
+        for (k, num) in &replicas {
+            let labels = JobLabels {
+                job: self.deployment.clone(),
+                target_cluster: k.cluster.clone(),
+                target_namespace: namespace.clone(),
+                gpu: match k.key.gpu() {
+                    Some(gpu) => gpu,
+                    None => Gpu::Unknown,
+                },
+            };
+            AUTOSCALER_METRICS.jobs[&labels].set(*num);
+
+            if self.queue_report_field == QueueReportFields::prover_jobs {
+                // TODO: Remove after migration to jobs metric.
+                AUTOSCALER_METRICS.provers
+                    [&(k.cluster.clone(), namespace.clone(), k.key.gpu().unwrap())]
+                    .set(*num);
+            }
+        }
+        self.diff(namespace, replicas, clusters, requests);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        cluster_types::{Deployment, Namespace, Pod, ScaleEvent},
+        key::{Gpu, GpuKey, NoKey},
+    };
+
+    fn scaler_config(apply_min_to_namespace: &str) -> Arc<ScalerConfig> {
+        Arc::new(ScalerConfig {
+            cluster_priorities: [("foo".into(), 0), ("bar".into(), 10)].into(),
+            apply_min_to_namespace: Some(apply_min_to_namespace.into()),
+            long_pending_duration: chrono::Duration::seconds(600),
+            scale_errors_duration: chrono::Duration::seconds(3600),
+            aggressive_mode_threshold: 0, // Disabled for tests by default
+            aggressive_mode_cooldown: chrono::Duration::seconds(600),
+        })
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_calculate() {
+        let scaler = Scaler::<GpuKey>::new(
+            QueueReportFields::prover_jobs,
+            "circuit-prover-gpu".into(),
+            2,
+            [
+                ("foo".into(), [(GpuKey(Gpu::L4), 100)].into()),
+                ("bar".into(), [(GpuKey(Gpu::L4), 100)].into()),
+            ]
+            .into(),
+            [(GpuKey(Gpu::L4), 500), (GpuKey(Gpu::T4), 100)].into(),
+            0,
+            scaler_config("prover-other"),
+            None,
+        );
+
+        assert_eq!(
+            scaler.calculate(
+                &"prover".into(),
+                1499,
+                &Clusters {
+                    clusters: [(
+                        "foo".into(),
+                        Cluster {
+                            name: "foo".into(),
+                            namespaces: [(
+                                "prover".into(),
+                                Namespace {
+                                    deployments: [(
+                                        "circuit-prover-gpu".into(),
+                                        Deployment::default(),
+                                    )]
+                                    .into(),
+                                    pods: [(
+                                        "circuit-prover-gpu-7c5f8fc747-gmtcr".into(),
+                                        Pod {
+                                            status: "Running".into(),
+                                            ..Default::default()
+                                        },
+                                    )]
+                                    .into(),
+                                    ..Default::default()
+                                },
+                            )]
+                            .into(),
+                        },
+                    )]
+                    .into(),
+                    ..Default::default()
+                },
+            ),
+            [(
+                PoolKey {
+                    cluster: "foo".into(),
+                    key: GpuKey(Gpu::L4),
+                },
+                3,
+            )]
+            .into(),
+            "3 new provers"
+        );
+        assert_eq!(
+            scaler.calculate(
+                &"prover".into(),
+                499,
+                &Clusters {
+                    clusters: [
+                        (
+                            "foo".into(),
+                            Cluster {
+                                name: "foo".into(),
+                                namespaces: [(
+                                    "prover".into(),
+                                    Namespace {
+                                        deployments: [(
+                                            "circuit-prover-gpu".into(),
+                                            Deployment::default(),
+                                        )]
+                                        .into(),
+                                        ..Default::default()
+                                    },
+                                )]
+                                .into(),
+                            },
+                        ),
+                        (
+                            "bar".into(),
+                            Cluster {
+                                name: "bar".into(),
+                                namespaces: [(
+                                    "prover".into(),
+                                    Namespace {
+                                        deployments: [(
+                                            "circuit-prover-gpu".into(),
+                                            Deployment {
+                                                running: 1,
+                                                desired: 1,
+                                            },
+                                        )]
+                                        .into(),
+                                        pods: [(
+                                            "circuit-prover-gpu-7c5f8fc747-gmtcr".into(),
+                                            Pod {
+                                                status: "Running".into(),
+                                                ..Default::default()
+                                            },
+                                        )]
+                                        .into(),
+                                        ..Default::default()
+                                    },
+                                )]
+                                .into(),
+                            },
+                        )
+                    ]
+                    .into(),
+                    ..Default::default()
+                },
+            ),
+            [
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::L4),
+                    },
+                    0,
+                ),
+                (
+                    PoolKey {
+                        cluster: "bar".into(),
+                        key: GpuKey(Gpu::L4),
+                    },
+                    1,
+                )
+            ]
+            .into(),
+            "Preserve running"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_calculate_h100() {
+        let scaler = Scaler::new(
+            QueueReportFields::prover_jobs,
+            "circuit-prover-gpu".into(),
+            0,
+            [
+                (
+                    "foo".into(),
+                    [(GpuKey(Gpu::L4), 0), (GpuKey(Gpu::H100), 100)].into(),
+                ),
+                (
+                    "bar".into(),
+                    [(GpuKey(Gpu::L4), 0), (GpuKey(Gpu::H100), 100)].into(),
+                ),
+            ]
+            .into(),
+            [
+                (GpuKey(Gpu::L4), 1500),
+                (GpuKey(Gpu::H100), 4000),
+                (GpuKey(Gpu::T4), 700),
+            ]
+            .into(),
+            0,
+            scaler_config("prover"),
+            None,
+        );
+
+        assert_eq!(
+            scaler.calculate(
+                &"prover".into(),
+                6308,
+                &Clusters {
+                    clusters: [
+                        (
+                            "foo".into(),
+                            Cluster {
+                                name: "foo".into(),
+                                namespaces: [(
+                                    "prover".into(),
+                                    Namespace {
+                                        deployments:
+                                            [
+                                                (
+                                                    "circuit-prover-gpu".into(),
+                                                    Deployment::default()
+                                                ),
+                                                (
+                                                    "circuit-prover-gpu-h100".into(),
+                                                    Deployment::default(),
+                                                ),
+                                                (
+                                                    "circuit-prover-gpu-t4".into(),
+                                                    Deployment::default(),
+                                                ),
+                                            ]
+                                            .into(),
+                                        pods: [
+                                            (
+                                                "circuit-prover-gpu-h100-7c5f8fc747-gmtcr".into(),
+                                                Pod {
+                                                    status: "Running".into(),
+                                                    ..Default::default()
+                                                },
+                                            ),
+                                            (
+                                                "circuit-prover-gpu-h100-7c5f8fc747-gmtc1".into(),
+                                                Pod {
+                                                    status: "Running".into(),
+                                                    ..Default::default()
+                                                },
+                                            ),
+                                            (
+                                                "circuit-prover-gpu-h100-7c5f8fc747-gmtc2".into(),
+                                                Pod {
+                                                    status: "Running".into(),
+                                                    ..Default::default()
+                                                },
+                                            ),
+                                            (
+                                                "circuit-prover-gpu-t4-7c5f8fc747-gmtc2".into(),
+                                                Pod {
+                                                    status: "Running".into(),
+                                                    ..Default::default()
+                                                },
+                                            ),
+                                        ]
+                                        .into(),
+                                        ..Default::default()
+                                    },
+                                )]
+                                .into(),
+                            },
+                        ),
+                        (
+                            "bar".into(),
+                            Cluster {
+                                name: "bar".into(),
+                                namespaces: [(
+                                    "prover".into(),
+                                    Namespace {
+                                        deployments:
+                                            [
+                                                (
+                                                    "circuit-prover-gpu".into(),
+                                                    Deployment::default()
+                                                ),
+                                                (
+                                                    "circuit-prover-gpu-h100".into(),
+                                                    Deployment::default(),
+                                                ),
+                                                (
+                                                    "circuit-prover-gpu-t4".into(),
+                                                    Deployment::default(),
+                                                ),
+                                            ]
+                                            .into(),
+                                        ..Default::default()
+                                    },
+                                )]
+                                .into(),
+                            },
+                        )
+                    ]
+                    .into(),
+                    ..Default::default()
+                },
+            ),
+            [
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::L4),
+                    },
+                    0,
+                ),
+                (
+                    PoolKey {
+                        cluster: "bar".into(),
+                        key: GpuKey(Gpu::L4),
+                    },
+                    0,
+                ),
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::H100),
+                    },
+                    2,
+                ),
+                (
+                    PoolKey {
+                        cluster: "bar".into(),
+                        key: GpuKey(Gpu::H100),
+                    },
+                    0,
+                ),
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::T4),
+                    },
+                    0,
+                ),
+                (
+                    PoolKey {
+                        cluster: "bar".into(),
+                        key: GpuKey(Gpu::T4),
+                    },
+                    0,
+                ),
+            ]
+            .into(),
+            "Running 2 H100"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_calculate_min_provers() {
+        let scaler = Scaler::new(
+            QueueReportFields::prover_jobs,
+            "circuit-prover-gpu".into(),
+            2,
+            [
+                ("foo".into(), [(GpuKey(Gpu::L4), 100)].into()),
+                ("bar".into(), [(GpuKey(Gpu::L4), 100)].into()),
+            ]
+            .into(),
+            [(GpuKey(Gpu::L4), 500), (GpuKey(Gpu::T4), 100)].into(),
+            0,
+            scaler_config("prover"),
+            None,
+        );
+
+        assert_eq!(
+            scaler.calculate(
+                &"prover".into(),
+                10,
+                &Clusters {
+                    clusters: [
+                        (
+                            "foo".into(),
+                            Cluster {
+                                name: "foo".into(),
+                                namespaces: [(
+                                    "prover".into(),
+                                    Namespace {
+                                        deployments: [(
+                                            "circuit-prover-gpu".into(),
+                                            Deployment::default(),
+                                        )]
+                                        .into(),
+                                        ..Default::default()
+                                    },
+                                )]
+                                .into(),
+                            },
+                        ),
+                        (
+                            "bar".into(),
+                            Cluster {
+                                name: "bar".into(),
+                                namespaces: [(
+                                    "prover".into(),
+                                    Namespace {
+                                        deployments: [(
+                                            "circuit-prover-gpu".into(),
+                                            Deployment::default(),
+                                        )]
+                                        .into(),
+                                        ..Default::default()
+                                    },
+                                )]
+                                .into(),
+                            },
+                        )
+                    ]
+                    .into(),
+                    ..Default::default()
+                },
+            ),
+            [
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::L4),
+                    },
+                    2,
+                ),
+                (
+                    PoolKey {
+                        cluster: "bar".into(),
+                        key: GpuKey(Gpu::L4),
+                    },
+                    0,
+                )
+            ]
+            .into(),
+            "Min 2 provers, non running"
+        );
+        assert_eq!(
+            scaler.calculate(
+                &"prover".into(),
+                0,
+                &Clusters {
+                    clusters: [
+                        (
+                            "foo".into(),
+                            Cluster {
+                                name: "foo".into(),
+                                namespaces: [(
+                                    "prover".into(),
+                                    Namespace {
+                                        deployments: [(
+                                            "circuit-prover-gpu".into(),
+                                            Deployment {
+                                                running: 3,
+                                                desired: 3,
+                                            },
+                                        )]
+                                        .into(),
+                                        pods: [
+                                            (
+                                                "circuit-prover-gpu-7c5f8fc747-gmtcr".into(),
+                                                Pod {
+                                                    status: "Running".into(),
+                                                    ..Default::default()
+                                                },
+                                            ),
+                                            (
+                                                "circuit-prover-gpu-7c5f8fc747-gmtc2".into(),
+                                                Pod {
+                                                    status: "Running".into(),
+                                                    ..Default::default()
+                                                },
+                                            ),
+                                            (
+                                                "circuit-prover-gpu-7c5f8fc747-gmtc3".into(),
+                                                Pod {
+                                                    status: "Running".into(),
+                                                    ..Default::default()
+                                                },
+                                            )
+                                        ]
+                                        .into(),
+                                        ..Default::default()
+                                    },
+                                )]
+                                .into(),
+                            },
+                        ),
+                        (
+                            "bar".into(),
+                            Cluster {
+                                name: "bar".into(),
+                                namespaces: [(
+                                    "prover".into(),
+                                    Namespace {
+                                        deployments: [(
+                                            "circuit-prover-gpu".into(),
+                                            Deployment {
+                                                running: 2,
+                                                desired: 2,
+                                            },
+                                        )]
+                                        .into(),
+                                        pods: [
+                                            (
+                                                "circuit-prover-gpu-7c5f8fc747-gmtcr".into(),
+                                                Pod {
+                                                    status: "Running".into(),
+                                                    ..Default::default()
+                                                },
+                                            ),
+                                            (
+                                                "circuit-prover-gpu-7c5f8fc747-gmtc2".into(),
+                                                Pod {
+                                                    status: "Running".into(),
+                                                    ..Default::default()
+                                                },
+                                            )
+                                        ]
+                                        .into(),
+                                        ..Default::default()
+                                    },
+                                )]
+                                .into(),
+                            },
+                        )
+                    ]
+                    .into(),
+                    ..Default::default()
+                },
+            ),
+            [
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::L4),
+                    },
+                    2,
+                ),
+                (
+                    PoolKey {
+                        cluster: "bar".into(),
+                        key: GpuKey(Gpu::L4),
+                    },
+                    0,
+                )
+            ]
+            .into(),
+            "Min 2 provers, 5 running"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_calculate_need_move() {
+        let scaler = Scaler::new(
+            QueueReportFields::prover_jobs,
+            "circuit-prover-gpu".into(),
+            2,
+            [
+                ("foo".into(), [(GpuKey(Gpu::L4), 100)].into()),
+                ("bar".into(), [(GpuKey(Gpu::L4), 100)].into()),
+            ]
+            .into(),
+            [(GpuKey(Gpu::L4), 500), (GpuKey(Gpu::T4), 100)].into(),
+            0,
+            scaler_config("prover"),
+            None,
+        );
+
+        assert_eq!(
+            scaler.calculate(
+                &"prover".into(),
+                1400,
+                &Clusters {
+                    clusters: [
+                        (
+                            "foo".into(),
+                            Cluster {
+                                name: "foo".into(),
+                                namespaces: [(
+                                    "prover".into(),
+                                    Namespace {
+                                        deployments: [(
+                                            "circuit-prover-gpu".into(),
+                                            Deployment {
+                                                running: 3,
+                                                desired: 3,
+                                            },
+                                        )]
+                                        .into(),
+                                        pods: [
+                                            (
+                                                "circuit-prover-gpu-7c5f8fc747-gmtcr".into(),
+                                                Pod {
+                                                    status: "Running".into(),
+                                                    changed: Utc::now(),
+                                                    ..Default::default()
+                                                },
+                                            ),
+                                            (
+                                                "circuit-prover-gpu-7c5f8fc747-gmtc2".into(),
+                                                Pod {
+                                                    status: "Pending".into(),
+                                                    changed: Utc::now(),
+                                                    out_of_resources: true,
+                                                    ..Default::default()
+                                                },
+                                            ),
+                                            (
+                                                "circuit-prover-gpu-7c5f8fc747-gmtc3".into(),
+                                                Pod {
+                                                    status: "Running".into(),
+                                                    changed: Utc::now(),
+                                                    ..Default::default()
+                                                },
+                                            )
+                                        ]
+                                        .into(),
+                                        scale_errors: vec![ScaleEvent {
+                                            name: "circuit-prover-gpu-7c5f8fc747-gmtc2.123456"
+                                                .into(),
+                                            time: Utc::now() - chrono::Duration::minutes(3)
+                                        }],
+                                    },
+                                )]
+                                .into(),
+                            },
+                        ),
+                        (
+                            "bar".into(),
+                            Cluster {
+                                name: "bar".into(),
+                                namespaces: [(
+                                    "prover".into(),
+                                    Namespace {
+                                        deployments: [(
+                                            "circuit-prover-gpu".into(),
+                                            Deployment::default(),
+                                        )]
+                                        .into(),
+                                        ..Default::default()
+                                    },
+                                )]
+                                .into(),
+                            },
+                        )
+                    ]
+                    .into(),
+                    ..Default::default()
+                },
+            ),
+            [
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::L4),
+                    },
+                    2,
+                ),
+                (
+                    PoolKey {
+                        cluster: "bar".into(),
+                        key: GpuKey(Gpu::L4),
+                    },
+                    1,
+                )
+            ]
+            .into(),
+            "Move 1 prover to bar"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_calculate_nokey() {
+        let scaler = Scaler::<NoKey>::new(
+            QueueReportFields::prover_jobs,
+            "some-deployment".into(),
+            0,
+            [
+                ("foo".into(), [(NoKey(), 100)].into()),
+                ("bar".into(), [(NoKey(), 100)].into()),
+            ]
+            .into(),
+            [(NoKey(), 10)].into(),
+            0,
+            scaler_config(""),
+            None,
+        );
+
+        assert_eq!(
+            scaler.calculate(
+                &"prover".into(),
+                24,
+                &Clusters {
+                    clusters: [(
+                        "foo".into(),
+                        Cluster {
+                            name: "foo".into(),
+                            namespaces: [(
+                                "prover".into(),
+                                Namespace {
+                                    deployments: [(
+                                        "some-deployment".into(),
+                                        Deployment::default(),
+                                    )]
+                                    .into(),
+                                    pods: [
+                                        (
+                                            "some-deployment-7c5f8fc747-gmtcr".into(),
+                                            Pod {
+                                                status: "Running".into(),
+                                                ..Default::default()
+                                            },
+                                        ),
+                                        (
+                                            "some-other-deployment-7c5f8fc747-12345".into(),
+                                            Pod {
+                                                status: "Running".into(),
+                                                ..Default::default()
+                                            },
+                                        ),
+                                        (
+                                            "some-other-deployment-7c5f8fc747-12346".into(),
+                                            Pod {
+                                                status: "Running".into(),
+                                                ..Default::default()
+                                            },
+                                        ),
+                                        (
+                                            "some-other-deployment-7c5f8fc747-12347".into(),
+                                            Pod {
+                                                status: "Running".into(),
+                                                ..Default::default()
+                                            },
+                                        ),
+                                    ]
+                                    .into(),
+                                    ..Default::default()
+                                },
+                            )]
+                            .into(),
+                        },
+                    )]
+                    .into(),
+                    ..Default::default()
+                },
+            ),
+            [(
+                PoolKey {
+                    cluster: "foo".into(),
+                    key: NoKey(),
+                },
+                3,
+            )]
+            .into(),
+            "3 new provers"
+        );
+        assert_eq!(
+            scaler.calculate(
+                &"prover".into(),
+                9,
+                &Clusters {
+                    clusters: [
+                        (
+                            "foo".into(),
+                            Cluster {
+                                name: "foo".into(),
+                                namespaces: [(
+                                    "prover".into(),
+                                    Namespace {
+                                        deployments: [(
+                                            "some-deployment".into(),
+                                            Deployment::default(),
+                                        )]
+                                        .into(),
+                                        ..Default::default()
+                                    },
+                                )]
+                                .into(),
+                            },
+                        ),
+                        (
+                            "bar".into(),
+                            Cluster {
+                                name: "bar".into(),
+                                namespaces: [(
+                                    "prover".into(),
+                                    Namespace {
+                                        deployments: [(
+                                            "some-deployment".into(),
+                                            Deployment {
+                                                running: 1,
+                                                desired: 1,
+                                            },
+                                        )]
+                                        .into(),
+                                        pods: [(
+                                            "some-deployment-7c5f8fc747-gmtcr".into(),
+                                            Pod {
+                                                status: "Running".into(),
+                                                ..Default::default()
+                                            },
+                                        )]
+                                        .into(),
+                                        ..Default::default()
+                                    },
+                                )]
+                                .into(),
+                            },
+                        )
+                    ]
+                    .into(),
+                    ..Default::default()
+                },
+            ),
+            [
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: NoKey(),
+                    },
+                    0,
+                ),
+                (
+                    PoolKey {
+                        cluster: "bar".into(),
+                        key: NoKey(),
+                    },
+                    1,
+                )
+            ]
+            .into(),
+            "Preserve running"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_calculate_override_priority_h100() {
+        let target_priority = Some(PriorityConfig::Gpu(vec![
+            ("foo".into(), GpuKey(Gpu::H100)),
+            ("bar".into(), GpuKey(Gpu::L4)),
+            ("bar".into(), GpuKey(Gpu::H100)),
+            ("foo".into(), GpuKey(Gpu::L4)),
+        ]));
+
+        let scaler = Scaler::new(
+            QueueReportFields::prover_jobs,
+            "circuit-prover-gpu".into(),
+            0,
+            [
+                (
+                    "foo".into(),
+                    [(GpuKey(Gpu::L4), 5), (GpuKey(Gpu::H100), 1)].into(),
+                ),
+                (
+                    "bar".into(),
+                    [(GpuKey(Gpu::L4), 5), (GpuKey(Gpu::H100), 1)].into(),
+                ),
+            ]
+            .into(),
+            [(GpuKey(Gpu::L4), 1500), (GpuKey(Gpu::H100), 3000)].into(),
+            0,
+            scaler_config("prover"),
+            target_priority,
+        );
+
+        let clusters = Clusters {
+            clusters: [
+                (
+                    "foo".into(),
+                    Cluster {
+                        name: "foo".into(),
+                        namespaces: [(
+                            "prover".into(),
+                            Namespace {
+                                deployments: [
+                                    ("circuit-prover-gpu".into(), Deployment::default()),
+                                    ("circuit-prover-gpu-h100".into(), Deployment::default()),
+                                ]
+                                .into(),
+                                ..Default::default()
+                            },
+                        )]
+                        .into(),
+                    },
+                ),
+                (
+                    "bar".into(),
+                    Cluster {
+                        name: "bar".into(),
+                        namespaces: [(
+                            "prover".into(),
+                            Namespace {
+                                deployments: [
+                                    ("circuit-prover-gpu".into(), Deployment::default()),
+                                    ("circuit-prover-gpu-h100".into(), Deployment::default()),
+                                ]
+                                .into(),
+                                ..Default::default()
+                            },
+                        )]
+                        .into(),
+                    },
+                ),
+            ]
+            .into(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scaler.calculate(&"prover".into(), 4000, &clusters),
+            [
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::H100),
+                    },
+                    1,
+                ),
+                (
+                    PoolKey {
+                        cluster: "bar".into(),
+                        key: GpuKey(Gpu::H100),
+                    },
+                    0,
+                ),
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::L4),
+                    },
+                    0,
+                ),
+                (
+                    PoolKey {
+                        cluster: "bar".into(),
+                        key: GpuKey(Gpu::L4),
+                    },
+                    1,
+                )
+            ]
+            .into(),
+            "Override priority: H100 in foo, then L4 in bar"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_calculate_backup_gpu() {
+        let target_priority = Some(PriorityConfig::Gpu(vec![
+            ("foo".into(), GpuKey(Gpu::L4)),
+            ("foo".into(), GpuKey(Gpu::H100)),
+        ]));
+
+        let scaler = Scaler::new(
+            QueueReportFields::prover_jobs,
+            "circuit-prover-gpu".into(),
+            0,
+            [(
+                "foo".into(),
+                [(GpuKey(Gpu::L4), 50), (GpuKey(Gpu::H100), 10)].into(),
+            )]
+            .into(),
+            [(GpuKey(Gpu::L4), 1500), (GpuKey(Gpu::H100), 3000)].into(),
+            0,
+            scaler_config("prover"),
+            target_priority,
+        );
+
+        let clusters = Clusters {
+            clusters: [(
+                "foo".into(),
+                Cluster {
+                    name: "foo".into(),
+                    namespaces: [(
+                        "prover".into(),
+                        Namespace {
+                            deployments: [
+                                ("circuit-prover-gpu".into(), Deployment::default()),
+                                ("circuit-prover-gpu-h100".into(), Deployment::default()),
+                            ]
+                            .into(),
+                            pods: [
+                                (
+                                    "circuit-prover-gpu-7c5f8fc747-gmtcr".into(),
+                                    Pod {
+                                        status: "Running".into(),
+                                        changed: Utc::now(),
+                                        ..Default::default()
+                                    },
+                                ),
+                                (
+                                    "circuit-prover-gpu-7c5f8fc747-gmtc2".into(),
+                                    Pod {
+                                        status: "Pending".into(),
+                                        changed: Utc::now(),
+                                        out_of_resources: true,
+                                        ..Default::default()
+                                    },
+                                ),
+                                (
+                                    "circuit-prover-gpu-7c5f8fc747-gmtc3".into(),
+                                    Pod {
+                                        status: "Pending".into(),
+                                        changed: Utc::now(),
+                                        ..Default::default()
+                                    },
+                                ),
+                            ]
+                            .into(),
+                            scale_errors: vec![ScaleEvent {
+                                name: "circuit-prover-gpu-7c5f8fc747-gmtc2.123456".into(),
+                                time: Utc::now() - chrono::Duration::minutes(3),
+                            }],
+                        },
+                    )]
+                    .into(),
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scaler.calculate(&"prover".into(), 2 * 1500 + 2 * 3000 + 2000, &clusters),
+            [
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::L4),
+                    },
+                    2,
+                ),
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::H100),
+                    },
+                    3,
+                ),
+            ]
+            .into(),
+            "Override priority: H100 in foo, then L4 in bar"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_calculate_hysteresis() {
+        let target_priority = Some(PriorityConfig::Gpu(vec![
+            ("foo".into(), GpuKey(Gpu::L4)),
+            ("foo".into(), GpuKey(Gpu::H100)),
+        ]));
+
+        let scaler = Scaler::new(
+            QueueReportFields::prover_jobs,
+            "circuit-prover-gpu".into(),
+            0,
+            [(
+                "foo".into(),
+                [(GpuKey(Gpu::L4), 50), (GpuKey(Gpu::H100), 10)].into(),
+            )]
+            .into(),
+            [(GpuKey(Gpu::L4), 1500), (GpuKey(Gpu::H100), 3000)].into(),
+            50,
+            scaler_config("prover"),
+            target_priority.clone(),
+        );
+
+        let scaler2 = Scaler::new(
+            QueueReportFields::prover_jobs,
+            "circuit-prover-gpu".into(),
+            0,
+            [(
+                "foo".into(),
+                [(GpuKey(Gpu::L4), 50), (GpuKey(Gpu::H100), 10)].into(),
+            )]
+            .into(),
+            [(GpuKey(Gpu::L4), 1500), (GpuKey(Gpu::H100), 3000)].into(),
+            0,
+            scaler_config("prover"),
+            target_priority,
+        );
+
+        let clusters = Clusters {
+            clusters: [(
+                "foo".into(),
+                Cluster {
+                    name: "foo".into(),
+                    namespaces: [(
+                        "prover".into(),
+                        Namespace {
+                            deployments: [
+                                ("circuit-prover-gpu".into(), Deployment::default()),
+                                ("circuit-prover-gpu-h100".into(), Deployment::default()),
+                            ]
+                            .into(),
+                            pods: [
+                                (
+                                    "circuit-prover-gpu-7c5f8fc747-gmtcr".into(),
+                                    Pod {
+                                        status: "Running".into(),
+                                        changed: Utc::now(),
+                                        ..Default::default()
+                                    },
+                                ),
+                                (
+                                    "circuit-prover-gpu-7c5f8fc747-gmtc2".into(),
+                                    Pod {
+                                        status: "Running".into(),
+                                        changed: Utc::now(),
+                                        out_of_resources: true,
+                                        ..Default::default()
+                                    },
+                                ),
+                                (
+                                    "circuit-prover-gpu-h100-7c5f8fc747-gmtc3".into(),
+                                    Pod {
+                                        status: "Running".into(),
+                                        changed: Utc::now(),
+                                        ..Default::default()
+                                    },
+                                ),
+                            ]
+                            .into(),
+                            scale_errors: vec![],
+                        },
+                    )]
+                    .into(),
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let clusters_h100 = Clusters {
+            clusters: [(
+                "foo".into(),
+                Cluster {
+                    name: "foo".into(),
+                    namespaces: [(
+                        "prover".into(),
+                        Namespace {
+                            deployments: [
+                                ("circuit-prover-gpu".into(), Deployment::default()),
+                                ("circuit-prover-gpu-h100".into(), Deployment::default()),
+                            ]
+                            .into(),
+                            pods: [(
+                                "circuit-prover-gpu-h100-7c5f8fc747-gmtc3".into(),
+                                Pod {
+                                    status: "Running".into(),
+                                    changed: Utc::now(),
+                                    ..Default::default()
+                                },
+                            )]
+                            .into(),
+                            scale_errors: vec![],
+                        },
+                    )]
+                    .into(),
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scaler.calculate(&"prover".into(), 2 * 1500 + 3000 - 1500, &clusters),
+            [
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::L4),
+                    },
+                    2,
+                ),
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::H100),
+                    },
+                    1,
+                ),
+            ]
+            .into(),
+            "Override priority: H100 in foo, then L4 in bar"
+        );
+        assert_eq!(
+            scaler.calculate(&"prover".into(), 2 * 1500 + 2 * 3000 - 1500, &clusters),
+            [
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::L4),
+                    },
+                    3,
+                ),
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::H100),
+                    },
+                    1,
+                ),
+            ]
+            .into(),
+            "Override priority: H100 in foo, then L4 in bar"
+        );
+        assert_eq!(
+            scaler2.calculate(&"prover".into(), 2 * 1500 + 3000 - 1500, &clusters),
+            [
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::L4),
+                    },
+                    1,
+                ),
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::H100),
+                    },
+                    1,
+                ),
+            ]
+            .into(),
+            "Override priority: H100 in foo, then L4 in bar"
+        );
+
+        assert_eq!(
+            scaler.calculate(&"prover".into(), 0, &clusters_h100),
+            [
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::L4),
+                    },
+                    0,
+                ),
+                (
+                    PoolKey {
+                        cluster: "foo".into(),
+                        key: GpuKey(Gpu::H100),
+                    },
+                    0,
+                ),
+            ]
+            .into(),
+            "Zero queue, H100 is running"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_convert_to_pool() {
+        let scaler = Scaler::new(
+            QueueReportFields::prover_jobs,
+            "circuit-prover-gpu".into(),
+            2,
+            [("foo".into(), [(GpuKey(Gpu::L4), 100)].into())].into(),
+            [(GpuKey(Gpu::L4), 500)].into(),
+            0,
+            scaler_config("prover"),
+            None,
+        );
+
+        let cluster = &Cluster {
+            name: "foo".into(),
+            namespaces: [(
+                "prover".into(),
+                Namespace {
+                    deployments: [("circuit-prover-gpu".into(), Deployment::default())].into(),
+                    pods: [
+                        (
+                            "circuit-prover-gpu-7c5f8fc747-gmtcr".into(),
+                            Pod {
+                                status: "Running".into(),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "circuit-prover-gpu-7c5f8fc747-12345".into(),
+                            Pod {
+                                status: "Pending".into(),
+                                changed: Utc::now() - chrono::Duration::minutes(15),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "circuit-prover-gpu-7c5f8fc747-12346".into(),
+                            Pod {
+                                status: "Pending".into(),
+                                changed: Utc::now() - chrono::Duration::minutes(2),
+                                out_of_resources: true,
+                                ..Default::default()
+                            },
+                        ),
+                    ]
+                    .into(),
+                    scale_errors: vec![
+                        ScaleEvent {
+                            name: "witness-generator-recursion-tip-fri-5bfdd77959-7ww7h.186b0284b4b8d17b".into(),
+                            time:  Utc::now() - chrono::Duration::minutes(1),
+                        },
+                        ScaleEvent {
+                            name: "circuit-prover-gpu-7c5f8fc747-12346.186afef8db6951b7".into(),
+                            time: Utc::now() - chrono::Duration::minutes(2),
+                        },
+                        ScaleEvent {
+                            name: "circuit-prover-gpu-998f89ff8-qr4x5.186afef8db6951b7".into(),
+                            time: Utc::now() - chrono::Duration::minutes(2),
+                        },
+                        ScaleEvent {
+                            name: "proof-fri-gpu-compressor-69f6999bbc-j88vg.186b02c88881ad70".into(),
+                            time: Utc::now() - chrono::Duration::minutes(3),
+                        },
+                    ],
+                },
+            )]
+            .into(),
+        };
+        assert_eq!(
+            scaler.convert_to_pool(&"prover".into(), cluster),
+            vec![Pool {
+                name: "foo".into(),
+                key: GpuKey(Gpu::L4),
+                pods: [
+                    (PodStatus::NeedToMove, 1),
+                    (PodStatus::LongPending, 1),
+                    (PodStatus::Running, 1)
+                ]
+                .into(),
+                scale_errors: 3,
+                max_pool_size: 100,
+            }]
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_aggressive_mode_trigger() {
+        // Test that aggressive mode triggers when 50% of pools have errors
+        let scaler_config = Arc::new(ScalerConfig {
+            cluster_priorities: [("foo".into(), 0), ("bar".into(), 10)].into(),
+            apply_min_to_namespace: Some("prover".into()),
+            long_pending_duration: chrono::Duration::seconds(600),
+            scale_errors_duration: chrono::Duration::seconds(3600),
+            aggressive_mode_threshold: 50, // 50% threshold
+            aggressive_mode_cooldown: chrono::Duration::seconds(600),
+        });
+
+        let scaler = Scaler::new(
+            QueueReportFields::prover_jobs,
+            "circuit-prover-gpu".into(),
+            0,
+            [
+                ("foo".into(), [(GpuKey(Gpu::L4), 100)].into()),
+                ("bar".into(), [(GpuKey(Gpu::L4), 100)].into()),
+                ("baz".into(), [(GpuKey(Gpu::H100), 100)].into()),
+                ("qux".into(), [(GpuKey(Gpu::H100), 100)].into()),
+            ]
+            .into(),
+            [(GpuKey(Gpu::L4), 1500), (GpuKey(Gpu::H100), 3000)].into(),
+            0,
+            scaler_config,
+            None,
+        );
+
+        let clusters = Clusters {
+            clusters: [
+                (
+                    "foo".into(),
+                    Cluster {
+                        name: "foo".into(),
+                        namespaces: [(
+                            "prover".into(),
+                            Namespace {
+                                deployments: [
+                                    ("circuit-prover-gpu".into(), Deployment::default()),
+                                    ("circuit-prover-gpu-h100".into(), Deployment::default()),
+                                ]
+                                .into(),
+                                pods: [(
+                                    "circuit-prover-gpu-1".into(),
+                                    Pod {
+                                        status: "Pending".into(),
+                                        changed: Utc::now(),
+                                        out_of_resources: true, // Error!
+                                        ..Default::default()
+                                    },
+                                )]
+                                .into(),
+                                ..Default::default()
+                            },
+                        )]
+                        .into(),
+                    },
+                ),
+                (
+                    "bar".into(),
+                    Cluster {
+                        name: "bar".into(),
+                        namespaces: [(
+                            "prover".into(),
+                            Namespace {
+                                deployments: [
+                                    ("circuit-prover-gpu".into(), Deployment::default()),
+                                    ("circuit-prover-gpu-h100".into(), Deployment::default()),
+                                ]
+                                .into(),
+                                pods: [(
+                                    "circuit-prover-gpu-1".into(),
+                                    Pod {
+                                        status: "Pending".into(),
+                                        changed: Utc::now(),
+                                        out_of_resources: true, // Error!
+                                        ..Default::default()
+                                    },
+                                )]
+                                .into(),
+                                ..Default::default()
+                            },
+                        )]
+                        .into(),
+                    },
+                ),
+                (
+                    "baz".into(),
+                    Cluster {
+                        name: "baz".into(),
+                        namespaces: [(
+                            "prover".into(),
+                            Namespace {
+                                deployments: [
+                                    ("circuit-prover-gpu".into(), Deployment::default()),
+                                    ("circuit-prover-gpu-h100".into(), Deployment::default()),
+                                ]
+                                .into(),
+                                ..Default::default()
+                            },
+                        )]
+                        .into(),
+                    },
+                ),
+                (
+                    "qux".into(),
+                    Cluster {
+                        name: "qux".into(),
+                        namespaces: [(
+                            "prover".into(),
+                            Namespace {
+                                deployments: [
+                                    ("circuit-prover-gpu".into(), Deployment::default()),
+                                    ("circuit-prover-gpu-h100".into(), Deployment::default()),
+                                ]
+                                .into(),
+                                ..Default::default()
+                            },
+                        )]
+                        .into(),
+                    },
+                ),
+            ]
+            .into(),
+            ..Default::default()
+        };
+
+        // 2 out of 4 pools have errors = 50%, should trigger aggressive mode
+        let result = scaler.calculate(&"prover".into(), 6000, &clusters);
+
+        // In aggressive mode, should request pods from ALL pools
+        // Should have requested in all 4 pools (2 L4s + 2 H100s)
+        assert!(
+            result.len() >= 2,
+            "Aggressive mode should request from multiple pools"
+        );
+
+        // Should have H100 requests (fallback)
+        let h100_requests: Vec<_> = result
+            .iter()
+            .filter(|(k, _)| k.key == GpuKey(Gpu::H100))
+            .collect();
+        assert!(
+            !h100_requests.is_empty(),
+            "Should have H100 fallback requests in aggressive mode"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_aggressive_mode_cleanup_pending() {
+        // Test that aggressive mode cleans up Pending pods when Running pods are sufficient
+        let scaler_config = Arc::new(ScalerConfig {
+            cluster_priorities: [("foo".into(), 0), ("bar".into(), 10)].into(),
+            apply_min_to_namespace: Some("prover".into()),
+            long_pending_duration: chrono::Duration::seconds(600),
+            scale_errors_duration: chrono::Duration::seconds(3600),
+            aggressive_mode_threshold: 50,
+            aggressive_mode_cooldown: chrono::Duration::seconds(600),
+        });
+
+        let scaler = Scaler::new(
+            QueueReportFields::prover_jobs,
+            "circuit-prover-gpu".into(),
+            0,
+            [
+                ("foo".into(), [(GpuKey(Gpu::L4), 100)].into()),
+                ("bar".into(), [(GpuKey(Gpu::H100), 100)].into()),
+            ]
+            .into(),
+            [(GpuKey(Gpu::L4), 1500), (GpuKey(Gpu::H100), 3000)].into(),
+            0,
+            scaler_config,
+            None,
+        );
+
+        let clusters = Clusters {
+            clusters: [
+                (
+                    "foo".into(),
+                    Cluster {
+                        name: "foo".into(),
+                        namespaces: [(
+                            "prover".into(),
+                            Namespace {
+                                deployments: [("circuit-prover-gpu".into(), Deployment::default())]
+                                    .into(),
+                                pods: [
+                                    (
+                                        "circuit-prover-gpu-1".into(),
+                                        Pod {
+                                            status: "Pending".into(),
+                                            changed: Utc::now(),
+                                            out_of_resources: true,
+                                            ..Default::default()
+                                        },
+                                    ),
+                                    (
+                                        "circuit-prover-gpu-2".into(),
+                                        Pod {
+                                            status: "Pending".into(),
+                                            changed: Utc::now(),
+                                            ..Default::default()
+                                        },
+                                    ),
+                                ]
+                                .into(),
+                                ..Default::default()
+                            },
+                        )]
+                        .into(),
+                    },
+                ),
+                (
+                    "bar".into(),
+                    Cluster {
+                        name: "bar".into(),
+                        namespaces: [(
+                            "prover".into(),
+                            Namespace {
+                                deployments: [(
+                                    "circuit-prover-gpu-h100".into(),
+                                    Deployment {
+                                        running: 2,
+                                        desired: 2,
+                                    },
+                                )]
+                                .into(),
+                                pods: [
+                                    (
+                                        "circuit-prover-gpu-h100-1".into(),
+                                        Pod {
+                                            status: "Running".into(), // Got resources!
+                                            changed: Utc::now(),
+                                            ..Default::default()
+                                        },
+                                    ),
+                                    (
+                                        "circuit-prover-gpu-h100-2".into(),
+                                        Pod {
+                                            status: "Running".into(), // Got resources!
+                                            changed: Utc::now(),
+                                            ..Default::default()
+                                        },
+                                    ),
+                                ]
+                                .into(),
+                                ..Default::default()
+                            },
+                        )]
+                        .into(),
+                    },
+                ),
+            ]
+            .into(),
+            ..Default::default()
+        };
+
+        // Queue needs 6000, H100s provide 2*3000 = 6000 (sufficient!)
+        let result = scaler.calculate(&"prover".into(), 6000, &clusters);
+
+        // Should keep only Running H100s, remove Pending L4s
+        let h100_count = result
+            .get(&PoolKey {
+                cluster: "bar".into(),
+                key: GpuKey(Gpu::H100),
+            })
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(h100_count, 2, "Should keep 2 Running H100s");
+
+        let l4_count = result
+            .get(&PoolKey {
+                cluster: "foo".into(),
+                key: GpuKey(Gpu::L4),
+            })
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(l4_count, 0, "Should remove Pending L4s after success");
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_aggressive_mode_disabled_by_default() {
+        // Test that aggressive mode doesn't trigger when threshold is 0
+        let scaler_config = Arc::new(ScalerConfig {
+            cluster_priorities: [("foo".into(), 0), ("bar".into(), 10)].into(),
+            apply_min_to_namespace: Some("prover".into()),
+            long_pending_duration: chrono::Duration::seconds(600),
+            scale_errors_duration: chrono::Duration::seconds(3600),
+            aggressive_mode_threshold: 0, // Disabled!
+            aggressive_mode_cooldown: chrono::Duration::seconds(600),
+        });
+
+        let scaler = Scaler::new(
+            QueueReportFields::prover_jobs,
+            "circuit-prover-gpu".into(),
+            0,
+            [
+                ("foo".into(), [(GpuKey(Gpu::L4), 100)].into()),
+                ("bar".into(), [(GpuKey(Gpu::L4), 100)].into()),
+            ]
+            .into(),
+            [(GpuKey(Gpu::L4), 1500)].into(),
+            0,
+            scaler_config,
+            None,
+        );
+
+        let clusters = Clusters {
+            clusters: [
+                (
+                    "foo".into(),
+                    Cluster {
+                        name: "foo".into(),
+                        namespaces: [(
+                            "prover".into(),
+                            Namespace {
+                                deployments: [("circuit-prover-gpu".into(), Deployment::default())]
+                                    .into(),
+                                pods: [(
+                                    "circuit-prover-gpu-1".into(),
+                                    Pod {
+                                        status: "Pending".into(),
+                                        changed: Utc::now(),
+                                        out_of_resources: true,
+                                        ..Default::default()
+                                    },
+                                )]
+                                .into(),
+                                ..Default::default()
+                            },
+                        )]
+                        .into(),
+                    },
+                ),
+                (
+                    "bar".into(),
+                    Cluster {
+                        name: "bar".into(),
+                        namespaces: [(
+                            "prover".into(),
+                            Namespace {
+                                deployments: [("circuit-prover-gpu".into(), Deployment::default())]
+                                    .into(),
+                                pods: [(
+                                    "circuit-prover-gpu-1".into(),
+                                    Pod {
+                                        status: "Pending".into(),
+                                        changed: Utc::now(),
+                                        out_of_resources: true,
+                                        ..Default::default()
+                                    },
+                                )]
+                                .into(),
+                                ..Default::default()
+                            },
+                        )]
+                        .into(),
+                    },
+                ),
+            ]
+            .into(),
+            ..Default::default()
+        };
+
+        // Even with 100% errors, should not trigger aggressive mode (threshold=0)
+        let result = scaler.calculate(&"prover".into(), 3000, &clusters);
+
+        // Normal mode behavior: tries one pool at a time
+        // Should not allocate to both pools simultaneously
+        let total_pools = result.len();
+        assert!(
+            total_pools <= 2,
+            "With aggressive mode disabled, should use normal allocation"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_aggressive_mode_with_priority_fallback() {
+        // Test that aggressive mode respects priority order (L4 → H100 → T4)
+        let target_priority = Some(PriorityConfig::Gpu(vec![
+            ("foo".into(), GpuKey(Gpu::L4)),
+            ("bar".into(), GpuKey(Gpu::L4)),
+            ("foo".into(), GpuKey(Gpu::H100)), // Fallback
+            ("bar".into(), GpuKey(Gpu::T4)),   // Last resort
+        ]));
+
+        let scaler_config = Arc::new(ScalerConfig {
+            cluster_priorities: [("foo".into(), 0), ("bar".into(), 10)].into(),
+            apply_min_to_namespace: Some("prover".into()),
+            long_pending_duration: chrono::Duration::seconds(600),
+            scale_errors_duration: chrono::Duration::seconds(3600),
+            aggressive_mode_threshold: 50,
+            aggressive_mode_cooldown: chrono::Duration::seconds(600),
+        });
+
+        let scaler = Scaler::new(
+            QueueReportFields::prover_jobs,
+            "circuit-prover-gpu".into(),
+            0,
+            [
+                (
+                    "foo".into(),
+                    [(GpuKey(Gpu::L4), 10), (GpuKey(Gpu::H100), 10)].into(),
+                ),
+                (
+                    "bar".into(),
+                    [(GpuKey(Gpu::L4), 10), (GpuKey(Gpu::T4), 10)].into(),
+                ),
+            ]
+            .into(),
+            [
+                (GpuKey(Gpu::L4), 1500),
+                (GpuKey(Gpu::H100), 3000),
+                (GpuKey(Gpu::T4), 700),
+            ]
+            .into(),
+            0,
+            scaler_config,
+            target_priority,
+        );
+
+        let clusters = Clusters {
+            clusters: [
+                (
+                    "foo".into(),
+                    Cluster {
+                        name: "foo".into(),
+                        namespaces: [(
+                            "prover".into(),
+                            Namespace {
+                                deployments: [
+                                    ("circuit-prover-gpu".into(), Deployment::default()),
+                                    ("circuit-prover-gpu-h100".into(), Deployment::default()),
+                                ]
+                                .into(),
+                                pods: [(
+                                    "circuit-prover-gpu-1".into(),
+                                    Pod {
+                                        status: "Pending".into(),
+                                        changed: Utc::now(),
+                                        out_of_resources: true,
+                                        ..Default::default()
+                                    },
+                                )]
+                                .into(),
+                                ..Default::default()
+                            },
+                        )]
+                        .into(),
+                    },
+                ),
+                (
+                    "bar".into(),
+                    Cluster {
+                        name: "bar".into(),
+                        namespaces: [(
+                            "prover".into(),
+                            Namespace {
+                                deployments: [
+                                    ("circuit-prover-gpu".into(), Deployment::default()),
+                                    ("circuit-prover-gpu-t4".into(), Deployment::default()),
+                                ]
+                                .into(),
+                                pods: [(
+                                    "circuit-prover-gpu-1".into(),
+                                    Pod {
+                                        status: "Pending".into(),
+                                        changed: Utc::now(),
+                                        out_of_resources: true,
+                                        ..Default::default()
+                                    },
+                                )]
+                                .into(),
+                                ..Default::default()
+                            },
+                        )]
+                        .into(),
+                    },
+                ),
+            ]
+            .into(),
+            ..Default::default()
+        };
+
+        // 2 out of 4 pools have errors (50%), should trigger aggressive mode
+        let result = scaler.calculate(&"prover".into(), 6000, &clusters);
+
+        // Should request from H100 (fallback) since L4s have errors
+        let h100_requested = result
+            .get(&PoolKey {
+                cluster: "foo".into(),
+                key: GpuKey(Gpu::H100),
+            })
+            .copied()
+            .unwrap_or(0);
+        assert!(
+            h100_requested > 0,
+            "Should request H100s as fallback when L4s exhausted"
+        );
+    }
+}

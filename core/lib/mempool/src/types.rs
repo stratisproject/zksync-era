@@ -1,14 +1,15 @@
-use std::{cmp::Ordering, collections::HashMap};
+use std::{cmp::Ordering, collections::BTreeMap};
 
 use zksync_types::{
-    fee::Fee, fee_model::BatchFeeInput, l2::L2Tx, Address, Nonce, Transaction, U256,
+    fee::Fee, fee_model::BatchFeeInput, l2::L2Tx, Address, Nonce, PriorityOpId, ProtocolVersionId,
+    Transaction, TransactionTimeRangeConstraint, U256,
 };
 
 /// Pending mempool transactions of account
 #[derive(Debug)]
 pub(crate) struct AccountTransactions {
     /// transactions that belong to given account keyed by transaction nonce
-    transactions: HashMap<Nonce, L2Tx>,
+    transactions: BTreeMap<Nonce, (L2Tx, TransactionTimeRangeConstraint)>,
     /// account nonce in mempool
     /// equals to committed nonce in db + number of transactions sent to state keeper
     nonce: Nonce,
@@ -17,13 +18,17 @@ pub(crate) struct AccountTransactions {
 impl AccountTransactions {
     pub fn new(nonce: Nonce) -> Self {
         Self {
-            transactions: HashMap::new(),
+            transactions: BTreeMap::new(),
             nonce,
         }
     }
 
     /// Inserts new transaction for given account. Returns insertion metadata
-    pub fn insert(&mut self, transaction: L2Tx) -> InsertionMetadata {
+    pub fn insert(
+        &mut self,
+        transaction: L2Tx,
+        constraint: TransactionTimeRangeConstraint,
+    ) -> InsertionMetadata {
         let mut metadata = InsertionMetadata::default();
         let nonce = transaction.common_data.nonce;
         // skip insertion if transaction is old
@@ -33,8 +38,8 @@ impl AccountTransactions {
         let new_score = Self::score_for_transaction(&transaction);
         let previous_score = self
             .transactions
-            .insert(nonce, transaction)
-            .map(|tx| Self::score_for_transaction(&tx));
+            .insert(nonce, (transaction, constraint))
+            .map(|x| Self::score_for_transaction(&x.0));
         metadata.is_new = previous_score.is_none();
         if nonce == self.nonce {
             metadata.new_score = Some(new_score);
@@ -43,9 +48,33 @@ impl AccountTransactions {
         metadata
     }
 
-    /// Returns next transaction to be included in block and optional score of its successor
-    /// Panics if no such transaction exists
-    pub fn next(&mut self) -> (L2Tx, Option<MempoolScore>) {
+    pub fn advance(&mut self, nonce: Nonce) -> AccountAdvanceMetadata {
+        if nonce <= self.nonce {
+            // Account nonce is already up-to-date.
+            return AccountAdvanceMetadata::default();
+        }
+
+        let new_score = self
+            .transactions
+            .get(&nonce)
+            .map(|x| Self::score_for_transaction(&x.0));
+        let previous_score = self
+            .transactions
+            .get(&self.nonce)
+            .map(|x| Self::score_for_transaction(&x.0));
+
+        self.transactions = self.transactions.split_off(&nonce);
+        self.nonce = nonce;
+
+        AccountAdvanceMetadata {
+            new_score,
+            previous_score,
+        }
+    }
+
+    /// Returns next transaction to be included in block, its time range constraint and optional
+    /// score of its successor. Panics if no such transaction exists
+    pub fn next(&mut self) -> (L2Tx, TransactionTimeRangeConstraint, Option<MempoolScore>) {
         let transaction = self
             .transactions
             .remove(&self.nonce)
@@ -54,12 +83,16 @@ impl AccountTransactions {
         let score = self
             .transactions
             .get(&self.nonce)
-            .map(Self::score_for_transaction);
-        (transaction, score)
+            .map(|(tx, _c)| Self::score_for_transaction(tx));
+        (transaction.0, transaction.1, score)
     }
 
-    /// Handles transaction rejection. Returns optional score of its successor
-    pub fn reset(&mut self, transaction: &Transaction) -> Option<MempoolScore> {
+    /// Handles transaction rejection. Returns optional score of its successor and time range
+    /// constraint that the transaction has been added to the mempool with
+    pub fn reset(
+        &mut self,
+        transaction: &Transaction,
+    ) -> Option<(MempoolScore, TransactionTimeRangeConstraint)> {
         // current nonce for the group needs to be reset
         let tx_nonce = transaction
             .nonce()
@@ -67,11 +100,19 @@ impl AccountTransactions {
         self.nonce = self.nonce.min(tx_nonce);
         self.transactions
             .get(&(tx_nonce + 1))
-            .map(Self::score_for_transaction)
+            .map(|(tx, c)| (Self::score_for_transaction(tx), c.clone()))
     }
 
     pub fn len(&self) -> usize {
         self.transactions.len()
+    }
+
+    pub fn nonce(&self) -> Nonce {
+        self.nonce
+    }
+
+    pub fn clear_txs(&mut self) {
+        self.transactions.clear();
     }
 
     fn score_for_transaction(transaction: &L2Tx) -> MempoolScore {
@@ -136,10 +177,26 @@ pub struct L2TxFilter {
     pub fee_per_gas: u64,
     /// Effective pubdata price in gas for transaction. The number of gas per 1 pubdata byte.
     pub gas_per_pubdata: u32,
+    /// Protocol version from which the high priority L2 transactions are allowed and prioritized.
+    pub protocol_version: ProtocolVersionId,
+}
+
+#[derive(Debug)]
+pub struct AdvanceInput {
+    pub next_priority_id: Option<PriorityOpId>,
+    pub next_account_nonces: Vec<(Address, Nonce)>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AccountAdvanceMetadata {
+    pub new_score: Option<MempoolScore>,
+    pub previous_score: Option<MempoolScore>,
 }
 
 #[cfg(test)]
 mod tests {
+    use zksync_types::L2TxCommonData;
+
     use super::*;
 
     /// Checks the filter logic.
@@ -150,6 +207,7 @@ mod tests {
                 fee_input: BatchFeeInput::sensible_l1_pegged_default(),
                 fee_per_gas,
                 gas_per_pubdata,
+                protocol_version: ProtocolVersionId::latest(),
             }
         }
 
@@ -197,5 +255,58 @@ mod tests {
             !score.matches_filter(&decline_pubdata_filter),
             "Incorrect pubdata price should be rejected"
         );
+    }
+
+    // Helper to create L2Tx with given nonce and timestamp
+    fn l2_tx(nonce: u32, received_at_ms: u64) -> L2Tx {
+        L2Tx {
+            common_data: L2TxCommonData {
+                nonce: Nonce(nonce),
+                fee: Fee {
+                    gas_limit: 100u32.into(),
+                    max_fee_per_gas: 10u32.into(),
+                    max_priority_fee_per_gas: 1u32.into(),
+                    gas_per_pubdata_limit: 1u32.into(),
+                },
+                ..Default::default()
+            },
+            received_timestamp_ms: received_at_ms,
+            execute: Default::default(),
+            raw_bytes: None,
+        }
+    }
+
+    #[test]
+    fn advance_removes_old_transactions_and_returns_metadata() {
+        let mut account = AccountTransactions::new(Nonce(0));
+
+        // Insert txs with nonces 0, 1, 2
+        for i in 0..3 {
+            account.insert(
+                l2_tx(i, 1000 + i as u64),
+                TransactionTimeRangeConstraint::default(),
+            );
+        }
+
+        // Advance to nonce 2
+        let meta = account.advance(Nonce(2));
+        // Only tx with nonce 2 should remain
+        assert_eq!(account.transactions.len(), 1);
+        assert!(account.transactions.contains_key(&Nonce(2)));
+        // Metadata should reflect new_score for nonce 2, previous_score for nonce 0
+        assert_eq!(meta.new_score.as_ref().unwrap().received_at_ms, 1002);
+        assert_eq!(meta.previous_score.as_ref().unwrap().received_at_ms, 1000);
+
+        // Advancing to current nonce does nothing
+        let meta2 = account.advance(Nonce(2));
+        assert_eq!(meta2.new_score, None);
+        assert_eq!(meta2.previous_score, None);
+        assert_eq!(account.transactions.len(), 1);
+
+        // Advance past all transactions
+        let meta3 = account.advance(Nonce(3));
+        assert_eq!(account.transactions.len(), 0);
+        assert_eq!(meta3.new_score, None);
+        assert_eq!(meta3.previous_score.as_ref().unwrap().received_at_ms, 1002);
     }
 }

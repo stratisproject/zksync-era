@@ -5,32 +5,29 @@ use std::{
 
 use anyhow::Context as _;
 use rand::{thread_rng, Rng};
-use tokio::runtime::Handle;
 use zksync_dal::{pruning_dal::PruningInfo, Connection, Core, CoreDal, DalError};
-use zksync_state::PostgresStorageCaches;
+use zksync_multivm::utils::get_eth_call_gas_limit;
 use zksync_types::{
-    api, fee_model::BatchFeeInput, AccountTreeId, Address, L1BatchNumber, L2BlockNumber, L2ChainId,
+    api, fee_model::BatchFeeInput, L1BatchNumber, L2BlockNumber, ProtocolVersionId, U256,
 };
+use zksync_vm_executor::oneshot::{BlockInfo, ResolvedBlockInfo};
 
 use self::vm_metrics::SandboxStage;
-pub(super) use self::{
+pub(crate) use self::{
     error::SandboxExecutionError,
-    execute::{TransactionExecutor, TxExecutionArgs},
-    tracers::ApiTracer,
+    execute::{SandboxAction, SandboxExecutionOutput, SandboxExecutor},
     validate::ValidationError,
     vm_metrics::{SubmitTxStage, SANDBOX_METRICS},
 };
-use super::tx_sender::MultiVMBaseSystemContracts;
 
 // Note: keep the modules private, and instead re-export functions that make public interface.
-mod apply;
 mod error;
 mod execute;
 mod storage;
-pub mod testonly;
+#[cfg(test)]
+pub(crate) mod testonly;
 #[cfg(test)]
 mod tests;
-mod tracers;
 mod validate;
 mod vm_metrics;
 
@@ -40,15 +37,7 @@ mod vm_metrics;
 /// as a proof that the caller obtained a token from `VmConcurrencyLimiter`,
 #[derive(Debug, Clone)]
 pub struct VmPermit {
-    /// A handle to the runtime that is used to query the VM storage.
-    rt_handle: Handle,
     _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
-}
-
-impl VmPermit {
-    fn rt_handle(&self) -> &Handle {
-        &self.rt_handle
-    }
 }
 
 /// Barrier-like synchronization primitive allowing to close a [`VmConcurrencyLimiter`] it's attached to
@@ -103,7 +92,6 @@ impl VmConcurrencyBarrier {
 pub struct VmConcurrencyLimiter {
     /// Semaphore that limits the number of concurrent VM executions.
     limiter: Arc<tokio::sync::Semaphore>,
-    rt_handle: Handle,
 }
 
 impl VmConcurrencyLimiter {
@@ -116,7 +104,6 @@ impl VmConcurrencyLimiter {
 
         let this = Self {
             limiter: Arc::clone(&limiter),
-            rt_handle: Handle::current(),
         };
         let barrier = VmConcurrencyBarrier {
             limiter,
@@ -144,49 +131,8 @@ impl VmConcurrencyLimiter {
         }
 
         Some(VmPermit {
-            rt_handle: self.rt_handle.clone(),
             _permit: Arc::new(permit),
         })
-    }
-}
-
-async fn get_pending_state(
-    connection: &mut Connection<'_, Core>,
-) -> anyhow::Result<(api::BlockId, L2BlockNumber)> {
-    let block_id = api::BlockId::Number(api::BlockNumber::Pending);
-    let resolved_block_number = connection
-        .blocks_web3_dal()
-        .resolve_block_id(block_id)
-        .await
-        .map_err(DalError::generalize)?
-        .context("pending block should always be present in Postgres")?;
-    Ok((block_id, resolved_block_number))
-}
-
-/// Arguments for VM execution not specific to a particular transaction.
-#[derive(Debug, Clone)]
-pub(crate) struct TxSharedArgs {
-    pub operator_account: AccountTreeId,
-    pub fee_input: BatchFeeInput,
-    pub base_system_contracts: MultiVMBaseSystemContracts,
-    pub caches: PostgresStorageCaches,
-    pub validation_computational_gas_limit: u32,
-    pub chain_id: L2ChainId,
-    pub whitelisted_tokens_for_aa: Vec<Address>,
-}
-
-impl TxSharedArgs {
-    #[cfg(test)]
-    pub fn mock(base_system_contracts: MultiVMBaseSystemContracts) -> Self {
-        Self {
-            operator_account: AccountTreeId::default(),
-            fee_input: BatchFeeInput::l1_pegged(55, 555),
-            base_system_contracts,
-            caches: PostgresStorageCaches::new(1, 1),
-            validation_computational_gas_limit: u32::MAX,
-            chain_id: L2ChainId::default(),
-            whitelisted_tokens_for_aa: Vec::new(),
-        }
     }
 }
 
@@ -215,7 +161,7 @@ impl BlockStartInfoInner {
 
 /// Information about first L1 batch / L2 block in the node storage.
 #[derive(Debug, Clone)]
-pub(crate) struct BlockStartInfo {
+pub struct BlockStartInfo {
     cached_pruning_info: Arc<RwLock<BlockStartInfoInner>>,
     max_cache_age: Duration,
 }
@@ -284,9 +230,8 @@ impl BlockStartInfo {
         storage: &mut Connection<'_, Core>,
     ) -> anyhow::Result<L2BlockNumber> {
         let cached_pruning_info = self.get_pruning_info(storage).await?;
-        let last_block = cached_pruning_info.last_soft_pruned_l2_block;
-        if let Some(L2BlockNumber(last_block)) = last_block {
-            return Ok(L2BlockNumber(last_block + 1));
+        if let Some(pruned) = cached_pruning_info.last_soft_pruned {
+            return Ok(pruned.l2_block + 1);
         }
         Ok(L2BlockNumber(0))
     }
@@ -296,9 +241,8 @@ impl BlockStartInfo {
         storage: &mut Connection<'_, Core>,
     ) -> anyhow::Result<L1BatchNumber> {
         let cached_pruning_info = self.get_pruning_info(storage).await?;
-        let last_batch = cached_pruning_info.last_soft_pruned_l1_batch;
-        if let Some(L1BatchNumber(last_block)) = last_batch {
-            return Ok(L1BatchNumber(last_block + 1));
+        if let Some(pruned) = cached_pruning_info.last_soft_pruned {
+            return Ok(pruned.l1_batch + 1);
         }
         Ok(L1BatchNumber(0))
     }
@@ -331,8 +275,8 @@ impl BlockStartInfo {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum BlockArgsError {
-    #[error("Block is pruned; first retained block is {0}")]
+pub enum BlockArgsError {
+    #[error("Block is not available, either it was pruned or the node was started from a snapshot created later than this block; first retained block is {0}")]
     Pruned(L2BlockNumber),
     #[error("Block is missing, but can appear in the future")]
     Missing,
@@ -341,21 +285,30 @@ pub(crate) enum BlockArgsError {
 }
 
 /// Information about a block provided to VM.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct BlockArgs {
+#[derive(Debug, Clone)]
+pub struct BlockArgs {
+    inner: BlockInfo,
+    resolved: ResolvedBlockInfo,
     block_id: api::BlockId,
-    resolved_block_number: L2BlockNumber,
-    l1_batch_timestamp_s: Option<u64>,
 }
 
 impl BlockArgs {
-    pub(crate) async fn pending(connection: &mut Connection<'_, Core>) -> anyhow::Result<Self> {
-        let (block_id, resolved_block_number) = get_pending_state(connection).await?;
+    pub async fn pending(connection: &mut Connection<'_, Core>) -> anyhow::Result<Self> {
+        let inner = BlockInfo::pending(connection).await?;
+        let resolved = inner.resolve(connection).await?;
         Ok(Self {
-            block_id,
-            resolved_block_number,
-            l1_batch_timestamp_s: None,
+            inner,
+            resolved,
+            block_id: api::BlockId::Number(api::BlockNumber::Pending),
         })
+    }
+
+    pub fn protocol_version(&self) -> ProtocolVersionId {
+        self.resolved.protocol_version()
+    }
+
+    pub fn use_evm_emulator(&self) -> bool {
+        self.resolved.use_evm_emulator()
     }
 
     /// Loads block information from DB.
@@ -372,7 +325,7 @@ impl BlockArgs {
             .await?;
 
         if block_id == api::BlockId::Number(api::BlockNumber::Pending) {
-            return Ok(BlockArgs::pending(connection).await?);
+            return Ok(Self::pending(connection).await?);
         }
 
         let resolved_block_number = connection
@@ -380,32 +333,27 @@ impl BlockArgs {
             .resolve_block_id(block_id)
             .await
             .map_err(DalError::generalize)?;
-        let Some(resolved_block_number) = resolved_block_number else {
+        let Some(block_number) = resolved_block_number else {
             return Err(BlockArgsError::Missing);
         };
 
-        let l1_batch = connection
-            .storage_web3_dal()
-            .resolve_l1_batch_number_of_l2_block(resolved_block_number)
-            .await
-            .with_context(|| {
-                format!("failed resolving L1 batch number of L2 block #{resolved_block_number}")
-            })?;
-        let l1_batch_timestamp = connection
-            .blocks_web3_dal()
-            .get_expected_l1_batch_timestamp(&l1_batch)
-            .await
-            .map_err(DalError::generalize)?
-            .context("missing timestamp for non-pending block")?;
+        let inner = BlockInfo::for_existing_block(connection, block_number).await?;
         Ok(Self {
+            inner,
+            resolved: inner.resolve(connection).await?,
             block_id,
-            resolved_block_number,
-            l1_batch_timestamp_s: Some(l1_batch_timestamp),
         })
     }
 
     pub fn resolved_block_number(&self) -> L2BlockNumber {
-        self.resolved_block_number
+        self.inner.block_number()
+    }
+
+    fn is_pending(&self) -> bool {
+        matches!(
+            self.block_id,
+            api::BlockId::Number(api::BlockNumber::Pending)
+        )
     }
 
     pub fn resolves_to_latest_sealed_l2_block(&self) -> bool {
@@ -415,5 +363,101 @@ impl BlockArgs {
                 api::BlockNumber::Pending | api::BlockNumber::Latest | api::BlockNumber::Committed
             )
         )
+    }
+
+    pub async fn historical_fee_input(
+        &self,
+        connection: &mut Connection<'_, Core>,
+    ) -> anyhow::Result<BatchFeeInput> {
+        self.inner.historical_fee_input(connection).await
+    }
+
+    /// Calculates the effective gas limit applying the gas cap if specified.
+    /// Returns the minimum of protocol default and gas cap (if cap is set and > 0).
+    pub fn calculate_effective_gas_limit(
+        protocol_version: ProtocolVersionId,
+        gas_cap: Option<u64>,
+    ) -> u64 {
+        let default_gas_limit = get_eth_call_gas_limit(protocol_version.into());
+
+        // Apply gas cap if specified (0 means no cap)
+        if let Some(cap) = gas_cap.filter(|&cap| cap > 0) {
+            std::cmp::min(default_gas_limit, cap)
+        } else {
+            default_gas_limit
+        }
+    }
+
+    pub async fn default_eth_call_gas(
+        &self,
+        connection: &mut Connection<'_, Core>,
+        gas_cap: Option<u64>,
+    ) -> anyhow::Result<U256> {
+        let protocol_version = if self.is_pending() {
+            connection.blocks_dal().pending_protocol_version().await?
+        } else {
+            let block_number = self.inner.block_number();
+            connection
+                .blocks_dal()
+                .get_l2_block_header(block_number)
+                .await?
+                .with_context(|| format!("missing header for resolved block #{block_number}"))?
+                .protocol_version
+                .unwrap_or_else(ProtocolVersionId::last_potentially_undefined)
+        };
+
+        let effective_gas_limit = Self::calculate_effective_gas_limit(protocol_version, gas_cap);
+        Ok(effective_gas_limit.into())
+    }
+}
+
+#[cfg(test)]
+mod gas_cap_tests {
+    use zksync_types::ProtocolVersionId;
+
+    use super::BlockArgs;
+
+    #[test]
+    fn test_gas_cap_logic() {
+        // Get a sample protocol version
+        let protocol_version = ProtocolVersionId::latest();
+
+        // Test 1: No gas cap (should use protocol default)
+        let result_no_cap = BlockArgs::calculate_effective_gas_limit(protocol_version, None);
+        let expected_default =
+            zksync_multivm::utils::get_eth_call_gas_limit(protocol_version.into());
+        assert_eq!(
+            result_no_cap, expected_default,
+            "No gas cap should use protocol default"
+        );
+
+        // Test 2: Gas cap of 0 (should use protocol default)
+        let result_zero_cap = BlockArgs::calculate_effective_gas_limit(protocol_version, Some(0));
+        assert_eq!(
+            result_zero_cap, expected_default,
+            "Zero gas cap should use protocol default"
+        );
+
+        // Test 3: Gas cap larger than protocol default (should use protocol default)
+        let large_gas_cap = expected_default + 1_000_000;
+        let result_large_cap =
+            BlockArgs::calculate_effective_gas_limit(protocol_version, Some(large_gas_cap));
+        assert_eq!(
+            result_large_cap, expected_default,
+            "Large gas cap should not exceed protocol default"
+        );
+
+        // Test 4: Gas cap smaller than protocol default (should use gas cap)
+        let small_gas_cap = 100_000u64;
+        let result_small_cap =
+            BlockArgs::calculate_effective_gas_limit(protocol_version, Some(small_gas_cap));
+        assert_eq!(
+            result_small_cap, small_gas_cap,
+            "Small gas cap should limit the gas"
+        );
+        assert!(
+            result_small_cap < expected_default,
+            "Capped gas should be less than uncapped"
+        );
     }
 }

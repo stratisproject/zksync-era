@@ -1,6 +1,6 @@
 use rlp::RlpStream;
 use zksync_types::{
-    eth_sender::EthTxBlobSidecar,
+    eth_sender::{EthTxBlobSidecar, SidecarBlobV1, SidecarBlobV2},
     ethabi, web3,
     web3::{
         contract::{Detokenize, Tokenize},
@@ -124,6 +124,52 @@ impl ContractCall<'_> {
             }
         })
     }
+
+    pub async fn call_with_function<Res: Detokenize>(
+        &self,
+        client: &dyn EthInterface,
+        function: ethabi::Function,
+    ) -> Result<Res, ContractCallError> {
+        let encoded_input = function
+            .encode_input(&self.inner.params)
+            .map_err(|source| ContractCallError::EncodeInput {
+                signature: function.signature(),
+                input: self.inner.params.clone(),
+                source,
+            })?;
+
+        let request = web3::CallRequest {
+            from: self.inner.from,
+            to: Some(self.contract_address),
+            data: Some(Bytes(encoded_input)),
+            // Other options are never set
+            gas: None,
+            gas_price: None,
+            value: None,
+            transaction_type: None,
+            access_list: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+        };
+
+        let encoded_output = client
+            .call_contract_function(request, self.inner.block)
+            .await?;
+        let output_tokens = function
+            .decode_output(&encoded_output.0)
+            .map_err(|source| ContractCallError::DecodeOutput {
+                signature: function.signature(),
+                output: encoded_output,
+                source,
+            })?;
+        Res::from_tokens(output_tokens.clone()).map_err(|source| {
+            ContractCallError::DetokenizeOutput {
+                signature: function.signature(),
+                output: output_tokens,
+                source,
+            }
+        })
+    }
 }
 
 /// Contract-related subset of Ethereum client errors.
@@ -179,6 +225,9 @@ pub enum SigningError {
     /// EIP4844 transaction lacks `blob_versioned_hashes` field
     #[error("EIP4844 transaction lacks blob_versioned_hashes field")]
     Eip4844MissingBlobVersionedHashes,
+    /// Wrong chain id for EIP712 transaction. Probably it's higher then L2ChainId::max
+    #[error("EIP712 transaction has wrong chain id")]
+    WrongL2Chain,
 }
 
 /// Raw transaction bytes.
@@ -235,52 +284,80 @@ impl SignedCallResult {
 // Encodes the blob transaction and the blob sidecar into the networking
 // format as defined in <https://eips.ethereum.org/EIPS/eip-4844#networking>
 pub fn encode_blob_tx_with_sidecar(raw_tx: &[u8], sidecar: &EthTxBlobSidecar) -> Vec<u8> {
-    let EthTxBlobSidecar::EthTxBlobSidecarV1(sidecar) = sidecar;
-    let blobs_count = sidecar.blobs.len();
-
     let mut stream_outer = RlpStream::new();
 
-    // top-level RLP encoded struct is defined as
-    //
-    // ```
-    // rlp([tx_payload_body, blobs, commitments, proofs])
-    // ```
-    // and is a list of 4 elements.
-    stream_outer.begin_list(4);
-    // The EIP doc states the following:
-    //
-    // ```
-    // the EIP-2718 TransactionPayload of the blob transaction
-    // is wrapped to become:
-    //
-    // rlp([tx_payload_body, blobs, commitments, proofs])
-    // ```
-    //
-    // If you look into the specs what this means for us here is the following:
-    //
-    // 1. The `0x03` byte signaling the type of the blob transaction has
-    //    to be removed from the head of received payload body
-    // 2. The above four-element RLP list has to be constructed.
-    // 3. The `0x03` byte has to be concatenated with the RLP-encoded list from
-    //    the previous step
-    // 4. The result of this concatenation has to be again RLP-encoded into
-    //    what constitutes the final form of a blob transaction with the sidecar
-    //    as it is sent to the network.
-    stream_outer.append_raw(&raw_tx[1..], 1);
+    match sidecar {
+        EthTxBlobSidecar::EthTxBlobSidecarV1(sidecar) => {
+            let blobs_count = sidecar.blobs.len();
+            // top-level RLP encoded struct is defined as
+            //
+            // ```
+            // rlp([tx_payload_body, blobs, commitments, proofs])
+            // ```
+            // and is a list of 4 elements.
+            stream_outer.begin_list(4);
+            // The EIP doc states the following:
+            //
+            // ```
+            // the EIP-2718 TransactionPayload of the blob transaction
+            // is wrapped to become:
+            //
+            // rlp([tx_payload_body, blobs, commitments, proofs])
+            // ```
+            //
+            // If you look into the specs what this means for us here is the following:
+            //
+            // 1. The `0x03` byte signaling the type of the blob transaction has
+            //    to be removed from the head of received payload body
+            // 2. The above four-element RLP list has to be constructed.
+            // 3. The `0x03` byte has to be concatenated with the RLP-encoded list from
+            //    the previous step
+            // 4. The result of this concatenation has to be again RLP-encoded into
+            //    what constitutes the final form of a blob transaction with the sidecar
+            //    as it is sent to the network.
+            stream_outer.append_raw(&raw_tx[1..], 1);
 
-    let mut blob_stream = RlpStream::new_list(blobs_count);
-    let mut commitment_stream = RlpStream::new_list(blobs_count);
-    let mut proof_stream = RlpStream::new_list(blobs_count);
+            let mut blob_stream = RlpStream::new_list(blobs_count);
+            let mut commitment_stream = RlpStream::new_list(blobs_count);
+            let mut proof_stream = RlpStream::new_list(blobs_count);
 
-    for i in 0..blobs_count {
-        blob_stream.append(&sidecar.blobs[i].blob);
-        commitment_stream.append(&sidecar.blobs[i].commitment);
-        proof_stream.append(&sidecar.blobs[i].proof);
+            for i in 0..blobs_count {
+                blob_stream.append(&sidecar.blobs[i].blob);
+                commitment_stream.append(&sidecar.blobs[i].commitment);
+                proof_stream.append(&sidecar.blobs[i].proof);
+            }
+
+            stream_outer.append_raw(&blob_stream.out(), 1);
+            stream_outer.append_raw(&commitment_stream.out(), 1);
+            stream_outer.append_raw(&proof_stream.out(), 1);
+        }
+        EthTxBlobSidecar::EthTxBlobSidecarV2(sidecar) => {
+            // rlp([tx_payload_body, wrapper_version, blobs, commitments, cell_proofs])
+            let blobs_count = sidecar.blobs.len();
+
+            stream_outer.begin_list(5);
+
+            stream_outer.append_raw(&raw_tx[1..], 1);
+            let wrapper_version = 1u8;
+            stream_outer.append_raw(&[wrapper_version], 1);
+
+            let mut blob_stream = RlpStream::new_list(blobs_count);
+            let mut commitment_stream = RlpStream::new_list(blobs_count);
+            let mut cell_proof_stream = RlpStream::new_list(128 * blobs_count);
+
+            for i in 0..blobs_count {
+                blob_stream.append(&sidecar.blobs[i].blob);
+                commitment_stream.append(&sidecar.blobs[i].commitment);
+                for cell_proof in &sidecar.blobs[i].cell_proofs {
+                    cell_proof_stream.append(cell_proof);
+                }
+            }
+
+            stream_outer.append_raw(&blob_stream.out(), 1);
+            stream_outer.append_raw(&commitment_stream.out(), 1);
+            stream_outer.append_raw(&cell_proof_stream.out(), 1);
+        }
     }
-
-    stream_outer.append_raw(&blob_stream.out(), 1);
-    stream_outer.append_raw(&commitment_stream.out(), 1);
-    stream_outer.append_raw(&proof_stream.out(), 1);
 
     let tx = [&[EIP_4844_TX_TYPE], stream_outer.as_raw()].concat();
 
@@ -318,9 +395,34 @@ pub struct FailureInfo {
     pub gas_limit: U256,
 }
 
+/// Convert eip4844 proofs to cell proofs as required by eip7594
+pub fn convert_eip4844_sidecar_to_eip7594_sidecar(sidecar: SidecarBlobV1) -> SidecarBlobV2 {
+    let mut cell_proofs = Vec::new();
+
+    let blob_kzg = c_kzg::Blob::from_bytes(&sidecar.blob).unwrap();
+
+    // KZG settings are cached, it's cheap to get them multiple times.
+    let kzg_settings = c_kzg::ethereum_kzg_settings_arc(0);
+    // Compute cells and their KZG proofs for this blob
+    let (_cells, kzg_proofs) = kzg_settings
+        .compute_cells_and_kzg_proofs(&blob_kzg)
+        .unwrap();
+
+    for kzg_proof in kzg_proofs.iter() {
+        cell_proofs.push(kzg_proof.to_bytes().into_inner().to_vec());
+    }
+
+    SidecarBlobV2 {
+        blob: sidecar.blob,
+        commitment: sidecar.commitment,
+        versioned_hash: sidecar.versioned_hash,
+        cell_proofs,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use zksync_eth_signer::{EthereumSigner, PrivateKeySigner, TransactionParameters};
+    use zksync_eth_signer::{PrivateKeySigner, TransactionParameters};
     use zksync_types::{
         eth_sender::{EthTxBlobSidecarV1, SidecarBlobV1},
         web3, K256PrivateKey, EIP_4844_TX_TYPE, H256, U256, U64,
@@ -384,10 +486,7 @@ mod tests {
                     .as_ref(),
             )]),
         };
-        let raw_tx = signer
-            .sign_transaction(raw_transaction.clone())
-            .await
-            .unwrap();
+        let raw_tx = signer.sign_transaction(raw_transaction.clone());
 
         let hash = web3::keccak256(&raw_tx).into();
         // Transaction generated with https://github.com/inphi/blob-utils with
@@ -493,10 +592,7 @@ mod tests {
             blob_versioned_hashes: Some(vec![versioned_hash_1, versioned_hash_2]),
         };
 
-        let raw_tx = signer
-            .sign_transaction(raw_transaction.clone())
-            .await
-            .unwrap();
+        let raw_tx = signer.sign_transaction(raw_transaction);
 
         let hash = web3::keccak256(&raw_tx).into();
         // Transaction generated with https://github.com/inphi/blob-utils with

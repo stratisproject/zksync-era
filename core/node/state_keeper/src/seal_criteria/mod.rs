@@ -12,25 +12,22 @@
 
 use std::fmt;
 
-use zksync_config::configs::chain::StateKeeperConfig;
+use zksync_config::configs::chain::SealCriteriaConfig;
 use zksync_multivm::{
     interface::{DeduplicatedWritesMetrics, Halt, TransactionExecutionMetrics, VmExecutionMetrics},
     vm_latest::TransactionVmExt,
 };
-use zksync_types::{
-    block::BlockGasCount, utils::display_timestamp, ProtocolVersionId, Transaction,
+use zksync_types::{ProtocolVersionId, Transaction};
+
+pub use self::{
+    conditional_sealer::{ConditionalSealer, NoopSealer, PanicSealer, SequencerSealer},
+    io_criteria::IoSealCriteria,
 };
-use zksync_utils::time::millis_since;
+use crate::metrics::AGGREGATION_METRICS;
 
 mod conditional_sealer;
 pub(super) mod criteria;
-
-pub use self::conditional_sealer::{ConditionalSealer, NoopSealer, SequencerSealer};
-use super::{
-    metrics::AGGREGATION_METRICS,
-    updates::UpdatesManager,
-    utils::{gas_count_from_tx_and_metrics, gas_count_from_writes},
-};
+pub(super) mod io_criteria;
 
 fn halt_as_metric_label(halt: &Halt) -> &'static str {
     match halt {
@@ -54,6 +51,7 @@ fn halt_as_metric_label(halt: &Halt) -> &'static str {
         Halt::VMPanic => "VMPanic",
         Halt::TracerCustom(_) => "TracerCustom",
         Halt::FailedToPublishCompressedBytecodes => "FailedToPublishCompressedBytecodes",
+        Halt::FailedBlockTimestampAssertion => "FailedBlockTimestampAssertion",
     }
 }
 
@@ -68,6 +66,8 @@ pub enum UnexecutableReason {
     OutOfGasForBatchTip,
     BootloaderOutOfGas,
     NotEnoughGasProvided,
+    TooMuchUserL2L1Logs,
+    DeploymentNotAllowed,
 }
 
 impl UnexecutableReason {
@@ -82,6 +82,8 @@ impl UnexecutableReason {
             UnexecutableReason::OutOfGasForBatchTip => "OutOfGasForBatchTip",
             UnexecutableReason::BootloaderOutOfGas => "BootloaderOutOfGas",
             UnexecutableReason::NotEnoughGasProvided => "NotEnoughGasProvided",
+            UnexecutableReason::TooMuchUserL2L1Logs => "TooMuchUserL2L1Logs",
+            UnexecutableReason::DeploymentNotAllowed => "DeploymentNotAllowed",
         }
     }
 }
@@ -106,6 +108,8 @@ impl fmt::Display for UnexecutableReason {
             UnexecutableReason::OutOfGasForBatchTip => write!(f, "Out of gas for batch tip"),
             UnexecutableReason::BootloaderOutOfGas => write!(f, "Bootloader out of gas"),
             UnexecutableReason::NotEnoughGasProvided => write!(f, "Not enough gas provided"),
+            UnexecutableReason::TooMuchUserL2L1Logs => write!(f, "Too much user l2 l1 logs"),
+            UnexecutableReason::DeploymentNotAllowed => write!(f, "Deployment not allowed"),
         }
     }
 }
@@ -159,7 +163,6 @@ impl SealResolution {
 #[derive(Debug, Default)]
 pub struct SealData {
     pub(super) execution_metrics: VmExecutionMetrics,
-    pub(super) gas_count: BlockGasCount,
     pub(super) cumulative_size: usize,
     pub(super) writes_metrics: DeduplicatedWritesMetrics,
     pub(super) gas_remaining: u32,
@@ -168,184 +171,47 @@ pub struct SealData {
 impl SealData {
     /// Creates sealing data based on the execution of a `transaction`. Assumes that all writes
     /// performed by the transaction are initial.
-    pub fn for_transaction(
+    pub(crate) fn for_transaction(
         transaction: &Transaction,
         tx_metrics: &TransactionExecutionMetrics,
-        protocol_version: ProtocolVersionId,
     ) -> Self {
-        let execution_metrics = VmExecutionMetrics::from_tx_metrics(tx_metrics);
-        let writes_metrics = DeduplicatedWritesMetrics::from_tx_metrics(tx_metrics);
-        let gas_count = gas_count_from_tx_and_metrics(transaction, &execution_metrics)
-            + gas_count_from_writes(&writes_metrics, protocol_version);
         Self {
-            execution_metrics,
-            gas_count,
+            execution_metrics: tx_metrics.vm,
             cumulative_size: transaction.bootloader_encoding_size(),
-            writes_metrics,
+            writes_metrics: tx_metrics.writes,
             gas_remaining: tx_metrics.gas_remaining,
         }
     }
 }
 
 pub(super) trait SealCriterion: fmt::Debug + Send + Sync + 'static {
+    #[allow(clippy::too_many_arguments)]
     fn should_seal(
         &self,
-        config: &StateKeeperConfig,
-        block_open_timestamp_ms: u128,
+        config: &SealCriteriaConfig,
         tx_count: usize,
+        l1_tx_count: usize,
+        interop_roots_count: usize,
         block_data: &SealData,
         tx_data: &SealData,
         protocol_version: ProtocolVersionId,
     ) -> SealResolution;
 
+    /// Returns fraction of the criterion's capacity filled in the batch.
+    /// If it can't be calculated for the criterion, then it should return `None`.
+    fn capacity_filled(
+        &self,
+        _config: &SealCriteriaConfig,
+        _tx_count: usize,
+        _l1_tx_count: usize,
+        _interop_roots_count: usize,
+        _block_data: &SealData,
+        _protocol_version: ProtocolVersionId,
+    ) -> Option<f64> {
+        None
+    }
+
     // We need self here only for rust restrictions for creating an object from trait
     // https://doc.rust-lang.org/reference/items/traits.html#object-safety
     fn prom_criterion_name(&self) -> &'static str;
-}
-
-/// I/O-dependent seal criteria.
-pub trait IoSealCriteria {
-    /// Checks whether an L1 batch should be sealed unconditionally (i.e., regardless of metrics
-    /// related to transaction execution) given the provided `manager` state.
-    fn should_seal_l1_batch_unconditionally(&mut self, manager: &UpdatesManager) -> bool;
-    /// Checks whether an L2 block should be sealed given the provided `manager` state.
-    fn should_seal_l2_block(&mut self, manager: &UpdatesManager) -> bool;
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct TimeoutSealer {
-    block_commit_deadline_ms: u64,
-    l2_block_commit_deadline_ms: u64,
-}
-
-impl TimeoutSealer {
-    pub fn new(config: &StateKeeperConfig) -> Self {
-        Self {
-            block_commit_deadline_ms: config.block_commit_deadline_ms,
-            l2_block_commit_deadline_ms: config.l2_block_commit_deadline_ms,
-        }
-    }
-}
-
-impl IoSealCriteria for TimeoutSealer {
-    fn should_seal_l1_batch_unconditionally(&mut self, manager: &UpdatesManager) -> bool {
-        const RULE_NAME: &str = "no_txs_timeout";
-
-        if manager.pending_executed_transactions_len() == 0 {
-            // Regardless of which sealers are provided, we never want to seal an empty batch.
-            return false;
-        }
-
-        let block_commit_deadline_ms = self.block_commit_deadline_ms;
-        // Verify timestamp
-        let should_seal_timeout =
-            millis_since(manager.batch_timestamp()) > block_commit_deadline_ms;
-
-        if should_seal_timeout {
-            AGGREGATION_METRICS.l1_batch_reason_inc_criterion(RULE_NAME);
-            tracing::debug!(
-                "Decided to seal L1 batch using rule `{RULE_NAME}`; batch timestamp: {}, \
-                 commit deadline: {block_commit_deadline_ms}ms",
-                display_timestamp(manager.batch_timestamp())
-            );
-        }
-        should_seal_timeout
-    }
-
-    fn should_seal_l2_block(&mut self, manager: &UpdatesManager) -> bool {
-        !manager.l2_block.executed_transactions.is_empty()
-            && millis_since(manager.l2_block.timestamp) > self.l2_block_commit_deadline_ms
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct L2BlockMaxPayloadSizeSealer {
-    max_payload_size: usize,
-}
-
-impl L2BlockMaxPayloadSizeSealer {
-    pub fn new(config: &StateKeeperConfig) -> Self {
-        Self {
-            max_payload_size: config.l2_block_max_payload_size,
-        }
-    }
-
-    pub fn should_seal_l2_block(&mut self, manager: &UpdatesManager) -> bool {
-        manager.l2_block.payload_encoding_size >= self.max_payload_size
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use zksync_utils::time::seconds_since_epoch;
-
-    use super::*;
-    use crate::tests::{create_execution_result, create_transaction, create_updates_manager};
-
-    fn apply_tx_to_manager(tx: Transaction, manager: &mut UpdatesManager) {
-        manager.extend_from_executed_transaction(
-            tx,
-            create_execution_result([]),
-            vec![],
-            BlockGasCount::default(),
-            VmExecutionMetrics::default(),
-            vec![],
-        );
-    }
-
-    /// This test mostly exists to make sure that we can't seal empty L2 blocks on the main node.
-    #[test]
-    fn timeout_l2_block_sealer() {
-        let mut timeout_l2_block_sealer = TimeoutSealer {
-            block_commit_deadline_ms: 10_000,
-            l2_block_commit_deadline_ms: 10_000,
-        };
-
-        let mut manager = create_updates_manager();
-        // Empty L2 block should not trigger.
-        manager.l2_block.timestamp = seconds_since_epoch() - 10;
-        assert!(
-            !timeout_l2_block_sealer.should_seal_l2_block(&manager),
-            "Empty L2 block shouldn't be sealed"
-        );
-
-        // Non-empty L2 block should trigger.
-        apply_tx_to_manager(create_transaction(10, 100), &mut manager);
-        assert!(
-            timeout_l2_block_sealer.should_seal_l2_block(&manager),
-            "Non-empty L2 block with old timestamp should be sealed"
-        );
-
-        // Check the timestamp logic. This relies on the fact that the test shouldn't run
-        // for more than 10 seconds (while the test itself is trivial, it may be preempted
-        // by other tests).
-        manager.l2_block.timestamp = seconds_since_epoch();
-        assert!(
-            !timeout_l2_block_sealer.should_seal_l2_block(&manager),
-            "Non-empty L2 block with too recent timestamp shouldn't be sealed"
-        );
-    }
-
-    #[test]
-    fn max_size_l2_block_sealer() {
-        let tx = create_transaction(10, 100);
-        let tx_encoding_size =
-            zksync_protobuf::repr::encode::<zksync_dal::consensus::proto::Transaction>(&tx).len();
-
-        let mut max_payload_sealer = L2BlockMaxPayloadSizeSealer {
-            max_payload_size: tx_encoding_size,
-        };
-
-        let mut manager = create_updates_manager();
-        assert!(
-            !max_payload_sealer.should_seal_l2_block(&manager),
-            "Empty L2 block shouldn't be sealed"
-        );
-
-        apply_tx_to_manager(tx, &mut manager);
-        assert!(
-            max_payload_sealer.should_seal_l2_block(&manager),
-            "L2 block with payload encoding size equal or greater than max payload size should be sealed"
-        );
-    }
 }

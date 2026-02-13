@@ -1,14 +1,18 @@
-use circuit_sequencer_api_1_3_3::sort_storage_access::sort_storage_access_queries;
+use std::{collections::VecDeque, rc::Rc};
+
+use circuit_sequencer_api::sort_storage_access::sort_storage_access_queries;
 use zksync_types::{l2_to_l1_log::UserL2ToL1Log, Transaction};
+use zksync_vm_interface::{pubdata::PubdataBuilder, InspectExecutionMode};
 
 use crate::{
     glue::GlueInto,
     interface::{
         storage::{StoragePtr, WriteStorage},
-        BootloaderMemory, BytecodeCompressionError, CompressedBytecodeInfo, CurrentExecutionState,
-        L1BatchEnv, L2BlockEnv, SystemEnv, VmExecutionMode, VmExecutionResultAndLogs, VmFactory,
-        VmInterface, VmInterfaceHistoryEnabled, VmMemoryMetrics,
+        BytecodeCompressionError, BytecodeCompressionResult, CurrentExecutionState,
+        FinishedL1Batch, L1BatchEnv, L2BlockEnv, PushTransactionResult, SystemEnv, VmExecutionMode,
+        VmExecutionResultAndLogs, VmFactory, VmInterface, VmInterfaceHistoryEnabled,
     },
+    utils::glue_log_query,
     vm_latest::HistoryEnabled,
     vm_refunds_enhancement::{
         bootloader_state::BootloaderState,
@@ -30,44 +34,15 @@ pub struct Vm<S: WriteStorage, H: HistoryMode> {
     pub(crate) system_env: SystemEnv,
     pub(crate) batch_env: L1BatchEnv,
     // Snapshots for the current run
-    pub(crate) snapshots: Vec<VmSnapshot>,
+    pub(crate) snapshots: VecDeque<VmSnapshot>,
     _phantom: std::marker::PhantomData<H>,
 }
 
-impl<S: WriteStorage, H: HistoryMode> VmInterface for Vm<S, H> {
-    type TracerDispatcher = TracerDispatcher<S, H::VmVirtualBlocksRefundsEnhancement>;
-
-    /// Push tx into memory for the future execution
-    fn push_transaction(&mut self, tx: Transaction) {
-        self.push_transaction_with_compression(tx, true)
+impl<S: WriteStorage, H: HistoryMode> Vm<S, H> {
+    pub(super) fn gas_remaining(&self) -> u32 {
+        self.state.local_state.callstack.current.ergs_remaining
     }
 
-    /// Execute VM with custom tracers.
-    fn inspect(
-        &mut self,
-        dispatcher: Self::TracerDispatcher,
-        execution_mode: VmExecutionMode,
-    ) -> VmExecutionResultAndLogs {
-        self.inspect_inner(dispatcher, execution_mode)
-    }
-
-    /// Get current state of bootloader memory.
-    fn get_bootloader_memory(&self) -> BootloaderMemory {
-        self.bootloader_state.bootloader_memory()
-    }
-
-    /// Get compressed bytecodes of the last executed transaction
-    fn get_last_tx_compressed_bytecodes(&self) -> Vec<CompressedBytecodeInfo> {
-        self.bootloader_state.get_last_tx_compressed_bytecodes()
-    }
-
-    fn start_new_l2_block(&mut self, l2_block_env: L2BlockEnv) {
-        self.bootloader_state.start_new_l2_block(l2_block_env);
-    }
-
-    /// Get current state of virtual machine.
-    /// This method should be used only after the batch execution.
-    /// Otherwise it can panic.
     fn get_current_execution_state(&self) -> CurrentExecutionState {
         let (raw_events, l1_messages) = self.state.event_sink.flatten();
         let events: Vec<_> = merge_events(raw_events)
@@ -82,8 +57,12 @@ impl<S: WriteStorage, H: HistoryMode> VmInterface for Vm<S, H> {
 
         let storage_log_queries = self.state.storage.get_final_log_queries();
 
-        let deduped_storage_log_queries =
-            sort_storage_access_queries(storage_log_queries.iter().map(|log| &log.log_query)).1;
+        let deduped_storage_log_queries = sort_storage_access_queries(
+            storage_log_queries
+                .iter()
+                .map(|log| glue_log_query(log.log_query)),
+        )
+        .1;
 
         CurrentExecutionState {
             events,
@@ -98,35 +77,70 @@ impl<S: WriteStorage, H: HistoryMode> VmInterface for Vm<S, H> {
             pubdata_costs: Vec::new(),
         }
     }
+}
+
+impl<S: WriteStorage, H: HistoryMode> VmInterface for Vm<S, H> {
+    type TracerDispatcher = TracerDispatcher<S, H::VmVirtualBlocksRefundsEnhancement>;
+
+    fn push_transaction(&mut self, tx: Transaction) -> PushTransactionResult<'_> {
+        self.push_transaction_with_compression(tx, true);
+        PushTransactionResult {
+            compressed_bytecodes: self
+                .bootloader_state
+                .get_last_tx_compressed_bytecodes()
+                .into(),
+        }
+    }
+
+    /// Execute VM with custom tracers.
+    fn inspect(
+        &mut self,
+        dispatcher: &mut Self::TracerDispatcher,
+        execution_mode: InspectExecutionMode,
+    ) -> VmExecutionResultAndLogs {
+        self.inspect_inner(dispatcher, execution_mode.into())
+    }
+
+    fn start_new_l2_block(&mut self, l2_block_env: L2BlockEnv) {
+        self.bootloader_state.start_new_l2_block(l2_block_env);
+    }
 
     /// Inspect transaction with optional bytecode compression.
     fn inspect_transaction_with_bytecode_compression(
         &mut self,
-        dispatcher: Self::TracerDispatcher,
+        dispatcher: &mut Self::TracerDispatcher,
         tx: Transaction,
         with_compression: bool,
-    ) -> (
-        Result<(), BytecodeCompressionError>,
-        VmExecutionResultAndLogs,
-    ) {
+    ) -> (BytecodeCompressionResult<'_>, VmExecutionResultAndLogs) {
         self.push_transaction_with_compression(tx, with_compression);
-        let result = self.inspect(dispatcher, VmExecutionMode::OneTx);
+        let result = self.inspect(dispatcher, InspectExecutionMode::OneTx);
         if self.has_unpublished_bytecodes() {
             (
                 Err(BytecodeCompressionError::BytecodeCompressionFailed),
                 result,
             )
         } else {
-            (Ok(()), result)
+            (
+                Ok(self
+                    .bootloader_state
+                    .get_last_tx_compressed_bytecodes()
+                    .into()),
+                result,
+            )
         }
     }
 
-    fn gas_remaining(&self) -> u32 {
-        self.state.local_state.callstack.current.ergs_remaining
-    }
-
-    fn record_vm_memory_metrics(&self) -> VmMemoryMetrics {
-        self.record_vm_memory_metrics_inner()
+    fn finish_batch(&mut self, _pubdata_builder: Rc<dyn PubdataBuilder>) -> FinishedL1Batch {
+        let result = self.inspect_inner(&mut TracerDispatcher::default(), VmExecutionMode::Batch);
+        let execution_state = self.get_current_execution_state();
+        let bootloader_memory = self.bootloader_state.bootloader_memory();
+        FinishedL1Batch {
+            block_tip_execution_result: result,
+            final_execution_state: execution_state,
+            final_bootloader_memory: Some(bootloader_memory),
+            pubdata_input: None,
+            state_diffs: None,
+        }
     }
 }
 
@@ -139,7 +153,7 @@ impl<S: WriteStorage, H: HistoryMode> VmFactory<S> for Vm<S, H> {
             storage,
             system_env,
             batch_env,
-            snapshots: vec![],
+            snapshots: VecDeque::new(),
             _phantom: Default::default(),
         }
     }
@@ -154,12 +168,16 @@ impl<S: WriteStorage> VmInterfaceHistoryEnabled for Vm<S, HistoryEnabled> {
     fn rollback_to_the_latest_snapshot(&mut self) {
         let snapshot = self
             .snapshots
-            .pop()
+            .pop_back()
             .expect("Snapshot should be created before rolling it back");
         self.rollback_to_snapshot(snapshot);
     }
 
     fn pop_snapshot_no_rollback(&mut self) {
-        self.snapshots.pop();
+        self.snapshots.pop_back();
+    }
+
+    fn pop_front_snapshot_no_rollback(&mut self) {
+        self.snapshots.pop_front();
     }
 }

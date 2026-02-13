@@ -1,44 +1,49 @@
 use std::{
     collections::{HashMap, HashSet},
     net::Ipv4Addr,
-    num::NonZeroUsize,
-    slice,
 };
 
 use assert_matches::assert_matches;
 use async_trait::async_trait;
 use tokio::sync::watch;
 use zksync_config::{
-    configs::{
-        api::Web3JsonRpcConfig,
-        chain::{NetworkConfig, StateKeeperConfig},
-        ContractsConfig,
-    },
+    configs::{api::Web3JsonRpcConfig, chain::StateKeeperConfig, ContractsConfig},
     GenesisConfig,
 };
-use zksync_dal::{transactions_dal::L2TxSubmissionResult, Connection, ConnectionPool, CoreDal};
+use zksync_contracts::BaseSystemContracts;
+use zksync_dal::{Connection, ConnectionPool, CoreDal};
 use zksync_multivm::interface::{
-    TransactionExecutionMetrics, TransactionExecutionResult, TxExecutionStatus, VmEvent,
-    VmExecutionMetrics,
+    tracer::ValidationTraces, TransactionExecutionMetrics, TransactionExecutionResult, VmEvent,
 };
 use zksync_node_genesis::{insert_genesis_batch, mock_genesis_config, GenesisParams};
 use zksync_node_test_utils::{
     create_l1_batch, create_l1_batch_metadata, create_l2_block, create_l2_transaction,
     l1_batch_metadata_to_commitment_artifacts, prepare_recovery_snapshot,
 };
-use zksync_types::{
-    api,
-    block::L2BlockHeader,
-    get_nonce_key,
-    l2::L2Tx,
-    storage::get_code_key,
-    tokens::{TokenInfo, TokenMetadata},
-    tx::IncludedTxLocation,
-    utils::{storage_key_for_eth_balance, storage_key_for_standard_token_balance},
-    AccountTreeId, Address, L1BatchNumber, Nonce, ProtocolVersionId, StorageKey, StorageLog, H256,
-    U256, U64,
+use zksync_system_constants::{
+    SYSTEM_CONTEXT_ADDRESS, SYSTEM_CONTEXT_CURRENT_L2_BLOCK_INFO_POSITION,
 };
-use zksync_utils::u256_to_h256;
+use zksync_types::{
+    aggregated_operations::L1BatchAggregatedActionType,
+    api,
+    api::{BlockNumber, BlockStatus, TransactionStatus},
+    block::{pack_block_info, L2BlockHasher, L2BlockHeader, UnsealedL1BatchHeader},
+    bytecode::{
+        testonly::{PADDED_EVM_BYTECODE, PROCESSED_EVM_BYTECODE},
+        BytecodeHash,
+    },
+    eth_sender::EthTxFinalityStatus,
+    fee_model::{BatchFeeInput, FeeParams},
+    get_deployer_key, get_nonce_key,
+    settlement::SettlementLayer,
+    storage::get_code_key,
+    system_contracts::get_system_smart_contracts,
+    tx::IncludedTxLocation,
+    u256_to_h256,
+    utils::storage_key_for_eth_balance,
+    AccountTreeId, Address, L1BatchNumber, Nonce, StorageKey, StorageLog, H256, U256, U64,
+};
+use zksync_vm_executor::oneshot::MockOneshotExecutor;
 use zksync_web3_decl::{
     client::{Client, DynClient, L2},
     jsonrpsee::{
@@ -46,7 +51,7 @@ use zksync_web3_decl::{
         http_client::HttpClient,
         rpc_params,
         types::{
-            error::{ErrorCode, OVERSIZED_RESPONSE_CODE},
+            error::{ErrorCode, INVALID_PARAMS_CODE, OVERSIZED_RESPONSE_CODE},
             ErrorObjectOwned,
         },
     },
@@ -55,13 +60,15 @@ use zksync_web3_decl::{
 
 use super::*;
 use crate::{
-    execution_sandbox::testonly::MockTransactionExecutor,
-    web3::testonly::{spawn_http_server, spawn_ws_server},
+    testonly::{mock_execute_transaction, store_custom_l2_block},
+    tx_sender::SandboxExecutorOptions,
+    web3::{state::InternalApiConfigBase, testonly::TestServerBuilder},
 };
 
 mod debug;
 mod filters;
 mod snapshots;
+mod unstable;
 mod vm;
 mod ws;
 
@@ -83,7 +90,7 @@ async fn setting_response_size_limits() {
             Ok::<_, ErrorObjectOwned>("!".repeat(response_size))
         })
         .unwrap();
-    let overrides = MaxResponseSizeOverrides::from_iter([("test_unlimited", NonZeroUsize::MAX)]);
+    let overrides = MaxResponseSizeOverrides::from_iter([("test_unlimited", None)]);
     let methods = ApiServer::override_method_response_sizes(rpc_module, &overrides).unwrap();
 
     let server = ServerBuilder::default()
@@ -132,30 +139,37 @@ async fn setting_response_size_limits() {
 trait HttpTest: Send + Sync {
     /// Prepares the storage before the server is started. The default implementation performs genesis.
     fn storage_initialization(&self) -> StorageInitialization {
-        StorageInitialization::Genesis
+        StorageInitialization::genesis()
     }
 
-    fn transaction_executor(&self) -> MockTransactionExecutor {
-        MockTransactionExecutor::default()
+    fn transaction_executor(&self) -> MockOneshotExecutor {
+        MockOneshotExecutor::default()
+    }
+
+    /// Allows to override sandbox executor options.
+    fn executor_options(&self) -> Option<SandboxExecutorOptions> {
+        None
     }
 
     fn method_tracer(&self) -> Arc<MethodTracer> {
         Arc::default()
     }
 
+    /// Provides a custom Web3 config. Note that only some config options are actually used in the tests.
+    fn web3_config(&self) -> Web3JsonRpcConfig {
+        Web3JsonRpcConfig::for_tests()
+    }
+
     async fn test(&self, client: &DynClient<L2>, pool: &ConnectionPool<Core>)
         -> anyhow::Result<()>;
-
-    /// Overrides the `filters_disabled` configuration parameter for HTTP server startup
-    fn filters_disabled(&self) -> bool {
-        false
-    }
 }
 
 /// Storage initialization strategy.
 #[derive(Debug)]
 enum StorageInitialization {
-    Genesis,
+    Genesis {
+        evm_emulator: bool,
+    },
     Recovery {
         logs: Vec<StorageLog>,
         factory_deps: HashMap<H256, Vec<u8>>,
@@ -166,6 +180,16 @@ impl StorageInitialization {
     const SNAPSHOT_RECOVERY_BATCH: L1BatchNumber = L1BatchNumber(23);
     const SNAPSHOT_RECOVERY_BLOCK: L2BlockNumber = L2BlockNumber(23);
 
+    const fn genesis() -> Self {
+        Self::Genesis {
+            evm_emulator: false,
+        }
+    }
+
+    const fn genesis_with_evm() -> Self {
+        Self::Genesis { evm_emulator: true }
+    }
+
     fn empty_recovery() -> Self {
         Self::Recovery {
             logs: vec![],
@@ -173,33 +197,63 @@ impl StorageInitialization {
         }
     }
 
-    async fn prepare_storage(
-        &self,
-        network_config: &NetworkConfig,
-        storage: &mut Connection<'_, Core>,
-    ) -> anyhow::Result<()> {
+    async fn prepare_storage(self, storage: &mut Connection<'_, Core>) -> anyhow::Result<()> {
         match self {
-            Self::Genesis => {
-                let params = GenesisParams::load_genesis_params(GenesisConfig {
-                    l2_chain_id: network_config.zksync_network_id,
-                    ..mock_genesis_config()
-                })
+            Self::Genesis { evm_emulator } => {
+                let config = mock_genesis_config();
+                let base_system_contracts = BaseSystemContracts::load_from_disk();
+                assert!(config.evm_emulator_hash.is_some());
+
+                let params = GenesisParams::from_genesis_config(
+                    config,
+                    base_system_contracts,
+                    get_system_smart_contracts(),
+                )
                 .unwrap();
+
                 if storage.blocks_dal().is_genesis_needed().await? {
                     insert_genesis_batch(storage, &params).await?;
                 }
+                if evm_emulator {
+                    // Enable EVM contract deployment in `ContractDeployer` storage.
+                    let contract_types_storage_key = get_deployer_key(H256::from_low_u64_be(1));
+                    let contract_types_log = StorageLog::new_write_log(
+                        contract_types_storage_key,
+                        H256::from_low_u64_be(1),
+                    );
+                    storage
+                        .storage_logs_dal()
+                        .append_storage_logs(L2BlockNumber(0), &[contract_types_log])
+                        .await?;
+                }
             }
-            Self::Recovery { logs, factory_deps } => {
+            Self::Recovery {
+                mut logs,
+                factory_deps,
+            } => {
+                let l2_block_info_key = StorageKey::new(
+                    AccountTreeId::new(SYSTEM_CONTEXT_ADDRESS),
+                    SYSTEM_CONTEXT_CURRENT_L2_BLOCK_INFO_POSITION,
+                );
+                let block_info = pack_block_info(
+                    Self::SNAPSHOT_RECOVERY_BLOCK.0.into(),
+                    Self::SNAPSHOT_RECOVERY_BLOCK.0.into(),
+                );
+                logs.push(StorageLog::new_write_log(
+                    l2_block_info_key,
+                    u256_to_h256(block_info),
+                ));
+
                 prepare_recovery_snapshot(
                     storage,
                     Self::SNAPSHOT_RECOVERY_BATCH,
                     Self::SNAPSHOT_RECOVERY_BLOCK,
-                    logs,
+                    &logs,
                 )
                 .await;
                 storage
                     .factory_deps_dal()
-                    .insert_factory_deps(Self::SNAPSHOT_RECOVERY_BLOCK, factory_deps)
+                    .insert_factory_deps(Self::SNAPSHOT_RECOVERY_BLOCK, &factory_deps)
                     .await?;
 
                 // Insert the next L1 batch in the storage so that the API server doesn't hang up.
@@ -213,28 +267,36 @@ impl StorageInitialization {
 
 async fn test_http_server(test: impl HttpTest) {
     let pool = ConnectionPool::<Core>::test_pool().await;
-    let network_config = NetworkConfig::for_tests();
     let mut storage = pool.connection().await.unwrap();
     test.storage_initialization()
-        .prepare_storage(&network_config, &mut storage)
+        .prepare_storage(&mut storage)
         .await
         .expect("Failed preparing storage for test");
     drop(storage);
 
     let (stop_sender, stop_receiver) = watch::channel(false);
     let contracts_config = ContractsConfig::for_tests();
-    let web3_config = Web3JsonRpcConfig::for_tests();
+    let web3_config = test.web3_config();
     let genesis = GenesisConfig::for_tests();
-    let mut api_config = InternalApiConfig::new(&web3_config, &contracts_config, &genesis);
-    api_config.filters_disabled = test.filters_disabled();
-    let mut server_handles = spawn_http_server(
-        api_config,
-        pool.clone(),
-        test.transaction_executor(),
-        test.method_tracer(),
-        stop_receiver,
-    )
-    .await;
+    let state_keeper_config = StateKeeperConfig::for_tests();
+    let api_config = InternalApiConfig::new(
+        InternalApiConfigBase::new(&genesis, &web3_config, &state_keeper_config)
+            .with_l1_to_l2_txs_paused(false),
+        &contracts_config.settlement_layer_specific_contracts(),
+        &contracts_config.l1_specific_contracts(),
+        &contracts_config.l2_contracts(),
+        &genesis,
+        SettlementLayer::for_tests(),
+    );
+
+    let mut server_builder = TestServerBuilder::new(pool.clone(), api_config)
+        .with_tx_executor(test.transaction_executor())
+        .with_method_tracer(test.method_tracer())
+        .with_request_timeout(web3_config.request_timeout);
+    if let Some(executor_options) = test.executor_options() {
+        server_builder = server_builder.with_executor_options(executor_options);
+    }
+    let mut server_handles = server_builder.build_http(stop_receiver).await;
 
     let local_addr = server_handles.wait_until_ready().await;
     let client = Client::http(format!("http://{local_addr}/").parse().unwrap())
@@ -268,49 +330,27 @@ fn assert_logs_match(actual_logs: &[api::Log], expected_logs: &[&VmEvent]) {
     }
 }
 
-fn execute_l2_transaction(transaction: L2Tx) -> TransactionExecutionResult {
-    TransactionExecutionResult {
-        hash: transaction.hash(),
-        transaction: transaction.into(),
-        execution_info: VmExecutionMetrics::default(),
-        execution_status: TxExecutionStatus::Success,
-        refunded_gas: 0,
-        operator_suggested_refund: 0,
-        compressed_bytecodes: vec![],
-        call_traces: vec![],
-        revert_reason: None,
-    }
-}
-
-/// Stores L2 block with a single transaction and returns the L2 block header + transaction hash.
+/// Stores L2 block and returns the L2 block header.
 async fn store_l2_block(
     storage: &mut Connection<'_, Core>,
     number: L2BlockNumber,
     transaction_results: &[TransactionExecutionResult],
 ) -> anyhow::Result<L2BlockHeader> {
-    for result in transaction_results {
-        let l2_tx = result.transaction.clone().try_into().unwrap();
-        let tx_submission_result = storage
-            .transactions_dal()
-            .insert_transaction_l2(&l2_tx, TransactionExecutionMetrics::default())
-            .await
-            .unwrap();
-        assert_matches!(tx_submission_result, L2TxSubmissionResult::Added);
-    }
+    let header = create_l2_block(number.0);
+    store_custom_l2_block(storage, &header, transaction_results).await?;
+    Ok(header)
+}
 
-    let new_l2_block = create_l2_block(number.0);
-    storage.blocks_dal().insert_l2_block(&new_l2_block).await?;
-    storage
-        .transactions_dal()
-        .mark_txs_as_executed_in_l2_block(
-            new_l2_block.number,
-            transaction_results,
-            1.into(),
-            ProtocolVersionId::latest(),
-            false,
-        )
-        .await?;
-    Ok(new_l2_block)
+async fn open_l1_batch(
+    storage: &mut Connection<'_, Core>,
+    number: L1BatchNumber,
+    batch_fee_input: BatchFeeInput,
+) -> anyhow::Result<UnsealedL1BatchHeader> {
+    let mut header = create_l1_batch(number.0);
+    header.batch_fee_input = batch_fee_input;
+    let header = header.to_unsealed_header();
+    storage.blocks_dal().insert_l1_batch(header.clone()).await?;
+    Ok(header)
 }
 
 async fn seal_l1_batch(
@@ -338,6 +378,20 @@ async fn seal_l1_batch(
     Ok(())
 }
 
+async fn save_eth_tx(
+    storage: &mut Connection<'_, Core>,
+    batch_number: L1BatchNumber,
+    tx_type: L1BatchAggregatedActionType,
+) -> H256 {
+    let tx_hash = H256::random();
+    storage
+        .eth_sender_dal()
+        .insert_pending_received_eth_tx(batch_number, tx_type, tx_hash, None)
+        .await
+        .unwrap();
+    tx_hash
+}
+
 async fn store_events(
     storage: &mut Connection<'_, Core>,
     l2_block_number: u32,
@@ -349,7 +403,6 @@ async fn store_events(
     let tx_location = IncludedTxLocation {
         tx_hash: H256::repeat_byte(1),
         tx_index_in_l2_block: 0,
-        tx_initiator_address: Address::repeat_byte(2),
     };
     let events = vec![
         // Matches address, doesn't match topics
@@ -389,6 +442,10 @@ async fn store_events(
         )
         .await?;
     Ok((tx_location, events))
+}
+
+fn scaled_sensible_fee_input(scale: f64) -> BatchFeeInput {
+    FeeParams::sensible_v1_default().scale(scale, scale)
 }
 
 #[derive(Debug)]
@@ -588,7 +645,7 @@ impl HttpTest for StorageAccessWithSnapshotRecovery {
     fn storage_initialization(&self) -> StorageInitialization {
         let address = Address::repeat_byte(1);
         let code_key = get_code_key(&address);
-        let code_hash = H256::repeat_byte(2);
+        let code_hash = BytecodeHash::for_bytecode(&[0; 32]).value();
         let balance_key = storage_key_for_eth_balance(&address);
         let logs = vec![
             StorageLog::new_write_log(code_key, code_hash),
@@ -663,7 +720,7 @@ impl HttpTest for TransactionCountTest {
             store_l2_block(
                 &mut storage,
                 l2_block_number,
-                &[execute_l2_transaction(committed_tx)],
+                &[mock_execute_transaction(committed_tx.into())],
             )
             .await?;
             let nonce_log = StorageLog::new_write_log(
@@ -684,7 +741,11 @@ impl HttpTest for TransactionCountTest {
         pending_tx.common_data.nonce = Nonce(2);
         storage
             .transactions_dal()
-            .insert_transaction_l2(&pending_tx, TransactionExecutionMetrics::default())
+            .insert_transaction_l2(
+                &pending_tx,
+                TransactionExecutionMetrics::default(),
+                ValidationTraces::default(),
+            )
             .await
             .unwrap();
 
@@ -764,7 +825,11 @@ impl HttpTest for TransactionCountAfterSnapshotRecoveryTest {
         let mut storage = pool.connection().await?;
         storage
             .transactions_dal()
-            .insert_transaction_l2(&pending_tx, TransactionExecutionMetrics::default())
+            .insert_transaction_l2(
+                &pending_tx,
+                TransactionExecutionMetrics::default(),
+                ValidationTraces::default(),
+            )
             .await
             .unwrap();
 
@@ -819,8 +884,8 @@ impl HttpTest for TransactionReceiptsTest {
         let tx1 = create_l2_transaction(10, 200);
         let tx2 = create_l2_transaction(10, 200);
         let tx_results = vec![
-            execute_l2_transaction(tx1.clone()),
-            execute_l2_transaction(tx2.clone()),
+            mock_execute_transaction(tx1.clone().into()),
+            mock_execute_transaction(tx2.clone().into()),
         ];
         store_l2_block(&mut storage, l2_block_number, &tx_results).await?;
 
@@ -859,77 +924,6 @@ impl HttpTest for TransactionReceiptsTest {
 #[tokio::test]
 async fn transaction_receipts() {
     test_http_server(TransactionReceiptsTest).await;
-}
-
-#[derive(Debug)]
-struct AllAccountBalancesTest;
-
-impl AllAccountBalancesTest {
-    const ADDRESS: Address = Address::repeat_byte(0x11);
-}
-
-#[async_trait]
-impl HttpTest for AllAccountBalancesTest {
-    async fn test(
-        &self,
-        client: &DynClient<L2>,
-        pool: &ConnectionPool<Core>,
-    ) -> anyhow::Result<()> {
-        let balances = client.get_all_account_balances(Self::ADDRESS).await?;
-        assert_eq!(balances, HashMap::new());
-
-        let mut storage = pool.connection().await?;
-        store_l2_block(&mut storage, L2BlockNumber(1), &[]).await?;
-
-        let eth_balance_key = storage_key_for_eth_balance(&Self::ADDRESS);
-        let eth_balance = U256::one() << 64;
-        let eth_balance_log = StorageLog::new_write_log(eth_balance_key, u256_to_h256(eth_balance));
-        storage
-            .storage_logs_dal()
-            .insert_storage_logs(L2BlockNumber(1), &[eth_balance_log])
-            .await?;
-        // Create a custom token, but don't set balance for it yet.
-        let custom_token = TokenInfo {
-            l1_address: Address::repeat_byte(0xfe),
-            l2_address: Address::repeat_byte(0xfe),
-            metadata: TokenMetadata::default(Address::repeat_byte(0xfe)),
-        };
-        storage
-            .tokens_dal()
-            .add_tokens(slice::from_ref(&custom_token))
-            .await?;
-
-        let balances = client.get_all_account_balances(Self::ADDRESS).await?;
-        assert_eq!(balances, HashMap::from([(Address::zero(), eth_balance)]));
-
-        store_l2_block(&mut storage, L2BlockNumber(2), &[]).await?;
-        let token_balance_key = storage_key_for_standard_token_balance(
-            AccountTreeId::new(custom_token.l2_address),
-            &Self::ADDRESS,
-        );
-        let token_balance = 123.into();
-        let token_balance_log =
-            StorageLog::new_write_log(token_balance_key, u256_to_h256(token_balance));
-        storage
-            .storage_logs_dal()
-            .insert_storage_logs(L2BlockNumber(2), &[token_balance_log])
-            .await?;
-
-        let balances = client.get_all_account_balances(Self::ADDRESS).await?;
-        assert_eq!(
-            balances,
-            HashMap::from([
-                (Address::zero(), eth_balance),
-                (custom_token.l2_address, token_balance),
-            ])
-        );
-        Ok(())
-    }
-}
-
-#[tokio::test]
-async fn getting_all_account_balances() {
-    test_http_server(AllAccountBalancesTest).await;
 }
 
 #[derive(Debug, Default)]
@@ -1064,4 +1058,630 @@ impl HttpTest for GenesisConfigTest {
 #[tokio::test]
 async fn tracing_genesis_config() {
     test_http_server(GenesisConfigTest).await;
+}
+
+#[derive(Debug)]
+struct GetBytecodeTest;
+
+impl GetBytecodeTest {
+    async fn insert_evm_bytecode(
+        connection: &mut Connection<'_, Core>,
+        at_block: L2BlockNumber,
+        address: Address,
+    ) -> anyhow::Result<()> {
+        let evm_bytecode_hash =
+            BytecodeHash::for_evm_bytecode(PROCESSED_EVM_BYTECODE.len(), PADDED_EVM_BYTECODE)
+                .value();
+        let code_log = StorageLog::new_write_log(get_code_key(&address), evm_bytecode_hash);
+        connection
+            .storage_logs_dal()
+            .append_storage_logs(at_block, &[code_log])
+            .await?;
+
+        let factory_deps = HashMap::from([(evm_bytecode_hash, PADDED_EVM_BYTECODE.to_vec())]);
+        connection
+            .factory_deps_dal()
+            .insert_factory_deps(at_block, &factory_deps)
+            .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl HttpTest for GetBytecodeTest {
+    async fn test(
+        &self,
+        client: &DynClient<L2>,
+        pool: &ConnectionPool<Core>,
+    ) -> anyhow::Result<()> {
+        let genesis_evm_address = Address::repeat_byte(1);
+        let mut connection = pool.connection().await?;
+        Self::insert_evm_bytecode(&mut connection, L2BlockNumber(0), genesis_evm_address).await?;
+
+        for contract in get_system_smart_contracts() {
+            let bytecode = client
+                .get_code(*contract.account_id.address(), None)
+                .await?;
+            assert_eq!(bytecode.0, contract.bytecode);
+        }
+
+        let bytecode = client.get_code(genesis_evm_address, None).await?;
+        assert_eq!(bytecode.0, PROCESSED_EVM_BYTECODE);
+
+        let latest_block_variants = [
+            api::BlockNumber::Pending,
+            api::BlockNumber::Latest,
+            api::BlockNumber::Committed,
+        ];
+        let latest_block_variants = latest_block_variants.map(api::BlockIdVariant::BlockNumber);
+
+        let genesis_block_variants = [
+            api::BlockIdVariant::BlockNumber(api::BlockNumber::Earliest),
+            api::BlockIdVariant::BlockNumber(api::BlockNumber::Number(0.into())),
+            api::BlockIdVariant::BlockHashObject(api::BlockHashObject {
+                block_hash: L2BlockHasher::legacy_hash(L2BlockNumber(0)),
+            }),
+        ];
+        for at_block in latest_block_variants
+            .into_iter()
+            .chain(genesis_block_variants)
+        {
+            println!("Testing {at_block:?} with genesis EVM code, latest block: 0");
+            let bytecode = client.get_code(genesis_evm_address, Some(at_block)).await?;
+            assert_eq!(bytecode.0, PROCESSED_EVM_BYTECODE);
+        }
+
+        // Create another block with an EVM bytecode.
+        let new_bytecode_address = Address::repeat_byte(2);
+        let mut connection = pool.connection().await?;
+        let block_header = store_l2_block(&mut connection, L2BlockNumber(1), &[]).await?;
+        Self::insert_evm_bytecode(&mut connection, L2BlockNumber(1), new_bytecode_address).await?;
+
+        let bytecode = client.get_code(genesis_evm_address, None).await?;
+        assert_eq!(bytecode.0, PROCESSED_EVM_BYTECODE);
+        let bytecode = client.get_code(new_bytecode_address, None).await?;
+        assert_eq!(bytecode.0, PROCESSED_EVM_BYTECODE);
+
+        let new_block_variants = [
+            api::BlockIdVariant::BlockNumber(api::BlockNumber::Number(1.into())),
+            api::BlockIdVariant::BlockHashObject(api::BlockHashObject {
+                block_hash: block_header.hash,
+            }),
+        ];
+        for at_block in latest_block_variants.into_iter().chain(new_block_variants) {
+            println!("Testing {at_block:?} with new EVM code, latest block: 1");
+            let bytecode = client
+                .get_code(new_bytecode_address, Some(at_block))
+                .await?;
+            assert_eq!(bytecode.0, PROCESSED_EVM_BYTECODE);
+        }
+        for at_block in genesis_block_variants {
+            println!("Testing {at_block:?} with new EVM code, latest block: 1");
+            let bytecode = client
+                .get_code(new_bytecode_address, Some(at_block))
+                .await?;
+            assert!(bytecode.0.is_empty());
+        }
+
+        for at_block in latest_block_variants
+            .into_iter()
+            .chain(new_block_variants)
+            .chain(genesis_block_variants)
+        {
+            println!("Testing {at_block:?} with genesis EVM code, latest block: 1");
+            let bytecode = client.get_code(genesis_evm_address, Some(at_block)).await?;
+            assert_eq!(bytecode.0, PROCESSED_EVM_BYTECODE);
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn getting_bytecodes() {
+    test_http_server(GetBytecodeTest).await;
+}
+
+#[derive(Debug)]
+struct FeeHistoryTest;
+
+#[async_trait]
+impl HttpTest for FeeHistoryTest {
+    async fn test(
+        &self,
+        client: &DynClient<L2>,
+        pool: &ConnectionPool<Core>,
+    ) -> anyhow::Result<()> {
+        let mut connection = pool.connection().await?;
+        let block1 = L2BlockHeader {
+            batch_fee_input: scaled_sensible_fee_input(1.0),
+            base_fee_per_gas: 100,
+            ..create_l2_block(1)
+        };
+        store_custom_l2_block(&mut connection, &block1, &[]).await?;
+        let block2 = L2BlockHeader {
+            batch_fee_input: scaled_sensible_fee_input(2.0),
+            base_fee_per_gas: 200,
+            ..create_l2_block(2)
+        };
+        store_custom_l2_block(&mut connection, &block2, &[]).await?;
+
+        let all_pubdata_prices = [
+            0,
+            block1.batch_fee_input.fair_pubdata_price(),
+            block2.batch_fee_input.fair_pubdata_price(),
+        ]
+        .map(U256::from);
+
+        let history = client
+            .fee_history(1_000.into(), api::BlockNumber::Latest, Some(vec![]))
+            .await?;
+        assert_eq!(history.inner.oldest_block, 0.into());
+        assert_eq!(
+            history.inner.base_fee_per_gas,
+            [0, 100, 200, 200].map(U256::from) // The latest value is duplicated
+        );
+        assert_eq!(history.l2_pubdata_price, all_pubdata_prices);
+        // Values below are not filled.
+        assert_eq!(history.inner.gas_used_ratio, [0.0; 3]);
+        assert_eq!(history.inner.base_fee_per_blob_gas, [U256::zero(); 4]);
+        assert_eq!(history.inner.blob_gas_used_ratio, [0.0; 3]);
+
+        // Check supplying hexadecimal block count
+        let hex_history: api::FeeHistory = client
+            .request(
+                "eth_feeHistory",
+                rpc_params!["0xaa", "latest", [] as [f64; 0]],
+            )
+            .await?;
+        assert_eq!(hex_history, history);
+
+        // ...and explicitly decimal count (which should've been supplied in the first call) for exhaustiveness
+        let dec_history: api::FeeHistory = client
+            .request(
+                "eth_feeHistory",
+                rpc_params![1_000, "latest", [] as [f64; 0]],
+            )
+            .await?;
+        assert_eq!(dec_history, history);
+
+        // Check partial histories: blocks 0..=1
+        let history = client
+            .fee_history(
+                1_000.into(),
+                api::BlockNumber::Number(1.into()),
+                Some(vec![]),
+            )
+            .await?;
+        assert_eq!(history.inner.oldest_block, 0.into());
+        assert_eq!(
+            history.inner.base_fee_per_gas,
+            [0, 100, 100].map(U256::from)
+        );
+        assert_eq!(history.l2_pubdata_price, all_pubdata_prices[..2]);
+
+        // Blocks 1..=2
+        let history = client
+            .fee_history(2.into(), api::BlockNumber::Latest, Some(vec![]))
+            .await?;
+        assert_eq!(history.inner.oldest_block, 1.into());
+        assert_eq!(
+            history.inner.base_fee_per_gas,
+            [100, 200, 200].map(U256::from)
+        );
+        assert_eq!(history.l2_pubdata_price, all_pubdata_prices[1..]);
+
+        // Blocks 1..=1
+        let history = client
+            .fee_history(1.into(), api::BlockNumber::Number(1.into()), Some(vec![]))
+            .await?;
+        assert_eq!(history.inner.oldest_block, 1.into());
+        assert_eq!(history.inner.base_fee_per_gas, [100, 100].map(U256::from));
+        assert_eq!(history.l2_pubdata_price, all_pubdata_prices[1..2]);
+
+        // Non-existing newest block.
+        let err = client
+            .fee_history(
+                1000.into(),
+                api::BlockNumber::Number(100.into()),
+                Some(vec![]),
+            )
+            .await
+            .unwrap_err();
+        assert_matches!(
+            err,
+            ClientError::Call(err) if err.code() == INVALID_PARAMS_CODE
+        );
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn getting_fee_history() {
+    test_http_server(FeeHistoryTest).await;
+}
+
+#[derive(Debug)]
+struct HttpServerBatchStatusTest;
+
+#[async_trait]
+impl HttpTest for HttpServerBatchStatusTest {
+    async fn test(
+        &self,
+        client: &DynClient<L2>,
+        pool: &ConnectionPool<Core>,
+    ) -> anyhow::Result<()> {
+        let mut storage = pool.connection().await?;
+        let l2_block_number = L2BlockNumber(1);
+        let l1_batch_number = L1BatchNumber(1);
+        let tx1 = create_l2_transaction(10, 200);
+        let tx_results = vec![mock_execute_transaction(tx1.clone().into())];
+        store_l2_block(&mut storage, l2_block_number, &tx_results).await?;
+        seal_l1_batch(&mut storage, l1_batch_number).await?;
+        let commit_eth_tx_hash = save_eth_tx(
+            &mut storage,
+            l1_batch_number,
+            L1BatchAggregatedActionType::Commit,
+        )
+        .await;
+
+        // Block is not committed yet.
+        let block = client
+            .get_block_details(l2_block_number.0.into())
+            .await?
+            .unwrap();
+        assert_eq!(block.base.status, BlockStatus::Sealed);
+        assert_eq!(block.base.commit_tx_hash, None); // pending txs are not returned
+        assert_eq!(block.base.commit_tx_finality, None); // pending txs are not returned
+
+        // Confirm commit transaction. But the block is still not finalized.
+        storage
+            .eth_sender_dal()
+            .confirm_tx(
+                commit_eth_tx_hash,
+                EthTxFinalityStatus::FastFinalized,
+                U256::zero(),
+            )
+            .await?;
+        let block = client
+            .get_block_details(l2_block_number.0.into())
+            .await?
+            .unwrap();
+        assert_eq!(block.base.status, BlockStatus::Sealed);
+        assert_eq!(block.base.commit_tx_hash, Some(commit_eth_tx_hash));
+        assert_eq!(
+            block.base.commit_tx_finality,
+            Some(EthTxFinalityStatus::FastFinalized)
+        );
+
+        // Save Execute transaction, but it is not executed yet. So block is still sealed.
+        storage
+            .eth_sender_dal()
+            .confirm_tx(
+                commit_eth_tx_hash,
+                EthTxFinalityStatus::Finalized,
+                U256::zero(),
+            )
+            .await?;
+        let prove_eth_tx_hash = save_eth_tx(
+            &mut storage,
+            l1_batch_number,
+            L1BatchAggregatedActionType::PublishProofOnchain,
+        )
+        .await;
+
+        storage
+            .eth_sender_dal()
+            .confirm_tx(
+                prove_eth_tx_hash,
+                EthTxFinalityStatus::Finalized,
+                U256::zero(),
+            )
+            .await?;
+        let execute_eth_tx_hash = save_eth_tx(
+            &mut storage,
+            l1_batch_number,
+            L1BatchAggregatedActionType::Execute,
+        )
+        .await;
+        let block = client
+            .get_block_details(l2_block_number.0.into())
+            .await?
+            .unwrap();
+
+        assert_eq!(block.base.status, BlockStatus::Sealed);
+        assert_eq!(block.base.prove_tx_hash, Some(prove_eth_tx_hash));
+        assert_eq!(
+            block.base.prove_tx_finality,
+            Some(EthTxFinalityStatus::Finalized)
+        );
+        assert_eq!(block.base.execute_tx_hash, None);
+        assert_eq!(block.base.execute_tx_finality, None);
+
+        // Fast finalize Execute transaction, block should be fast finalized.
+        storage
+            .eth_sender_dal()
+            .confirm_tx(
+                execute_eth_tx_hash,
+                EthTxFinalityStatus::FastFinalized,
+                U256::zero(),
+            )
+            .await?;
+        let block = client
+            .get_block_details(l2_block_number.0.into())
+            .await?
+            .unwrap();
+        assert_eq!(
+            block.base.execute_tx_finality,
+            Some(EthTxFinalityStatus::FastFinalized)
+        );
+        let tx = client.get_transaction_details(tx1.hash()).await?.unwrap();
+        assert_eq!(tx.status, TransactionStatus::FastFinalized);
+
+        // Confirm Execute transaction, block should be Verified.
+        storage
+            .eth_sender_dal()
+            .confirm_tx(
+                execute_eth_tx_hash,
+                EthTxFinalityStatus::Finalized,
+                U256::zero(),
+            )
+            .await?;
+        let block = client
+            .get_block_details(l2_block_number.0.into())
+            .await?
+            .unwrap();
+        assert_eq!(block.base.status, BlockStatus::Verified);
+        assert_eq!(
+            block.base.execute_tx_finality,
+            Some(EthTxFinalityStatus::Finalized)
+        );
+
+        let tx = client.get_transaction_details(tx1.hash()).await?.unwrap();
+        assert_eq!(tx.status, TransactionStatus::Verified);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn http_server_batch_statuses() {
+    test_http_server(HttpServerBatchStatusTest).await;
+}
+
+#[derive(Debug)]
+struct HttpServerBlockNumberTest;
+
+impl HttpServerBlockNumberTest {
+    async fn save_l1_batch(
+        storage: &mut Connection<'_, Core>,
+        l1_batch_number: L1BatchNumber,
+    ) -> anyhow::Result<()> {
+        let tx1 = create_l2_transaction(10, 200);
+        let tx_results = vec![mock_execute_transaction(tx1.clone().into())];
+        store_l2_block(storage, L2BlockNumber(l1_batch_number.0), &tx_results).await?;
+        seal_l1_batch(storage, l1_batch_number).await?;
+        Ok(())
+    }
+}
+
+enum PromotionBatchStates {
+    L1Committed,
+    Proved,
+    FastFinalized,
+    Executed(Option<H256>),
+}
+async fn promote_l1_batch_to_the_state(
+    storage: &mut Connection<'_, Core>,
+    l1_batch_number: L1BatchNumber,
+    // We use BlockNumber here, because we want to test exactly how the api will assume block statuses
+    state: PromotionBatchStates,
+) -> anyhow::Result<H256> {
+    let details = storage
+        .blocks_web3_dal()
+        .get_block_details(l1_batch_number.0.into())
+        .await?
+        .unwrap();
+
+    let tx_hash = match state {
+        PromotionBatchStates::L1Committed => {
+            if let Some(tx_hash) = details.base.commit_tx_hash {
+                return Ok(tx_hash);
+            }
+            let commit_eth_tx_hash = save_eth_tx(
+                storage,
+                l1_batch_number,
+                L1BatchAggregatedActionType::Commit,
+            )
+            .await;
+            storage
+                .eth_sender_dal()
+                .confirm_tx(
+                    commit_eth_tx_hash,
+                    EthTxFinalityStatus::Finalized,
+                    U256::zero(),
+                )
+                .await?;
+            commit_eth_tx_hash
+        }
+        PromotionBatchStates::Proved => {
+            if let Some(tx_hash) = details.base.prove_tx_hash {
+                return Ok(tx_hash);
+            }
+            let tx_hash = save_eth_tx(
+                storage,
+                l1_batch_number,
+                L1BatchAggregatedActionType::PublishProofOnchain,
+            )
+            .await;
+            storage
+                .eth_sender_dal()
+                .confirm_tx(tx_hash, EthTxFinalityStatus::Finalized, U256::zero())
+                .await?;
+            tx_hash
+        }
+        PromotionBatchStates::FastFinalized => {
+            if let Some(tx_hash) = details.base.execute_tx_hash {
+                return Ok(tx_hash);
+            }
+            let tx_hash = save_eth_tx(
+                storage,
+                l1_batch_number,
+                L1BatchAggregatedActionType::Execute,
+            )
+            .await;
+            storage
+                .eth_sender_dal()
+                .confirm_tx(tx_hash, EthTxFinalityStatus::FastFinalized, U256::zero())
+                .await?;
+            tx_hash
+        }
+        PromotionBatchStates::Executed(tx_hash) => {
+            let tx_hash = if let Some(tx_hash) = tx_hash {
+                tx_hash
+            } else {
+                save_eth_tx(
+                    storage,
+                    l1_batch_number,
+                    L1BatchAggregatedActionType::Execute,
+                )
+                .await
+            };
+            storage
+                .eth_sender_dal()
+                .confirm_tx(tx_hash, EthTxFinalityStatus::Finalized, U256::zero())
+                .await?;
+            tx_hash
+        }
+    };
+    Ok(tx_hash)
+}
+
+#[async_trait]
+impl HttpTest for HttpServerBlockNumberTest {
+    async fn test(
+        &self,
+        client: &DynClient<L2>,
+        pool: &ConnectionPool<Core>,
+    ) -> anyhow::Result<()> {
+        let mut storage = pool.connection().await?;
+        let l1_batch_number_1 = L1BatchNumber(1);
+        HttpServerBlockNumberTest::save_l1_batch(&mut storage, l1_batch_number_1).await?;
+        let l1_batch_number_2 = L1BatchNumber(2);
+        HttpServerBlockNumberTest::save_l1_batch(&mut storage, l1_batch_number_2).await?;
+        let l1_batch_number_3 = L1BatchNumber(3);
+        HttpServerBlockNumberTest::save_l1_batch(&mut storage, l1_batch_number_3).await?;
+        let l1_batch_number_4 = L1BatchNumber(4);
+        HttpServerBlockNumberTest::save_l1_batch(&mut storage, l1_batch_number_4).await?;
+
+        // Latest block is the latest sealed L2 block.
+        let block = client
+            .get_block_by_number(BlockNumber::Latest, false)
+            .await?
+            .unwrap();
+        assert_eq!(block.l1_batch_number.unwrap(), l1_batch_number_4.0.into());
+
+        // L1Committed block is the zero l2 block. Before none L1 batch is committed.
+        let block = client
+            .get_block_by_number(BlockNumber::L1Committed, false)
+            .await?
+            .unwrap();
+        assert_eq!(block.l1_batch_number.unwrap(), U64::zero());
+
+        // Mark the first L1 batch as L1Committed
+        promote_l1_batch_to_the_state(
+            &mut storage,
+            l1_batch_number_1,
+            PromotionBatchStates::L1Committed,
+        )
+        .await?;
+        let block = client
+            .get_block_by_number(BlockNumber::L1Committed, false)
+            .await?
+            .unwrap();
+        assert_eq!(block.l1_batch_number.unwrap(), l1_batch_number_1.0.into());
+
+        // Mark the first and second L1 batches as Proved
+        promote_l1_batch_to_the_state(
+            &mut storage,
+            l1_batch_number_1,
+            PromotionBatchStates::Proved,
+        )
+        .await?;
+        promote_l1_batch_to_the_state(
+            &mut storage,
+            l1_batch_number_2,
+            PromotionBatchStates::L1Committed,
+        )
+        .await?;
+        promote_l1_batch_to_the_state(
+            &mut storage,
+            l1_batch_number_2,
+            PromotionBatchStates::Proved,
+        )
+        .await?;
+        let block = client
+            .get_block_by_number(BlockNumber::L1Committed, false)
+            .await?
+            .unwrap();
+        // We don't have a special status for Proved, so the proven L1 batch is the last committed one.
+        assert_eq!(block.l1_batch_number.unwrap(), l1_batch_number_2.0.into());
+
+        // Mark the first and second L1 batch as FastFinalized
+        let execute_tx_hash_1 = promote_l1_batch_to_the_state(
+            &mut storage,
+            l1_batch_number_1,
+            PromotionBatchStates::FastFinalized,
+        )
+        .await?;
+        let execute_tx_hash_2 = promote_l1_batch_to_the_state(
+            &mut storage,
+            l1_batch_number_2,
+            PromotionBatchStates::FastFinalized,
+        )
+        .await?;
+        let block = client
+            .get_block_by_number(BlockNumber::FastFinalized, false)
+            .await?
+            .unwrap();
+        assert_eq!(block.l1_batch_number.unwrap(), l1_batch_number_2.0.into());
+
+        // Check that there are no L1 batches in Executed state yet.
+        let block = client
+            .get_block_by_number(BlockNumber::Finalized, false)
+            .await?
+            .unwrap();
+        assert_eq!(block.l1_batch_number.unwrap(), U64::zero());
+
+        // Mark the first L1 batch as Executed
+        promote_l1_batch_to_the_state(
+            &mut storage,
+            l1_batch_number_1,
+            PromotionBatchStates::Executed(Some(execute_tx_hash_1)),
+        )
+        .await?;
+        let block = client
+            .get_block_by_number(BlockNumber::Finalized, false)
+            .await?
+            .unwrap();
+        assert_eq!(block.l1_batch_number.unwrap(), l1_batch_number_1.0.into());
+
+        // Mark the second L1 batch as Executed. And verify that the latest FastFinalized is also latest Executed.
+        promote_l1_batch_to_the_state(
+            &mut storage,
+            l1_batch_number_2,
+            PromotionBatchStates::Executed(Some(execute_tx_hash_2)),
+        )
+        .await?;
+        let block = client
+            .get_block_by_number(BlockNumber::FastFinalized, false)
+            .await?
+            .unwrap();
+        assert_eq!(block.l1_batch_number.unwrap(), l1_batch_number_2.0.into());
+
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn http_server_block_number_test() {
+    test_http_server(HttpServerBlockNumberTest).await;
 }

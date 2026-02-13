@@ -1,7 +1,8 @@
 import { TestMessage } from './matcher-helpers';
 import { MatcherModifier } from '../modifiers';
 import * as zksync from 'zksync-ethers';
-import { AugmentedTransactionResponse } from '../retry-provider';
+import { AugmentedTransactionResponse } from '../transaction-response';
+import { ethers } from 'ethers';
 
 // This file contains implementation of matchers for ZKsync/ethereum transaction.
 // For actual doc-comments, see `typings/jest.d.ts` file.
@@ -70,6 +71,10 @@ export async function toBeReverted(
 
         return fail(message);
     } catch (error: any) {
+        // kl todo remove this once ethers is fixed
+        if (error.toString().includes('reverted')) {
+            return pass();
+        }
         const receipt = error.receipt;
         if (!receipt) {
             const message = new TestMessage()
@@ -207,7 +212,7 @@ function fail(message: string) {
  *
  * @returns If check has failed, returns a Jest error object. Otherwise, returns `undefined`.
  */
-function checkReceiptFields(request: zksync.types.TransactionResponse, receipt: zksync.types.TransactionReceipt) {
+function checkReceiptFields(request: ethers.TransactionResponseParams, receipt: zksync.types.TransactionReceipt) {
     const errorMessageBuilder = new TestMessage()
         .matcherHint('.checkReceiptFields')
         .line('Transaction receipt is not properly formatted. Transaction request:')

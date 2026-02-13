@@ -26,10 +26,12 @@ pub enum Network {
     Goerli,
     /// Ethereum Sepolia testnet.
     Sepolia,
-    /// Stratis Mainnet,
-    Stratis,
-    /// Stratis Auroria testnet
+    /// Xertra Mainnet,
+    Xertra,
+    /// Xertra Auroria testnet
     Auroria,
+    /// Ethereum Holešky testnet.
+    Holesky,
     /// Self-hosted Ethereum network.
     Localhost,
     /// Self-hosted L2 network.
@@ -52,8 +54,9 @@ impl FromStr for Network {
             "localhost" => Self::Localhost,
             "localhostL2" => Self::LocalhostL2,
             "sepolia" => Self::Sepolia,
-            "stratis" => Self::Stratis,
+            "xertra" => Self::Xertra,
             "auroria" => Self::Auroria,
+            "holesky" => Self::Holesky,
             "test" => Self::Test,
             another => return Err(another.to_owned()),
         })
@@ -70,8 +73,9 @@ impl fmt::Display for Network {
             Self::Localhost => write!(f, "localhost"),
             Self::LocalhostL2 => write!(f, "localhostL2"),
             Self::Sepolia => write!(f, "sepolia"),
-            Self::Stratis => write!(f, "stratis"),
+            Self::Xertra => write!(f, "xertra"),
             Self::Auroria => write!(f, "auroria"),
+            Self::Holesky => write!(f, "holesky"),
             Self::Unknown => write!(f, "unknown"),
             Self::Test => write!(f, "test"),
         }
@@ -88,8 +92,10 @@ impl Network {
             5 => Self::Goerli,
             9 => Self::Localhost,
             11155111 => Self::Sepolia,
-            105105 => Self::Stratis,
+            105105 => Self::Xertra,
             205205 => Self::Auroria,
+            17000 => Self::Holesky,
+            270 => Self::LocalhostL2,
             _ => Self::Unknown,
         }
     }
@@ -103,8 +109,9 @@ impl Network {
             Self::Goerli => SLChainId(5),
             Self::Localhost => SLChainId(9),
             Self::Sepolia => SLChainId(11155111),
-            Self::Stratis => SLChainId(105105),
+            Self::Xertra => SLChainId(105105),
             Self::Auroria => SLChainId(205205),
+            Self::Holesky => SLChainId(17000),
             Self::LocalhostL2 => SLChainId(270),
             Self::Unknown => panic!("Unknown chain ID"),
             Self::Test => panic!("Test chain ID"),

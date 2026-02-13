@@ -1,18 +1,21 @@
 //! Configuration utilities for the consensus component.
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Context as _;
-use secrecy::{ExposeSecret as _, Secret};
-use zksync_concurrency::{limiter, net, time};
+use secrecy::{ExposeSecret as _, SecretString};
+use zksync_concurrency::net;
 use zksync_config::{
     configs,
     configs::consensus::{ConsensusConfig, ConsensusSecrets, Host, NodePublicKey},
 };
 use zksync_consensus_crypto::{Text, TextFmt};
 use zksync_consensus_executor as executor;
-use zksync_consensus_roles::{attester, node, validator};
+use zksync_consensus_network as network;
+use zksync_consensus_roles::{node, validator};
+use zksync_dal::consensus_dal;
+use zksync_types::ethabi;
 
-fn read_secret_text<T: TextFmt>(text: Option<&Secret<String>>) -> anyhow::Result<Option<T>> {
+fn read_secret_text<T: TextFmt>(text: Option<&SecretString>) -> anyhow::Result<Option<T>> {
     text.map(|text| Text::new(text.expose_secret()).decode())
         .transpose()
         .map_err(|_| anyhow::format_err!("invalid format"))
@@ -21,13 +24,7 @@ fn read_secret_text<T: TextFmt>(text: Option<&Secret<String>>) -> anyhow::Result
 pub(super) fn validator_key(
     secrets: &ConsensusSecrets,
 ) -> anyhow::Result<Option<validator::SecretKey>> {
-    read_secret_text(secrets.validator_key.as_ref().map(|x| &x.0))
-}
-
-pub(super) fn attester_key(
-    secrets: &ConsensusSecrets,
-) -> anyhow::Result<Option<attester::SecretKey>> {
-    read_secret_text(secrets.attester_key.as_ref().map(|x| &x.0))
+    read_secret_text(secrets.validator_key.as_ref())
 }
 
 /// Consensus genesis specification.
@@ -38,74 +35,94 @@ pub(super) fn attester_key(
 pub(super) struct GenesisSpec {
     pub(super) chain_id: validator::ChainId,
     pub(super) protocol_version: validator::ProtocolVersion,
-    pub(super) validators: validator::Committee,
-    pub(super) attesters: Option<attester::Committee>,
-    pub(super) leader_selection: validator::LeaderSelectionMode,
+    pub(super) validators: Option<validator::Schedule>,
+    pub(super) registry_address: Option<ethabi::Address>,
+    pub(super) seed_peers: BTreeMap<node::PublicKey, net::Host>,
 }
 
 impl GenesisSpec {
-    pub(super) fn from_genesis(g: &validator::Genesis) -> Self {
+    pub(super) fn from_global_config(cfg: &consensus_dal::GlobalConfig) -> Self {
         Self {
-            chain_id: g.chain_id,
-            protocol_version: g.protocol_version,
-            validators: g.validators.clone(),
-            attesters: g.attesters.clone(),
-            leader_selection: g.leader_selection.clone(),
+            chain_id: cfg.genesis.chain_id,
+            protocol_version: cfg.genesis.protocol_version,
+            validators: cfg.genesis.validators_schedule.clone(),
+            registry_address: cfg.registry_address,
+            seed_peers: cfg.seed_peers.clone(),
         }
     }
 
     pub(super) fn parse(x: &configs::consensus::GenesisSpec) -> anyhow::Result<Self> {
-        let validators: Vec<_> = x
-            .validators
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                Ok(validator::WeightedValidator {
-                    key: Text::new(&v.key.0).decode().context("key").context(i)?,
-                    weight: v.weight,
-                })
-            })
-            .collect::<anyhow::Result<_>>()
-            .context("validators")?;
+        let schedule = if x.validators.is_empty() || x.leader.is_none() {
+            None
+        } else {
+            let leader = x.leader.as_ref().unwrap(); // safe to unwrap because of the check above
 
-        let attesters: Vec<_> = x
-            .attesters
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                Ok(attester::WeightedAttester {
-                    key: Text::new(&v.key.0).decode().context("key").context(i)?,
-                    weight: v.weight,
+            let validators: Vec<_> = x
+                .validators
+                .iter()
+                .enumerate()
+                .map(|(i, (key, weight))| {
+                    Ok(validator::ValidatorInfo {
+                        key: Text::new(&key.0).decode().context("key").context(i)?,
+                        weight: *weight,
+                        leader: key == leader,
+                    })
                 })
-            })
-            .collect::<anyhow::Result<_>>()
-            .context("attesters")?;
+                .collect::<anyhow::Result<_>>()
+                .context("validators")?;
+
+            Some(
+                validator::Schedule::new(validators, validator::LeaderSelection::default())
+                    .context("schedule")?,
+            )
+        };
+
+        anyhow::ensure!(
+            schedule.is_some() || x.registry_address.is_some(),
+            "either validators or registry_address must be present"
+        );
 
         Ok(Self {
             chain_id: validator::ChainId(x.chain_id.as_u64()),
             protocol_version: validator::ProtocolVersion(x.protocol_version.0),
-            leader_selection: validator::LeaderSelectionMode::Sticky(
-                Text::new(&x.leader.0).decode().context("leader")?,
-            ),
-            validators: validator::Committee::new(validators).context("validators")?,
-            attesters: if attesters.is_empty() {
-                None
-            } else {
-                Some(attester::Committee::new(attesters).context("attesters")?)
-            },
+            validators: schedule,
+            registry_address: x.registry_address,
+            seed_peers: x
+                .seed_peers
+                .iter()
+                .map(|(key, addr)| {
+                    anyhow::Ok((
+                        Text::new(&key.0)
+                            .decode::<node::PublicKey>()
+                            .context("key")?,
+                        net::Host(addr.0.clone()),
+                    ))
+                })
+                .collect::<Result<_, _>>()
+                .context("seed_peers")?,
         })
     }
 }
 
 pub(super) fn node_key(secrets: &ConsensusSecrets) -> anyhow::Result<Option<node::SecretKey>> {
-    read_secret_text(secrets.node_key.as_ref().map(|x| &x.0))
+    read_secret_text(secrets.node_key.as_ref())
 }
 
 pub(super) fn executor(
     cfg: &ConsensusConfig,
     secrets: &ConsensusSecrets,
+    global_config: &consensus_dal::GlobalConfig,
+    build_version: Option<semver::Version>,
 ) -> anyhow::Result<executor::Config> {
-    let mut gossip_static_outbound = HashMap::new();
+    // Always connect to seed peers.
+    // Once we implement dynamic peer discovery,
+    // we won't establish a persistent connection to seed peers
+    // but rather just ask them for more peers.
+    let mut gossip_static_outbound: HashMap<_, _> = global_config
+        .seed_peers
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     {
         let mut append = |key: &NodePublicKey, addr: &Host| {
             gossip_static_outbound.insert(
@@ -121,20 +138,22 @@ pub(super) fn executor(
 
     let mut rpc = executor::RpcConfig::default();
     rpc.get_block_rate = cfg.rpc().get_block_rate();
-    // Disable batch syncing, because it is not implemented.
-    rpc.get_batch_rate = limiter::Rate {
-        burst: 0,
-        refresh: time::Duration::ZERO,
-    };
+
+    let debug_page = cfg
+        .debug_page_addr
+        .map(|addr| network::debug_page::Config { addr });
 
     Ok(executor::Config {
+        build_version,
         server_addr: cfg.server_addr,
         public_addr: net::Host(cfg.public_addr.0.clone()),
-        max_payload_size: cfg.max_payload_size,
-        max_batch_size: cfg.max_batch_size,
+        max_payload_size: cfg.max_payload_size.0 as usize,
+        max_tx_size: cfg.max_transaction_size.0 as usize,
+        view_timeout: cfg.view_timeout.try_into().context("view_timeout")?,
         node_key: node_key(secrets)
             .context("node_key")?
             .context("missing node_key")?,
+        validator_key: validator_key(secrets).context("validator_key")?,
         gossip_dynamic_inbound_limit: cfg.gossip_dynamic_inbound_limit,
         gossip_static_inbound: cfg
             .gossip_static_inbound
@@ -145,8 +164,6 @@ pub(super) fn executor(
             .context("gossip_static_inbound")?,
         gossip_static_outbound,
         rpc,
-        // TODO: Add to configuration
-        debug_page: None,
-        batch_poll_interval: time::Duration::seconds(1),
+        debug_page,
     })
 }

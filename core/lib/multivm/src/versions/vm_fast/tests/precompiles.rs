@@ -1,133 +1,89 @@
-use zk_evm_1_5_0::zk_evm_abstractions::precompiles::PrecompileAddress;
-use zksync_types::{Address, Execute};
+use circuit_sequencer_api::geometry_config::ProtocolGeometry;
+use zksync_types::Execute;
 
 use crate::{
-    interface::{TxExecutionMode, VmExecutionMode, VmInterface},
-    vm_fast::tests::{tester::VmTesterBuilder, utils::read_precompiles_contract},
-    vm_latest::constants::BATCH_COMPUTATIONAL_GAS_LIMIT,
+    interface::{InspectExecutionMode, TxExecutionMode, VmInterface, VmInterfaceExt},
+    versions::testonly::{
+        precompiles::{
+            test_ecadd, test_ecmul, test_ecpairing, test_ecrecover, test_keccak, test_modexp,
+            test_sha256, test_v28_precompiles_disabled,
+        },
+        VmTesterBuilder,
+    },
+    vm_fast::Vm,
 };
 
 #[test]
-fn test_keccak() {
-    // Execute special transaction and check that at least 1000 keccak calls were made.
-    let contract = read_precompiles_contract();
-    let address = Address::random();
-    let mut vm = VmTesterBuilder::new()
-        .with_empty_in_memory_storage()
-        .with_random_rich_accounts(1)
-        .with_deployer()
-        .with_bootloader_gas_limit(BATCH_COMPUTATIONAL_GAS_LIMIT)
-        .with_execution_mode(TxExecutionMode::VerifyExecute)
-        .with_custom_contracts(vec![(contract, address, true)])
-        .build();
-
-    // calldata for `doKeccak(1000)`.
-    let keccak1000_calldata =
-        "370f20ac00000000000000000000000000000000000000000000000000000000000003e8";
-
-    let account = &mut vm.rich_accounts[0];
-    let tx = account.get_l2_tx_for_execute(
-        Execute {
-            contract_address: address,
-            calldata: hex::decode(keccak1000_calldata).unwrap(),
-            value: Default::default(),
-            factory_deps: None,
-        },
-        None,
-    );
-    vm.vm.push_transaction(tx);
-    let _ = vm.vm.inspect(Default::default(), VmExecutionMode::OneTx);
-
-    let keccak_count = vm
-        .vm
-        .state
-        .precompiles_processor
-        .precompile_cycles_history
-        .inner()
-        .iter()
-        .filter(|(precompile, _)| precompile == &PrecompileAddress::Keccak256)
-        .count();
-
-    assert!(keccak_count >= 1000);
+fn keccak() {
+    test_keccak::<Vm<_>>();
 }
 
 #[test]
-fn test_sha256() {
-    // Execute special transaction and check that at least 1000 `sha256` calls were made.
-    let contract = read_precompiles_contract();
-    let address = Address::random();
-    let mut vm = VmTesterBuilder::new()
-        .with_empty_in_memory_storage()
-        .with_random_rich_accounts(1)
-        .with_deployer()
-        .with_bootloader_gas_limit(BATCH_COMPUTATIONAL_GAS_LIMIT)
-        .with_execution_mode(TxExecutionMode::VerifyExecute)
-        .with_custom_contracts(vec![(contract, address, true)])
-        .build();
-
-    // calldata for `doSha256(1000)`.
-    let sha1000_calldata =
-        "5d0b4fb500000000000000000000000000000000000000000000000000000000000003e8";
-
-    let account = &mut vm.rich_accounts[0];
-    let tx = account.get_l2_tx_for_execute(
-        Execute {
-            contract_address: address,
-            calldata: hex::decode(sha1000_calldata).unwrap(),
-            value: Default::default(),
-            factory_deps: None,
-        },
-        None,
-    );
-    vm.vm.push_transaction(tx);
-    let _ = vm.vm.inspect(Default::default(), VmExecutionMode::OneTx);
-
-    let sha_count = vm
-        .vm
-        .state
-        .precompiles_processor
-        .precompile_cycles_history
-        .inner()
-        .iter()
-        .filter(|(precompile, _)| precompile == &PrecompileAddress::SHA256)
-        .count();
-
-    assert!(sha_count >= 1000);
+fn sha256() {
+    test_sha256::<Vm<_>>();
 }
 
 #[test]
-fn test_ecrecover() {
-    // Execute simple transfer and check that exactly 1 `ecrecover` call was made (it's done during tx validation).
+fn ecrecover() {
+    test_ecrecover::<Vm<_>>();
+}
+
+#[test]
+fn ecadd() {
+    test_ecadd::<Vm<_>>();
+}
+
+#[test]
+fn ecmul() {
+    test_ecmul::<Vm<_>>();
+}
+
+#[test]
+fn ecpairing() {
+    test_ecpairing::<Vm<_>>();
+}
+
+#[test]
+fn modexp() {
+    test_modexp::<Vm<_>>();
+}
+
+#[test]
+fn v28_precompiles_disabled() {
+    test_v28_precompiles_disabled::<Vm<_>>();
+}
+
+#[test]
+fn caching_ecrecover_result() {
     let mut vm = VmTesterBuilder::new()
-        .with_empty_in_memory_storage()
-        .with_random_rich_accounts(1)
-        .with_deployer()
-        .with_bootloader_gas_limit(BATCH_COMPUTATIONAL_GAS_LIMIT)
+        .with_rich_accounts(1)
         .with_execution_mode(TxExecutionMode::VerifyExecute)
-        .build();
+        .build::<Vm<_>>();
+    vm.vm.skip_signature_verification();
 
     let account = &mut vm.rich_accounts[0];
     let tx = account.get_l2_tx_for_execute(
         Execute {
-            contract_address: account.address,
-            calldata: Vec::new(),
-            value: Default::default(),
-            factory_deps: None,
+            contract_address: Some(account.address),
+            calldata: vec![],
+            value: 0.into(),
+            factory_deps: vec![],
         },
         None,
     );
     vm.vm.push_transaction(tx);
-    let _ = vm.vm.inspect(Default::default(), VmExecutionMode::OneTx);
 
-    let ecrecover_count = vm
-        .vm
-        .state
-        .precompiles_processor
-        .precompile_cycles_history
-        .inner()
-        .iter()
-        .filter(|(precompile, _)| precompile == &PrecompileAddress::Ecrecover)
-        .count();
+    assert!(vm.vm.world.precompiles.expected_ecrecover_call.is_some());
+    assert_eq!(vm.vm.world.precompiles.expected_calls.get(), 0);
 
-    assert_eq!(ecrecover_count, 1);
+    let exec_result = vm.vm.execute(InspectExecutionMode::OneTx);
+    assert!(!exec_result.result.is_failed(), "{exec_result:#?}");
+    assert_eq!(vm.vm.world.precompiles.expected_calls.get(), 1);
+
+    // Cycle stats should still be produced for the cached call
+    let ecrecover_count = exec_result.statistics.circuit_statistic.ecrecover
+        * ProtocolGeometry::latest()
+            .config()
+            .cycles_per_ecrecover_circuit as f32;
+    assert!((ecrecover_count - 1.0).abs() < 1e-4, "{ecrecover_count}");
 }

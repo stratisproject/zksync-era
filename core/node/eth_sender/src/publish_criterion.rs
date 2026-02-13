@@ -1,18 +1,14 @@
-use std::fmt;
+use std::{fmt, ops, time::Duration};
 
 use async_trait::async_trait;
 use chrono::Utc;
 use zksync_dal::{Connection, Core, CoreDal};
-use zksync_l1_contract_interface::{i_executor::structures::CommitBatchInfo, Tokenizable};
 use zksync_types::{
-    aggregated_operations::AggregatedActionType,
-    commitment::{L1BatchCommitmentMode, L1BatchWithMetadata},
-    ethabi,
-    pubdata_da::PubdataDA,
+    aggregated_operations::L1BatchAggregatedActionType, commitment::L1BatchWithMetadata,
     L1BatchNumber,
 };
 
-use super::{metrics::METRICS, utils::agg_l1_batch_base_cost};
+use super::metrics::METRICS;
 
 #[async_trait]
 pub trait L1BatchPublishCriterion: fmt::Debug + Send + Sync {
@@ -27,12 +23,13 @@ pub trait L1BatchPublishCriterion: fmt::Debug + Send + Sync {
         storage: &mut Connection<'_, Core>,
         consecutive_l1_batches: &[L1BatchWithMetadata],
         last_sealed_l1_batch: L1BatchNumber,
+        is_gateway: bool,
     ) -> Option<L1BatchNumber>;
 }
 
 #[derive(Debug)]
 pub struct NumberCriterion {
-    pub op: AggregatedActionType,
+    pub op: L1BatchAggregatedActionType,
     /// Maximum number of L1 batches to be packed together.
     pub limit: u32,
 }
@@ -48,13 +45,14 @@ impl L1BatchPublishCriterion for NumberCriterion {
         _storage: &mut Connection<'_, Core>,
         consecutive_l1_batches: &[L1BatchWithMetadata],
         _last_sealed_l1_batch: L1BatchNumber,
+        _is_gateway: bool,
     ) -> Option<L1BatchNumber> {
         let mut batch_numbers = consecutive_l1_batches
             .iter()
             .map(|batch| batch.header.number.0);
 
         let first = batch_numbers.next()?;
-        let last_batch_number = batch_numbers.last().unwrap_or(first);
+        let last_batch_number = batch_numbers.next_back().unwrap_or(first);
         let batch_count = last_batch_number - first + 1;
         if batch_count >= self.limit {
             let result = L1BatchNumber(first + self.limit - 1);
@@ -74,9 +72,9 @@ impl L1BatchPublishCriterion for NumberCriterion {
 
 #[derive(Debug)]
 pub struct TimestampDeadlineCriterion {
-    pub op: AggregatedActionType,
+    pub op: L1BatchAggregatedActionType,
     /// Maximum L1 batch age in seconds. Once reached, we pack and publish all the available L1 batches.
-    pub deadline_seconds: u64,
+    pub deadline: Duration,
     /// If `max_allowed_lag` is `Some(_)` and last batch sent to L1 is more than `max_allowed_lag` behind,
     /// it means that sender is lagging significantly and we shouldn't apply this criteria to use all capacity
     /// and avoid packing small ranges.
@@ -94,6 +92,7 @@ impl L1BatchPublishCriterion for TimestampDeadlineCriterion {
         _storage: &mut Connection<'_, Core>,
         consecutive_l1_batches: &[L1BatchWithMetadata],
         last_sealed_l1_batch: L1BatchNumber,
+        _is_gateway: bool,
     ) -> Option<L1BatchNumber> {
         let first_l1_batch = consecutive_l1_batches.iter().next()?;
         let last_l1_batch_number = consecutive_l1_batches.iter().last()?.header.number.0;
@@ -104,7 +103,7 @@ impl L1BatchPublishCriterion for TimestampDeadlineCriterion {
         }
         let oldest_l1_batch_age_seconds =
             Utc::now().timestamp() as u64 - first_l1_batch.header.timestamp;
-        if oldest_l1_batch_age_seconds >= self.deadline_seconds {
+        if oldest_l1_batch_age_seconds >= self.deadline.as_secs() {
             let result = consecutive_l1_batches
                 .last()
                 .unwrap_or(first_l1_batch)
@@ -123,32 +122,93 @@ impl L1BatchPublishCriterion for TimestampDeadlineCriterion {
     }
 }
 
-#[derive(Debug)]
-pub struct GasCriterion {
-    pub op: AggregatedActionType,
-    pub gas_limit: u32,
+#[derive(Debug, Clone, Copy)]
+pub enum GasCriterionKind {
+    CommitValidium,
+    Execute,
 }
 
-impl GasCriterion {
-    pub fn new(op: AggregatedActionType, gas_limit: u32) -> GasCriterion {
-        GasCriterion { op, gas_limit }
+impl From<GasCriterionKind> for L1BatchAggregatedActionType {
+    fn from(value: GasCriterionKind) -> Self {
+        match value {
+            GasCriterionKind::CommitValidium => L1BatchAggregatedActionType::Commit,
+            GasCriterionKind::Execute => L1BatchAggregatedActionType::Execute,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct L1GasCriterion {
+    pub gas_limit: u64,
+    pub kind: GasCriterionKind,
+}
+
+impl L1GasCriterion {
+    pub fn new(gas_limit: u64, kind: GasCriterionKind) -> L1GasCriterion {
+        L1GasCriterion { gas_limit, kind }
     }
 
-    async fn get_gas_amount(
-        &self,
+    pub async fn total_execute_gas_amount(
+        storage: &mut Connection<'_, Core>,
+        batch_numbers: ops::RangeInclusive<L1BatchNumber>,
+        dependency_roots_per_batch: Vec<u64>,
+        is_gateway: bool,
+    ) -> u64 {
+        let costs = GasConsts::execute_costs(is_gateway);
+        let mut total = costs.base;
+
+        let batch_range = batch_numbers.start().0..=batch_numbers.end().0;
+        for (batch_number, dependency_roots) in batch_range.zip(dependency_roots_per_batch) {
+            total +=
+                Self::get_execute_gas_amount(storage, batch_number.into(), dependency_roots, &costs)
+                    .await
+        }
+
+        total
+    }
+
+    pub fn total_precommit_gas_amount(is_gateway: bool, txs_len: usize) -> u64 {
+        let costs = GasConsts::precommit_costs(is_gateway);
+        costs.base + costs.per_tx * txs_len as u64
+    }
+
+    pub fn total_proof_gas_amount(is_gateway: bool) -> u64 {
+        GasConsts::proof_costs(is_gateway)
+    }
+
+    // Return the gas limit for the Validium part of commit.
+    // Gas limit for DA part will be adjusted later in eth_tx_manager,
+    // when the pubdata price will be known
+    pub fn total_commit_validium_gas_amount(
+        batch_numbers: ops::RangeInclusive<L1BatchNumber>,
+        is_gateway: bool,
+    ) -> u64 {
+        let costs = GasConsts::commit_costs(is_gateway);
+        costs.base
+            + ((batch_numbers.end().0 - batch_numbers.start().0 + 1) as u64) * costs.per_batch
+    }
+
+    async fn get_execute_gas_amount(
         storage: &mut Connection<'_, Core>,
         batch_number: L1BatchNumber,
-    ) -> u32 {
-        storage
+        dependency_roots_number: u64,
+        costs: &ExecuteCosts,
+    ) -> u64 {
+        let header = storage
             .blocks_dal()
-            .get_l1_batches_predicted_gas(batch_number..=batch_number, self.op)
+            .get_l1_batch_header(batch_number)
             .await
             .unwrap()
+            .unwrap_or_else(|| panic!("Missing L1 batch header in DB for #{batch_number}"));
+
+        costs.per_batch
+            + u64::from(header.l1_tx_count) * costs.per_l1_l2_tx
+            + costs.per_interop_root * dependency_roots_number
     }
 }
 
 #[async_trait]
-impl L1BatchPublishCriterion for GasCriterion {
+impl L1BatchPublishCriterion for L1GasCriterion {
     fn name(&self) -> &'static str {
         "gas_limit"
     }
@@ -158,18 +218,43 @@ impl L1BatchPublishCriterion for GasCriterion {
         storage: &mut Connection<'_, Core>,
         consecutive_l1_batches: &[L1BatchWithMetadata],
         _last_sealed_l1_batch: L1BatchNumber,
+        is_gateway: bool,
     ) -> Option<L1BatchNumber> {
-        let base_cost = agg_l1_batch_base_cost(self.op);
+        let execute_costs = GasConsts::execute_costs(is_gateway);
+        let commit_costs = GasConsts::commit_costs(is_gateway);
+
+        let aggr_cost = match self.kind {
+            GasCriterionKind::Execute => execute_costs.base,
+            GasCriterionKind::CommitValidium => commit_costs.base,
+        };
         assert!(
-            self.gas_limit > base_cost,
+            self.gas_limit > aggr_cost,
             "Config max gas cost for operations is too low"
         );
         // We're not sure our predictions are accurate, so it's safer to lower the gas limit by 10%
-        let mut gas_left = (self.gas_limit as f64 * 0.9).round() as u32 - base_cost;
+        let mut gas_left = (self.gas_limit as f64 * 0.9).round() as u64 - aggr_cost;
 
         let mut last_l1_batch = None;
         for (index, l1_batch) in consecutive_l1_batches.iter().enumerate() {
-            let batch_gas = self.get_gas_amount(storage, l1_batch.header.number).await;
+            let interop_roots_number = storage
+                .interop_root_dal()
+                .get_interop_roots_batch(l1_batch.header.number)
+                .await
+                .unwrap()
+                .len() as u64;
+
+            let batch_gas = match self.kind {
+                GasCriterionKind::Execute => {
+                    Self::get_execute_gas_amount(
+                        storage,
+                        l1_batch.header.number,
+                        interop_roots_number,
+                        &execute_costs,
+                    )
+                    .await
+                }
+                GasCriterionKind::CommitValidium => commit_costs.per_batch,
+            };
             if batch_gas >= gas_left {
                 if index == 0 {
                     panic!(
@@ -185,70 +270,154 @@ impl L1BatchPublishCriterion for GasCriterion {
         }
 
         if let Some(last_l1_batch) = last_l1_batch {
+            let op: L1BatchAggregatedActionType = self.kind.into();
             let first_l1_batch_number = consecutive_l1_batches.first().unwrap().header.number.0;
             tracing::debug!(
                 "`gas_limit` publish criterion (gas={}) triggered for op {} with L1 batch range {:?}",
                 self.gas_limit - gas_left,
-                self.op,
+                op,
                 first_l1_batch_number..=last_l1_batch.0
             );
-            METRICS.block_aggregation_reason[&(self.op, "gas").into()].inc();
+            METRICS.block_aggregation_reason[&(op, "gas").into()].inc();
         }
         last_l1_batch
     }
 }
 
 #[derive(Debug)]
-pub struct DataSizeCriterion {
-    pub op: AggregatedActionType,
-    pub data_limit: usize,
-    pub pubdata_da: PubdataDA,
-    pub commitment_mode: L1BatchCommitmentMode,
+struct GasConsts;
+
+#[derive(Debug)]
+struct CommitGasConsts {
+    base: u64,
+    per_batch: u64,
 }
 
-#[async_trait]
-impl L1BatchPublishCriterion for DataSizeCriterion {
-    fn name(&self) -> &'static str {
-        "data_size"
+#[derive(Debug)]
+struct ExecuteCosts {
+    base: u64,
+    per_batch: u64,
+    per_l1_l2_tx: u64,
+    per_interop_root: u64,
+}
+
+#[derive(Debug)]
+struct PrecommitCosts {
+    base: u64,
+    per_tx: u64,
+}
+
+impl GasConsts {
+    /// Base gas cost of processing aggregated `Execute` operation.
+    /// It's applicable iff SL is Ethereum.
+    const AGGR_L1_BATCH_EXECUTE_BASE_COST: u64 = 210_000;
+    /// Base gas cost of processing aggregated `Execute` operation.
+    /// It's applicable if SL is  Gateway.
+    const AGGR_GATEWAY_BATCH_EXECUTE_BASE_COST: u64 = 410_000;
+
+    /// Base gas cost of processing aggregated `Commit` operation.
+    /// It's applicable if SL is Ethereum.
+    const AGGR_L1_BATCH_COMMIT_BASE_COST: u64 = 242_000;
+
+    /// Additional gas cost of processing `Commit` operation per batch.
+    /// It's applicable if SL is Ethereum.
+    const L1_BATCH_COMMIT_BASE_COST: u64 = 31_000;
+
+    /// Additional gas cost of processing `Commit` operation per batch.
+    /// It's applicable if SL is Gateway.
+    const AGGR_GATEWAY_BATCH_COMMIT_BASE_COST: u64 = 150_000;
+
+    /// Additional gas cost of processing `Commit` operation per batch.
+    /// It's applicable if SL is Gateway.
+    const GATEWAY_BATCH_COMMIT_BASE_COST: u64 = 200_000;
+
+    /// All gas cost of processing `PROVE` operation per batch.
+    /// It's applicable if SL is GATEWAY.
+    /// TODO calculate it properly
+    const GATEWAY_BATCH_PROOF_GAS_COST: u64 = 1_600_000;
+
+    /// All gas cost of processing `PROVE` operation per batch.
+    /// It's applicable if SL is Ethereum.
+    const L1_BATCH_PROOF_GAS_COST_ETHEREUM: u64 = 800_000;
+
+    /// Base gas cost of processing `EXECUTION` operation per batch.
+    /// It's applicable if SL is GATEWAY.
+    const GATEWAY_BATCH_EXECUTION_COST: u64 = 100_000;
+    /// Gas cost of processing `l1_operation` in batch.
+    /// It's applicable if SL is GATEWAY.
+    const GATEWAY_L1_OPERATION_COST: u64 = 4_000;
+
+    /// Gas cost of processing `interop_root` in batch.
+    /// It's applicable if SL is GATEWAY.
+    const GATEWAY_INTEROP_ROOT_COST: u64 = 5_500;
+
+    /// Additional gas cost of processing `Execute` operation per batch.
+    /// It's applicable iff SL is Ethereum.
+    const L1_BATCH_EXECUTE_BASE_COST: u64 = 50_000;
+
+    /// Additional gas cost of processing `Execute` operation per L1->L2 tx.
+    /// It's applicable iff SL is Ethereum.
+    const L1_OPERATION_EXECUTE_COST: u64 = 15_000;
+
+    /// Base gas cost of processing `Precommit` operation.
+    const PRECOMMIT_BASE_COST: u64 = 200_000;
+
+    /// Additional gas cost of processing `Precommit` operation per tx.
+    const PRECOMMIT_PER_TX_COST: u64 = 10_000;
+
+    /// Gas cost of processing `interop_root` in batch.
+    /// It's applicable if SL is Ethereum.
+    const L1_INTEROP_ROOT_COST: u64 = 4_500;
+
+    fn commit_costs(is_gateway: bool) -> CommitGasConsts {
+        if is_gateway {
+            CommitGasConsts {
+                base: Self::GATEWAY_BATCH_COMMIT_BASE_COST,
+                per_batch: Self::AGGR_GATEWAY_BATCH_COMMIT_BASE_COST,
+            }
+        } else {
+            CommitGasConsts {
+                base: Self::L1_BATCH_COMMIT_BASE_COST,
+                per_batch: Self::AGGR_L1_BATCH_COMMIT_BASE_COST,
+            }
+        }
     }
 
-    async fn last_l1_batch_to_publish(
-        &mut self,
-        _storage: &mut Connection<'_, Core>,
-        consecutive_l1_batches: &[L1BatchWithMetadata],
-        _last_sealed_l1_batch: L1BatchNumber,
-    ) -> Option<L1BatchNumber> {
-        const STORED_BLOCK_INFO_SIZE: usize = 96; // size of `StoredBlockInfo` solidity struct
-        let mut data_size_left = self.data_limit - STORED_BLOCK_INFO_SIZE;
-
-        for (index, l1_batch) in consecutive_l1_batches.iter().enumerate() {
-            // TODO (PLA-771): Make sure that this estimation is correct.
-            let commit_token =
-                CommitBatchInfo::new(self.commitment_mode, l1_batch, self.pubdata_da).into_token();
-            let l1_commit_data_size = ethabi::encode(&[commit_token]).len();
-
-            if data_size_left < l1_commit_data_size {
-                if index == 0 {
-                    panic!(
-                        "L1 batch #{} requires {} data, which is more than the range limit of {}",
-                        l1_batch.header.number, l1_commit_data_size, self.data_limit
-                    );
-                }
-
-                let first_l1_batch_number = consecutive_l1_batches.first().unwrap().header.number.0;
-                let output = l1_batch.header.number - 1;
-                tracing::debug!(
-                    "`data_size` publish criterion (data={}) triggered for op {} with L1 batch range {:?}",
-                    self.data_limit - data_size_left,
-                    self.op,
-                    first_l1_batch_number..=output.0
-                );
-                METRICS.block_aggregation_reason[&(self.op, "data_size").into()].inc();
-                return Some(output);
-            }
-            data_size_left -= l1_commit_data_size;
+    fn proof_costs(is_gateway: bool) -> u64 {
+        if is_gateway {
+            Self::GATEWAY_BATCH_PROOF_GAS_COST
+        } else {
+            Self::L1_BATCH_PROOF_GAS_COST_ETHEREUM
         }
+    }
 
-        None
+    fn precommit_costs(is_gateway: bool) -> PrecommitCosts {
+        let mut costs = PrecommitCosts {
+            base: Self::PRECOMMIT_BASE_COST,
+            per_tx: Self::PRECOMMIT_PER_TX_COST,
+        };
+        if is_gateway {
+            costs.base *= 2;
+            costs.per_tx *= 2;
+        }
+        costs
+    }
+
+    fn execute_costs(is_gateway: bool) -> ExecuteCosts {
+        if is_gateway {
+            ExecuteCosts {
+                base: Self::AGGR_GATEWAY_BATCH_EXECUTE_BASE_COST,
+                per_batch: Self::GATEWAY_BATCH_EXECUTION_COST,
+                per_l1_l2_tx: Self::GATEWAY_L1_OPERATION_COST,
+                per_interop_root: Self::GATEWAY_INTEROP_ROOT_COST,
+            }
+        } else {
+            ExecuteCosts {
+                base: Self::AGGR_L1_BATCH_EXECUTE_BASE_COST,
+                per_batch: Self::L1_BATCH_EXECUTE_BASE_COST,
+                per_l1_l2_tx: Self::L1_OPERATION_EXECUTE_COST,
+                per_interop_root: Self::L1_INTEROP_ROOT_COST,
+            }
+        }
     }
 }

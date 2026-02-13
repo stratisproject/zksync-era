@@ -1,14 +1,21 @@
-pub use self::vm::Vm;
+pub use zksync_vm2::interface;
 
-mod bootloader_state;
+pub(crate) use self::version::FastVmVersion;
+pub use self::{
+    tracers::{
+        CallTracer, FastValidationTracer, FullValidationTracer, StorageInvocationsTracer,
+        ValidationTracer,
+    },
+    vm::Vm,
+};
+
 mod bytecode;
 mod events;
 mod glue;
-mod hook;
-mod initial_bootloader_memory;
-mod pubdata;
-mod refund;
 #[cfg(test)]
 mod tests;
-mod transaction_data;
+mod tracers;
+mod utils;
+mod version;
 mod vm;
+mod world;

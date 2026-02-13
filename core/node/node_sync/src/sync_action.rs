@@ -33,6 +33,18 @@ impl ActionQueueSender {
         Ok(())
     }
 
+    /// Pushes a single action into the queue without checking validity of the sequence.
+    ///
+    /// Useful to simulate situations where only a part of the sequence was executed on the node.
+    #[cfg(test)]
+    pub async fn push_action_unchecked(&self, action: SyncAction) -> anyhow::Result<()> {
+        self.0
+            .send(action)
+            .await
+            .map_err(|_| anyhow::anyhow!("node action processor stopped"))?;
+        Ok(())
+    }
+
     /// Checks whether the action sequence is valid.
     /// Returned error is meant to be used as a panic message, since an invalid sequence represents an unrecoverable
     /// error. This function itself does not panic for the ease of testing.
@@ -137,6 +149,10 @@ impl ActionQueue {
             .ok()?;
         self.peeked.clone()
     }
+
+    pub(super) fn validate_ready_for_next_block(&self) {
+        assert!(self.peeked.is_none());
+    }
 }
 
 /// An instruction for the ExternalIO to request a certain action from the state keeper.
@@ -182,10 +198,9 @@ mod tests {
                 validation_computational_gas_limit: u32::MAX,
                 operator_address: Address::default(),
                 fee_input: BatchFeeInput::default(),
-                first_l2_block: L2BlockParams {
-                    timestamp: 1,
-                    virtual_blocks: 1,
-                },
+                first_l2_block: L2BlockParams::new(1000),
+                pubdata_params: Default::default(),
+                pubdata_limit: Some(100_000),
             },
             number: L1BatchNumber(1),
             first_l2_block_number: L2BlockNumber(1),
@@ -194,10 +209,7 @@ mod tests {
 
     fn l2_block() -> SyncAction {
         SyncAction::L2Block {
-            params: L2BlockParams {
-                timestamp: 1,
-                virtual_blocks: 1,
-            },
+            params: L2BlockParams::new(1000),
             number: 1.into(),
         }
     }

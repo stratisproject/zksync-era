@@ -9,22 +9,25 @@
 use std::{collections::HashMap, convert::TryFrom};
 
 use serde::{Deserialize, Serialize};
-pub use zksync_basic_types::commitment::L1BatchCommitmentMode;
+use thiserror::Error;
+pub use zksync_basic_types::commitment::{L1BatchCommitmentMode, PubdataParams, PubdataType};
 use zksync_contracts::BaseSystemContractsHashes;
+use zksync_crypto_primitives::hasher::{keccak::KeccakHasher, Hasher};
 use zksync_mini_merkle_tree::MiniMerkleTree;
 use zksync_system_constants::{
-    KNOWN_CODES_STORAGE_ADDRESS, L2_TO_L1_LOGS_TREE_ROOT_KEY, STATE_DIFF_HASH_KEY,
+    KNOWN_CODES_STORAGE_ADDRESS, L2_TO_L1_LOGS_TREE_ROOT_KEY, STATE_DIFF_HASH_KEY_PRE_GATEWAY,
     ZKPORTER_IS_AVAILABLE,
 };
-use zksync_utils::u256_to_h256;
 
 use crate::{
     blob::num_blobs_required,
     block::{L1BatchHeader, L1BatchTreeData},
+    ethabi,
     l2_to_l1_log::{
-        l2_to_l1_logs_tree_size, parse_system_logs_for_blob_hashes, L2ToL1Log, SystemL2ToL1Log,
-        UserL2ToL1Log,
+        l2_to_l1_logs_tree_size, parse_system_logs_for_blob_hashes_pre_gateway, L2ToL1Log,
+        SystemL2ToL1Log, UserL2ToL1Log,
     },
+    u256_to_h256,
     web3::keccak256,
     writes::{
         compress_state_diffs, InitialStorageWrite, RepeatedStorageWrite, StateDiffRecord,
@@ -35,6 +38,21 @@ use crate::{
 
 #[cfg(test)]
 mod tests;
+
+#[derive(Debug, Error)]
+pub enum CommitmentValidationError {
+    #[error("State diff hash mismatch: expected {expected}, got {actual}")]
+    StateDiffHashMismatch { expected: H256, actual: H256 },
+    #[error("Blob linear hashes mismatch: expected {expected:?}, got {actual:?}")]
+    BlobLinearHashesMismatch {
+        expected: Vec<H256>,
+        actual: Vec<H256>,
+    },
+    #[error("L2 L1 logs tree root mismatch: expected {expected}, got {actual}")]
+    L2L1LogsTreeRootMismatch { expected: H256, actual: H256 },
+    #[error("Serialized size for BlockPassThroughData is bigger than expected: expected {expected}, got {actual}")]
+    SerializedSizeMismatch { expected: usize, actual: usize },
+}
 
 /// Type that can be serialized for commitment.
 pub trait SerializeCommitment {
@@ -72,6 +90,31 @@ pub fn serialize_commitments<I: SerializeCommitment>(values: &[I]) -> Vec<u8> {
     input
 }
 
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct PriorityOpsMerkleProof {
+    pub left_path: Vec<H256>,
+    pub right_path: Vec<H256>,
+    pub hashes: Vec<H256>,
+}
+
+impl PriorityOpsMerkleProof {
+    pub fn into_token(&self) -> ethabi::Token {
+        let array_into_token = |array: &[H256]| {
+            ethabi::Token::Array(
+                array
+                    .iter()
+                    .map(|hash| ethabi::Token::FixedBytes(hash.as_bytes().to_vec()))
+                    .collect(),
+            )
+        };
+        ethabi::Token::Tuple(vec![
+            array_into_token(&self.left_path),
+            array_into_token(&self.right_path),
+            array_into_token(&self.hashes),
+        ])
+    }
+}
+
 /// Precalculated data for the L1 batch that was used in commitment and L1 transaction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct L1BatchMetadata {
@@ -85,6 +128,7 @@ pub struct L1BatchMetadata {
     pub aux_data_hash: H256,
     pub meta_parameters_hash: H256,
     pub pass_through_data_hash: H256,
+
     /// The commitment to the final events queue state after the batch is committed.
     /// Practically, it is a commitment to all events that happened on L2 during the batch execution.
     pub events_queue_commitment: Option<H256>,
@@ -92,6 +136,16 @@ pub struct L1BatchMetadata {
     /// commitment to the transactions in the batch.
     pub bootloader_initial_content_commitment: Option<H256>,
     pub state_diffs_compressed: Vec<u8>,
+    /// Hash of packed state diffs. It's present only for post-gateway batches.
+    pub state_diff_hash: Option<H256>,
+    /// Root hash of the local logs tree. Tree contains logs that were produced on this chain.
+    /// It's present only for post-gateway batches.
+    pub local_root: Option<H256>,
+    /// Root hash of the aggregated logs tree. Tree aggregates `local_root`s of chains that settle on this chain.
+    /// It's present only for post-gateway batches.
+    pub aggregation_root: Option<H256>,
+    /// Data Availability inclusion proof, that has to be verified on the settlement layer.
+    pub da_inclusion_data: Option<Vec<u8>>,
 }
 
 impl L1BatchMetadata {
@@ -265,6 +319,13 @@ pub struct L1BatchAuxiliaryCommonOutput {
     protocol_version: ProtocolVersionId,
 }
 
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+#[cfg_attr(test, derive(Serialize, Deserialize))]
+pub struct BlobHash {
+    pub commitment: H256,
+    pub linear_hash: H256,
+}
+
 /// Block Output produced by Virtual Machine
 #[derive(Debug, Clone, Eq, PartialEq)]
 #[cfg_attr(test, derive(Serialize, Deserialize))]
@@ -283,13 +344,17 @@ pub enum L1BatchAuxiliaryOutput {
         state_diffs_compressed: Vec<u8>,
         state_diffs_hash: H256,
         aux_commitments: AuxCommitments,
-        blob_linear_hashes: Vec<H256>,
-        blob_commitments: Vec<H256>,
+        blob_hashes: Vec<BlobHash>,
+        aggregation_root: H256,
+        local_root: H256,
     },
 }
 
 impl L1BatchAuxiliaryOutput {
-    fn new(input: CommitmentInput) -> Self {
+    fn new(
+        input: CommitmentInput,
+        disable_sanity_checks: bool,
+    ) -> Result<Self, CommitmentValidationError> {
         match input {
             CommitmentInput::PreBoojum {
                 common: common_input,
@@ -319,31 +384,37 @@ impl L1BatchAuxiliaryOutput {
                 let repeated_writes_compressed = pre_boojum_serialize_commitments(&repeated_writes);
                 let repeated_writes_hash = H256::from(keccak256(&repeated_writes_compressed));
 
-                Self::PreBoojum {
+                Ok(Self::PreBoojum {
                     common: common_output,
                     l2_l1_logs_linear_hash,
                     initial_writes_compressed,
                     initial_writes_hash,
                     repeated_writes_compressed,
                     repeated_writes_hash,
-                }
+                })
             }
             CommitmentInput::PostBoojum {
                 common: common_input,
                 system_logs,
                 state_diffs,
                 aux_commitments,
-                blob_commitments,
+                blob_hashes,
+                aggregation_root,
             } => {
                 let l2_l1_logs_compressed = serialize_commitments(&common_input.l2_to_l1_logs);
                 let merkle_tree_leaves = l2_l1_logs_compressed
                     .chunks(UserL2ToL1Log::SERIALIZED_SIZE)
                     .map(|chunk| <[u8; UserL2ToL1Log::SERIALIZED_SIZE]>::try_from(chunk).unwrap());
-                let l2_l1_logs_merkle_root = MiniMerkleTree::new(
+                let local_root = MiniMerkleTree::new(
                     merkle_tree_leaves,
                     Some(l2_to_l1_logs_tree_size(common_input.protocol_version)),
                 )
                 .merkle_root();
+                let l2_l1_logs_merkle_root = if common_input.protocol_version.is_pre_gateway() {
+                    local_root
+                } else {
+                    KeccakHasher.compress(&local_root, &aggregation_root)
+                };
 
                 let common_output = L1BatchAuxiliaryCommonOutput {
                     l2_l1_logs_merkle_root,
@@ -357,22 +428,37 @@ impl L1BatchAuxiliaryOutput {
                 let state_diffs_hash = H256::from(keccak256(&(state_diffs_packed)));
                 let state_diffs_compressed = compress_state_diffs(state_diffs);
 
-                let blob_linear_hashes =
-                    parse_system_logs_for_blob_hashes(&common_input.protocol_version, &system_logs);
-
                 // Sanity checks. System logs are empty for the genesis batch, so we can't do checks for it.
-                if !system_logs.is_empty() {
-                    let state_diff_hash_from_logs = system_logs
-                        .iter()
-                        .find_map(|log| {
-                            (log.0.key == u256_to_h256(STATE_DIFF_HASH_KEY.into()))
-                                .then_some(log.0.value)
-                        })
-                        .expect("Failed to find state diff hash in system logs");
-                    assert_eq!(
-                        state_diffs_hash, state_diff_hash_from_logs,
-                        "State diff hash mismatch"
-                    );
+                if !system_logs.is_empty() && !disable_sanity_checks {
+                    if common_input.protocol_version.is_pre_gateway() {
+                        let state_diff_hash_from_logs = system_logs
+                            .iter()
+                            .find_map(|log| {
+                                (log.0.key == u256_to_h256(STATE_DIFF_HASH_KEY_PRE_GATEWAY.into()))
+                                    .then_some(log.0.value)
+                            })
+                            .expect("Failed to find state diff hash in system logs");
+                        if state_diffs_hash != state_diff_hash_from_logs {
+                            return Err(CommitmentValidationError::StateDiffHashMismatch {
+                                expected: state_diff_hash_from_logs,
+                                actual: state_diffs_hash,
+                            });
+                        }
+
+                        let blob_linear_hashes_from_logs =
+                            parse_system_logs_for_blob_hashes_pre_gateway(
+                                &common_input.protocol_version,
+                                &system_logs,
+                            );
+                        let blob_linear_hashes: Vec<_> =
+                            blob_hashes.iter().map(|b| b.linear_hash).collect();
+                        if blob_linear_hashes != blob_linear_hashes_from_logs {
+                            return Err(CommitmentValidationError::BlobLinearHashesMismatch {
+                                expected: blob_linear_hashes_from_logs,
+                                actual: blob_linear_hashes,
+                            });
+                        }
+                    }
 
                     let l2_to_l1_logs_tree_root_from_logs = system_logs
                         .iter()
@@ -381,28 +467,50 @@ impl L1BatchAuxiliaryOutput {
                                 .then_some(log.0.value)
                         })
                         .expect("Failed to find L2 to L1 logs tree root in system logs");
-                    assert_eq!(
-                        l2_l1_logs_merkle_root, l2_to_l1_logs_tree_root_from_logs,
-                        "L2 L1 logs tree root mismatch"
-                    );
+                    if l2_l1_logs_merkle_root != l2_to_l1_logs_tree_root_from_logs {
+                        return Err(CommitmentValidationError::L2L1LogsTreeRootMismatch {
+                            expected: l2_to_l1_logs_tree_root_from_logs,
+                            actual: l2_l1_logs_merkle_root,
+                        });
+                    }
                 }
 
-                assert_eq!(
-                    blob_linear_hashes.len(),
-                    blob_commitments.len(),
-                    "Blob linear hashes and commitments have different lengths"
-                );
-
-                Self::PostBoojum {
+                Ok(Self::PostBoojum {
                     common: common_output,
                     system_logs_linear_hash,
                     state_diffs_compressed,
                     state_diffs_hash,
                     aux_commitments,
-                    blob_linear_hashes,
-                    blob_commitments,
-                }
+                    blob_hashes,
+                    local_root,
+                    aggregation_root,
+                })
             }
+        }
+    }
+
+    pub fn local_root(&self) -> H256 {
+        match self {
+            Self::PreBoojum { common, .. } => common.l2_l1_logs_merkle_root,
+            Self::PostBoojum { local_root, .. } => *local_root,
+        }
+    }
+
+    pub fn aggregation_root(&self) -> H256 {
+        match self {
+            Self::PreBoojum { .. } => H256::zero(),
+            Self::PostBoojum {
+                aggregation_root, ..
+            } => *aggregation_root,
+        }
+    }
+
+    pub fn state_diff_hash(&self) -> H256 {
+        match self {
+            Self::PreBoojum { .. } => H256::zero(),
+            Self::PostBoojum {
+                state_diffs_hash, ..
+            } => *state_diffs_hash,
         }
     }
 
@@ -426,8 +534,7 @@ impl L1BatchAuxiliaryOutput {
                 system_logs_linear_hash,
                 state_diffs_hash,
                 aux_commitments,
-                blob_linear_hashes,
-                blob_commitments,
+                blob_hashes,
                 ..
             } => {
                 result.extend(system_logs_linear_hash.as_bytes());
@@ -439,9 +546,9 @@ impl L1BatchAuxiliaryOutput {
                 );
                 result.extend(aux_commitments.events_queue_commitment.as_bytes());
 
-                for i in 0..blob_commitments.len() {
-                    result.extend(blob_linear_hashes[i].as_bytes());
-                    result.extend(blob_commitments[i].as_bytes());
+                for b in blob_hashes {
+                    result.extend(b.linear_hash.as_bytes());
+                    result.extend(b.commitment.as_bytes());
                 }
             }
         }
@@ -467,6 +574,7 @@ pub struct L1BatchMetaParameters {
     pub zkporter_is_available: bool,
     pub bootloader_code_hash: H256,
     pub default_aa_code_hash: H256,
+    pub evm_emulator_code_hash: Option<H256>,
     pub protocol_version: Option<ProtocolVersionId>,
 }
 
@@ -478,14 +586,12 @@ impl L1BatchMetaParameters {
         result.extend(self.bootloader_code_hash.as_bytes());
         result.extend(self.default_aa_code_hash.as_bytes());
 
-        if self
-            .protocol_version
-            .map_or(false, |ver| ver.is_post_1_5_0())
-        {
-            // EVM simulator hash for now is the same as the default AA hash.
-            result.extend(self.default_aa_code_hash.as_bytes());
+        if self.protocol_version.is_some_and(|ver| ver.is_post_1_5_0()) {
+            let evm_emulator_code_hash = self
+                .evm_emulator_code_hash
+                .unwrap_or(self.default_aa_code_hash);
+            result.extend(evm_emulator_code_hash.as_bytes());
         }
-
         result
     }
 
@@ -508,7 +614,7 @@ struct L1BatchPassThroughData {
 }
 
 impl L1BatchPassThroughData {
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, CommitmentValidationError> {
         // We assume that currently we have only two shared state: Rollup and ZkPorter where porter is always zero
         const SERIALIZED_SIZE: usize = 8 + 32 + 8 + 32;
         let mut result = Vec::with_capacity(SERIALIZED_SIZE);
@@ -516,16 +622,17 @@ impl L1BatchPassThroughData {
             result.extend_from_slice(&state.last_leaf_index.to_be_bytes());
             result.extend_from_slice(state.root_hash.as_bytes());
         }
-        assert_eq!(
-            result.len(),
-            SERIALIZED_SIZE,
-            "Serialized size for BlockPassThroughData is bigger than expected"
-        );
-        result
+        if result.len() != SERIALIZED_SIZE {
+            return Err(CommitmentValidationError::SerializedSizeMismatch {
+                expected: SERIALIZED_SIZE,
+                actual: result.len(),
+            });
+        }
+        Ok(result)
     }
 
-    pub fn hash(&self) -> H256 {
-        H256::from_slice(&keccak256(&self.to_bytes()))
+    pub fn hash(&self) -> Result<H256, CommitmentValidationError> {
+        Ok(H256::from_slice(&keccak256(&self.to_bytes()?)))
     }
 }
 
@@ -546,15 +653,21 @@ pub struct L1BatchCommitmentHash {
 }
 
 impl L1BatchCommitment {
-    pub fn new(input: CommitmentInput) -> Self {
+    pub fn new(
+        input: CommitmentInput,
+        // Sanity checks are disabled for external node, because it's a sign of incorrect
+        // state inside external node, the commitment correctness will be double checked on l1
+        disable_sanity_checks: bool,
+    ) -> Result<Self, CommitmentValidationError> {
         let meta_parameters = L1BatchMetaParameters {
             zkporter_is_available: ZKPORTER_IS_AVAILABLE,
             bootloader_code_hash: input.common().bootloader_code_hash,
             default_aa_code_hash: input.common().default_aa_code_hash,
+            evm_emulator_code_hash: input.common().evm_emulator_code_hash,
             protocol_version: Some(input.common().protocol_version),
         };
 
-        Self {
+        Ok(Self {
             pass_through_data: L1BatchPassThroughData {
                 shared_states: vec![
                     RootState {
@@ -568,9 +681,9 @@ impl L1BatchCommitment {
                     },
                 ],
             },
-            auxiliary_output: L1BatchAuxiliaryOutput::new(input),
+            auxiliary_output: L1BatchAuxiliaryOutput::new(input, disable_sanity_checks)?,
             meta_parameters,
-        }
+        })
     }
 
     pub fn meta_parameters(&self) -> L1BatchMetaParameters {
@@ -590,9 +703,9 @@ impl L1BatchCommitment {
         }
     }
 
-    pub fn hash(&self) -> L1BatchCommitmentHash {
+    pub fn hash(&self) -> Result<L1BatchCommitmentHash, CommitmentValidationError> {
         let mut result = vec![];
-        let pass_through_data_hash = self.pass_through_data.hash();
+        let pass_through_data_hash = self.pass_through_data.hash()?;
         result.extend_from_slice(pass_through_data_hash.as_bytes());
         let metadata_hash = self.meta_parameters.hash();
         result.extend_from_slice(metadata_hash.as_bytes());
@@ -600,15 +713,15 @@ impl L1BatchCommitment {
         result.extend_from_slice(auxiliary_output_hash.as_bytes());
         let hash = keccak256(&result);
         let commitment = H256::from_slice(&hash);
-        L1BatchCommitmentHash {
+        Ok(L1BatchCommitmentHash {
             pass_through_data: pass_through_data_hash,
             aux_output: auxiliary_output_hash,
             meta_parameters: metadata_hash,
             commitment,
-        }
+        })
     }
 
-    pub fn artifacts(&self) -> L1BatchCommitmentArtifacts {
+    pub fn artifacts(&self) -> Result<L1BatchCommitmentArtifacts, CommitmentValidationError> {
         let (compressed_initial_writes, compressed_repeated_writes, compressed_state_diffs) =
             match &self.auxiliary_output {
                 L1BatchAuxiliaryOutput::PostBoojum {
@@ -626,15 +739,18 @@ impl L1BatchCommitment {
                 ),
             };
 
-        L1BatchCommitmentArtifacts {
-            commitment_hash: self.hash(),
+        Ok(L1BatchCommitmentArtifacts {
+            commitment_hash: self.hash()?,
             l2_l1_merkle_root: self.l2_l1_logs_merkle_root(),
             compressed_state_diffs,
             zkporter_is_available: self.meta_parameters.zkporter_is_available,
             aux_commitments: self.aux_commitments(),
             compressed_initial_writes,
             compressed_repeated_writes,
-        }
+            local_root: self.auxiliary_output.local_root(),
+            aggregation_root: self.auxiliary_output.aggregation_root(),
+            state_diff_hash: self.auxiliary_output.state_diff_hash(),
+        })
     }
 }
 
@@ -653,6 +769,7 @@ pub struct CommitmentCommonInput {
     pub rollup_root_hash: H256,
     pub bootloader_code_hash: H256,
     pub default_aa_code_hash: H256,
+    pub evm_emulator_code_hash: Option<H256>,
     pub protocol_version: ProtocolVersionId,
 }
 
@@ -669,7 +786,8 @@ pub enum CommitmentInput {
         system_logs: Vec<SystemL2ToL1Log>,
         state_diffs: Vec<StateDiffRecord>,
         aux_commitments: AuxCommitments,
-        blob_commitments: Vec<H256>,
+        blob_hashes: Vec<BlobHash>,
+        aggregation_root: H256,
     },
 }
 
@@ -693,6 +811,7 @@ impl CommitmentInput {
             rollup_root_hash,
             bootloader_code_hash: base_system_contracts_hashes.bootloader,
             default_aa_code_hash: base_system_contracts_hashes.default_aa,
+            evm_emulator_code_hash: base_system_contracts_hashes.evm_emulator,
             protocol_version,
         };
         if protocol_version.is_pre_boojum() {
@@ -710,11 +829,11 @@ impl CommitmentInput {
                     events_queue_commitment: H256::zero(),
                     bootloader_initial_content_commitment: H256::zero(),
                 },
-                blob_commitments: {
+                blob_hashes: {
                     let num_blobs = num_blobs_required(&protocol_version);
-
-                    vec![H256::zero(); num_blobs]
+                    vec![Default::default(); num_blobs]
                 },
+                aggregation_root: H256::zero(),
             }
         }
     }
@@ -729,4 +848,7 @@ pub struct L1BatchCommitmentArtifacts {
     pub compressed_repeated_writes: Option<Vec<u8>>,
     pub zkporter_is_available: bool,
     pub aux_commitments: Option<AuxCommitments>,
+    pub aggregation_root: H256,
+    pub local_root: H256,
+    pub state_diff_hash: H256,
 }

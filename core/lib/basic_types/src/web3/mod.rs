@@ -21,9 +21,39 @@ mod tests;
 
 pub type Index = U64;
 
+/// Number that can be either hex-encoded or decimal.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum U64Number {
+    Hex(U64),
+    Number(u64),
+}
+
+impl From<U64Number> for u64 {
+    fn from(value: U64Number) -> Self {
+        match value {
+            U64Number::Hex(number) => number.as_u64(),
+            U64Number::Number(number) => number,
+        }
+    }
+}
+
+impl From<u64> for U64Number {
+    fn from(value: u64) -> Self {
+        Self::Number(value)
+    }
+}
+
+impl From<U64> for U64Number {
+    fn from(value: U64) -> Self {
+        Self::Hex(value)
+    }
+}
+
 // `Signature`, `keccak256`: from `web3::signing`
 
 /// A struct that represents the components of a secp256k1 signature.
+#[derive(Debug)]
 pub struct Signature {
     /// V component in Electrum format with chain-id replay protection.
     pub v: u64,
@@ -42,6 +72,14 @@ pub fn keccak256(bytes: &[u8]) -> [u8; 32] {
     hasher.update(bytes);
     hasher.finalize(&mut output);
     output
+}
+
+/// Hashes concatenation of the two provided hashes using `keccak256`.
+pub fn keccak256_concat(hash1: H256, hash2: H256) -> H256 {
+    let mut bytes = [0_u8; 64];
+    bytes[..32].copy_from_slice(hash1.as_bytes());
+    bytes[32..].copy_from_slice(hash2.as_bytes());
+    H256(keccak256(&bytes))
 }
 
 // `Bytes`: from `web3::types::bytes`
@@ -161,11 +199,17 @@ pub struct Filter {
 }
 
 #[derive(Default, Debug, PartialEq, Clone)]
-pub struct ValueOrArray<T>(Vec<T>);
+pub struct ValueOrArray<T>(pub Vec<T>);
 
 impl<T> ValueOrArray<T> {
     pub fn flatten(self) -> Vec<T> {
         self.0
+    }
+}
+
+impl<T> From<T> for ValueOrArray<T> {
+    fn from(value: T) -> Self {
+        Self(vec![value])
     }
 }
 
@@ -197,10 +241,17 @@ where
             Sequence(Vec<T>),
         }
 
-        Ok(match Repr::<T>::deserialize(deserializer)? {
-            Repr::Single(element) => Self(vec![element]),
-            Repr::Sequence(elements) => Self(elements),
-        })
+        match Repr::<T>::deserialize(deserializer) {
+            Ok(Repr::Single(element)) => Ok(Self(vec![element])),
+            Ok(Repr::Sequence(elements)) => Ok(Self(elements)),
+            Err(e) => Err(serde::de::Error::custom(format!(
+                "Invalid parameter format. Expected either a single value or an array of values. \
+                 Common issues: hex strings with extra spaces, malformed JSON objects, or invalid data types. \
+                 Make sure hex strings are properly formatted (e.g., '0x123abc' not '0x123 abc'). \
+                 Original error: {}",
+                e
+            ))),
+        }
     }
 }
 
@@ -344,6 +395,15 @@ impl Log {
             }
         }
         false
+    }
+}
+
+impl From<Log> for ethabi::RawLog {
+    fn from(log: Log) -> Self {
+        ethabi::RawLog {
+            topics: log.topics,
+            data: log.data.0,
+        }
     }
 }
 

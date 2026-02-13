@@ -1,10 +1,12 @@
+use std::collections::HashMap;
+
 use zk_evm_1_4_1::aux_structures::Timestamp;
 
 use crate::{
     interface::{
         storage::WriteStorage,
         tracer::{TracerExecutionStatus, VmExecutionStopReason},
-        VmExecutionMode, VmExecutionResultAndLogs, VmInterface,
+        VmExecutionMode, VmExecutionResultAndLogs,
     },
     vm_1_4_2::{
         old_vm::utils::{vm_may_have_ended_inner, VmExecutionResult},
@@ -96,6 +98,7 @@ impl<S: WriteStorage, H: HistoryMode> Vm<S, H> {
             logs,
             statistics,
             refunds,
+            dynamic_factory_deps: HashMap::new(), // dynamic bytecode deployment is not supported
         };
 
         (stop_reason, result)

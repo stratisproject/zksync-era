@@ -1,129 +1,87 @@
 //! VM storage functionality specifically used in the VM sandbox.
 
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-};
-
-use zksync_multivm::interface::storage::ReadStorage;
+use zksync_multivm::interface::storage::{ReadStorage, StorageWithOverrides};
 use zksync_types::{
-    api::state_override::{OverrideState, StateOverride},
-    get_code_key, get_nonce_key,
+    api::state_override::{BytecodeOverride, OverrideState, StateOverride},
+    bytecode::{pad_evm_bytecode, BytecodeHash, BytecodeMarker},
+    get_code_key, get_evm_code_hash_key, get_known_code_key, get_nonce_key, h256_to_u256,
+    u256_to_h256,
     utils::{decompose_full_nonce, nonces_to_full_nonce, storage_key_for_eth_balance},
-    AccountTreeId, StorageKey, StorageValue, H256,
+    web3, AccountTreeId, StorageKey, H256,
 };
-use zksync_utils::{h256_to_u256, u256_to_h256};
 
-/// A storage view that allows to override some of the storage values.
-#[derive(Debug)]
-pub(super) struct StorageWithOverrides<S> {
-    storage_handle: S,
-    overridden_slots: HashMap<StorageKey, H256>,
-    overridden_factory_deps: HashMap<H256, Vec<u8>>,
-    overridden_accounts: HashSet<AccountTreeId>,
-}
+/// This method is blocking.
+pub(super) fn apply_state_override<S: ReadStorage>(
+    storage: S,
+    state_override: StateOverride,
+) -> StorageWithOverrides<S> {
+    let mut storage = StorageWithOverrides::new(storage);
 
-impl<S: ReadStorage> StorageWithOverrides<S> {
-    /// Creates a new storage view based on the underlying storage.
-    pub(super) fn new(storage: S, state_override: &StateOverride) -> Self {
-        let mut this = Self {
-            storage_handle: storage,
-            overridden_slots: HashMap::new(),
-            overridden_factory_deps: HashMap::new(),
-            overridden_accounts: HashSet::new(),
-        };
-        this.apply_state_override(state_override);
-        this
-    }
+    for (account, overrides) in state_override {
+        if let Some(balance) = overrides.balance {
+            let balance_key = storage_key_for_eth_balance(&account);
+            storage.set_value(balance_key, u256_to_h256(balance));
+        }
 
-    fn apply_state_override(&mut self, state_override: &StateOverride) {
-        for (account, overrides) in state_override.iter() {
-            if let Some(balance) = overrides.balance {
-                let balance_key = storage_key_for_eth_balance(account);
-                self.overridden_slots
-                    .insert(balance_key, u256_to_h256(balance));
-            }
+        if let Some(nonce) = overrides.nonce {
+            let nonce_key = get_nonce_key(&account);
+            let full_nonce = storage.read_value(&nonce_key);
+            let (_, deployment_nonce) = decompose_full_nonce(h256_to_u256(full_nonce));
+            let new_full_nonce = u256_to_h256(nonces_to_full_nonce(nonce, deployment_nonce));
+            storage.set_value(nonce_key, new_full_nonce);
+        }
 
-            if let Some(nonce) = overrides.nonce {
-                let nonce_key = get_nonce_key(account);
-                let full_nonce = self.read_value(&nonce_key);
-                let (_, deployment_nonce) = decompose_full_nonce(h256_to_u256(full_nonce));
-                let new_full_nonce = u256_to_h256(nonces_to_full_nonce(nonce, deployment_nonce));
-                self.overridden_slots.insert(nonce_key, new_full_nonce);
-            }
+        if let Some(code) = overrides.code {
+            let (bytecode_kind, code) = match code {
+                BytecodeOverride::Unspecified(code) => (BytecodeMarker::detect(&code.0), code),
+                BytecodeOverride::EraVm(code) => (BytecodeMarker::EraVm, code),
+                BytecodeOverride::Evm(code) => (BytecodeMarker::Evm, code),
+            };
+            let code_key = get_code_key(&account);
 
-            if let Some(code) = &overrides.code {
-                let code_key = get_code_key(account);
-                let code_hash = code.hash();
-                self.overridden_slots.insert(code_key, code_hash);
-                self.store_factory_dep(code_hash, code.clone().into_bytes());
-            }
-
-            match &overrides.state {
-                Some(OverrideState::State(state)) => {
-                    let account = AccountTreeId::new(*account);
-                    self.override_account_state_diff(account, state);
-                    self.overridden_accounts.insert(account);
+            let (code_hash, prepared_code) = match bytecode_kind {
+                BytecodeMarker::EraVm => (BytecodeHash::for_bytecode(&code.0).value(), code.0),
+                BytecodeMarker::Evm => {
+                    // For better usability, we allow overriding EVM bytecodes even if EVM contract deployment is not enabled for the chain.
+                    let versioned_hash = BytecodeHash::for_raw_evm_bytecode(&code.0).value();
+                    let evm_bytecode_hash_key = get_evm_code_hash_key(versioned_hash);
+                    storage.set_value(evm_bytecode_hash_key, H256(web3::keccak256(&code.0)));
+                    (versioned_hash, pad_evm_bytecode(&code.0))
                 }
-                Some(OverrideState::StateDiff(state_diff)) => {
-                    let account = AccountTreeId::new(*account);
-                    self.override_account_state_diff(account, state_diff);
+            };
+
+            storage.set_value(code_key, code_hash);
+            let known_code_key = get_known_code_key(&code_hash);
+            storage.set_value(known_code_key, H256::from_low_u64_be(1));
+            storage.store_factory_dep(code_hash, prepared_code);
+        }
+
+        match overrides.state {
+            Some(OverrideState::State(state)) => {
+                let account = AccountTreeId::new(account);
+                for (key, value) in state {
+                    storage.set_value(StorageKey::new(account, key), value);
                 }
-                None => { /* do nothing */ }
+                storage.insert_erased_account(account);
             }
+            Some(OverrideState::StateDiff(state_diff)) => {
+                let account = AccountTreeId::new(account);
+                for (key, value) in state_diff {
+                    storage.set_value(StorageKey::new(account, key), value);
+                }
+            }
+            None => { /* do nothing */ }
         }
     }
-
-    fn store_factory_dep(&mut self, hash: H256, code: Vec<u8>) {
-        self.overridden_factory_deps.insert(hash, code);
-    }
-
-    fn override_account_state_diff(
-        &mut self,
-        account: AccountTreeId,
-        state_diff: &HashMap<H256, H256>,
-    ) {
-        let account_slots = state_diff
-            .iter()
-            .map(|(&slot, &value)| (StorageKey::new(account, slot), value));
-        self.overridden_slots.extend(account_slots);
-    }
-}
-
-impl<S: ReadStorage + fmt::Debug> ReadStorage for StorageWithOverrides<S> {
-    fn read_value(&mut self, key: &StorageKey) -> StorageValue {
-        if let Some(value) = self.overridden_slots.get(key) {
-            return *value;
-        }
-        if self.overridden_accounts.contains(key.account()) {
-            return H256::zero();
-        }
-        self.storage_handle.read_value(key)
-    }
-
-    fn is_write_initial(&mut self, key: &StorageKey) -> bool {
-        self.storage_handle.is_write_initial(key)
-    }
-
-    fn load_factory_dep(&mut self, hash: H256) -> Option<Vec<u8>> {
-        self.overridden_factory_deps
-            .get(&hash)
-            .cloned()
-            .or_else(|| self.storage_handle.load_factory_dep(hash))
-    }
-
-    fn get_enumeration_index(&mut self, key: &StorageKey) -> Option<u64> {
-        self.storage_handle.get_enumeration_index(key)
-    }
+    storage
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use zksync_multivm::interface::storage::InMemoryStorage;
-    use zksync_types::{
-        api::state_override::{Bytecode, OverrideAccount},
-        Address,
-    };
+    use zksync_types::{api::state_override::OverrideAccount, web3, Address};
 
     use super::*;
 
@@ -147,7 +105,7 @@ mod tests {
             (
                 Address::repeat_byte(3),
                 OverrideAccount {
-                    code: Some(Bytecode::new((0..32).collect()).unwrap()),
+                    code: Some(BytecodeOverride::EraVm(web3::Bytes((0..32).collect()))),
                     ..OverrideAccount::default()
                 },
             ),
@@ -181,7 +139,7 @@ mod tests {
         storage.set_value(retained_key, H256::repeat_byte(0xfe));
         let erased_key = StorageKey::new(AccountTreeId::new(Address::repeat_byte(5)), H256::zero());
         storage.set_value(erased_key, H256::repeat_byte(1));
-        let mut storage = StorageWithOverrides::new(storage, &overrides);
+        let mut storage = apply_state_override(storage, overrides);
 
         let balance = storage.read_value(&storage_key_for_eth_balance(&Address::repeat_byte(1)));
         assert_eq!(balance, H256::from_low_u64_be(1));

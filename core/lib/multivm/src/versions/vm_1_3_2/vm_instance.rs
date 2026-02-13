@@ -1,4 +1,4 @@
-use std::{convert::TryFrom, fmt::Debug};
+use std::{collections::VecDeque, convert::TryFrom, fmt::Debug};
 
 use itertools::Itertools;
 use zk_evm_1_3_3::{
@@ -81,7 +81,7 @@ pub struct VmInstance<S: WriteStorage, H: HistoryMode> {
     pub block_context: DerivedBlockContext,
     pub(crate) bootloader_state: BootloaderState,
 
-    pub snapshots: Vec<VmSnapshot>,
+    pub snapshots: VecDeque<VmSnapshot>,
 }
 
 /// This structure stores data that accumulates during the VM run.
@@ -142,6 +142,7 @@ pub struct VmPartialExecutionResult {
     pub contracts_used: usize,
     pub cycles_used: u32,
     pub computational_gas_used: u32,
+    pub gas_remaining: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -374,12 +375,6 @@ impl<H: HistoryMode, S: WriteStorage> VmInstance<S, H> {
                 original_data: vec![],
             }),
         }
-    }
-
-    /// Removes the latest snapshot without rolling it back.
-    /// This function expects that there is at least one snapshot present.
-    pub fn pop_snapshot_no_rollback(&mut self) {
-        self.snapshots.pop();
     }
 
     /// Returns the amount of gas remaining to the VM.
@@ -660,6 +655,7 @@ impl<H: HistoryMode, S: WriteStorage> VmInstance<S, H> {
                             cycles_used: self.state.local_state.monotonic_cycle_counter
                                 - cycles_initial,
                             computational_gas_used,
+                            gas_remaining: self.gas_remaining(),
                         },
                         call_traces: tx_tracer.call_traces(),
                     })
@@ -762,6 +758,7 @@ impl<H: HistoryMode, S: WriteStorage> VmInstance<S, H> {
                         .get_decommitted_bytecodes_after_timestamp(timestamp_initial),
                     cycles_used: self.state.local_state.monotonic_cycle_counter - cycles_initial,
                     computational_gas_used,
+                    gas_remaining: self.gas_remaining(),
                 };
 
                 // Collecting `block_tip_result` needs logs with timestamp, so we drain events for the `full_result`
@@ -810,6 +807,7 @@ impl<H: HistoryMode, S: WriteStorage> VmInstance<S, H> {
                             contracts_used: 0,
                             cycles_used: 0,
                             computational_gas_used: 0,
+                            gas_remaining: 0,
                         },
                     }
                 } else {
@@ -863,6 +861,7 @@ impl<H: HistoryMode, S: WriteStorage> VmInstance<S, H> {
                 .get_decommitted_bytecodes_after_timestamp(timestamp_initial),
             cycles_used: self.state.local_state.monotonic_cycle_counter - cycles_initial,
             computational_gas_used,
+            gas_remaining: self.gas_remaining(),
         }
     }
 
@@ -916,7 +915,7 @@ impl<S: WriteStorage> VmInstance<S, HistoryEnabled> {
     /// Saves the snapshot of the current state of the VM that can be used
     /// to roll back its state later on.
     pub fn save_current_vm_as_snapshot(&mut self) {
-        self.snapshots.push(VmSnapshot {
+        self.snapshots.push_back(VmSnapshot {
             // Vm local state contains O(1) various parameters (registers/etc).
             // The only "expensive" copying here is copying of the call stack.
             // It will take `O(callstack_depth)` to copy it.
@@ -958,16 +957,22 @@ impl<S: WriteStorage> VmInstance<S, HistoryEnabled> {
     }
 
     /// Rollbacks the state of the VM to the state of the latest snapshot.
-    pub fn rollback_to_latest_snapshot(&mut self) {
-        let snapshot = self.snapshots.last().cloned().unwrap();
+    /// Removes that snapshot from the list.
+    pub fn rollback_to_latest_snapshot_popping(&mut self) {
+        let snapshot = self.snapshots.pop_back().unwrap();
         self.rollback_to_snapshot(snapshot);
     }
 
-    /// Rollbacks the state of the VM to the state of the latest snapshot.
-    /// Removes that snapshot from the list.
-    pub fn rollback_to_latest_snapshot_popping(&mut self) {
-        let snapshot = self.snapshots.pop().unwrap();
-        self.rollback_to_snapshot(snapshot);
+    /// Removes the latest snapshot without rolling it back.
+    /// This function expects that there is at least one snapshot present.
+    pub fn pop_snapshot_no_rollback(&mut self) {
+        self.snapshots.pop_back();
+    }
+
+    /// Removes the earliest snapshot without rolling it back.
+    /// This function expects that there is at least one snapshot present.
+    pub fn pop_front_snapshot_no_rollback(&mut self) {
+        self.snapshots.pop_front();
     }
 }
 

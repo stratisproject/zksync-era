@@ -6,11 +6,12 @@ use thiserror::Error;
 use zksync_contracts::BaseSystemContractsHashes;
 use zksync_types::{
     api,
-    block::{L1BatchHeader, L2BlockHeader},
-    commitment::{L1BatchMetaParameters, L1BatchMetadata},
-    fee_model::{BatchFeeInput, L1PeggedBatchFeeModelInput, PubdataIndependentBatchFeeModelInput},
+    block::{CommonL1BatchHeader, L1BatchHeader, L2BlockHeader, UnsealedL1BatchHeader},
+    commitment::{L1BatchMetaParameters, L1BatchMetadata, PubdataParams, PubdataType},
+    eth_sender::EthTxFinalityStatus,
+    fee_model::BatchFeeInput,
     l2_to_l1_log::{L2ToL1Log, SystemL2ToL1Log, UserL2ToL1Log},
-    Address, Bloom, L1BatchNumber, L2BlockNumber, ProtocolVersionId, H256,
+    Address, Bloom, L1BatchNumber, L2BlockNumber, ProtocolVersionId, SLChainId, H256,
 };
 
 /// This is the gas limit that was used inside blocks before we started saving block gas limit into the database.
@@ -44,6 +45,7 @@ pub(crate) struct StorageL1BatchHeader {
     pub used_contract_hashes: serde_json::Value,
     pub bootloader_code_hash: Option<Vec<u8>>,
     pub default_aa_code_hash: Option<Vec<u8>>,
+    pub evm_emulator_code_hash: Option<Vec<u8>>,
     pub protocol_version: Option<i32>,
 
     // `system_logs` are introduced as part of boojum and will be absent in all batches generated prior to boojum.
@@ -52,6 +54,13 @@ pub(crate) struct StorageL1BatchHeader {
     // will be exactly 7 (or 8 in the event of a protocol upgrade) system logs.
     pub system_logs: Vec<Vec<u8>>,
     pub pubdata_input: Option<Vec<u8>>,
+    pub fee_address: Vec<u8>,
+
+    pub l1_gas_price: i64,
+    pub l2_fair_gas_price: i64,
+    pub fair_pubdata_price: Option<i64>,
+
+    pub pubdata_limit: Option<i64>,
 }
 
 impl StorageL1BatchHeader {
@@ -66,6 +75,14 @@ impl StorageL1BatchHeader {
             .collect();
 
         let system_logs = convert_l2_to_l1_logs(self.system_logs);
+
+        let batch_fee_input = BatchFeeInput::from_protocol_version(
+            self.protocol_version
+                .map(|v| (v as u16).try_into().unwrap()),
+            self.l1_gas_price as u64,
+            self.l2_fair_gas_price as u64,
+            self.fair_pubdata_price.map(|p| p as u64),
+        );
 
         L1BatchHeader {
             number: L1BatchNumber(self.number as u32),
@@ -82,12 +99,16 @@ impl StorageL1BatchHeader {
             base_system_contracts_hashes: convert_base_system_contracts_hashes(
                 self.bootloader_code_hash,
                 self.default_aa_code_hash,
+                self.evm_emulator_code_hash,
             ),
             system_logs: system_logs.into_iter().map(SystemL2ToL1Log).collect(),
             protocol_version: self
                 .protocol_version
                 .map(|v| (v as u16).try_into().unwrap()),
             pubdata_input: self.pubdata_input,
+            fee_address: Address::from_slice(&self.fee_address),
+            batch_fee_input,
+            pubdata_limit: self.pubdata_limit.map(|l| l as u64),
         }
     }
 }
@@ -103,6 +124,7 @@ fn convert_l2_to_l1_logs(raw_logs: Vec<Vec<u8>>) -> Vec<L2ToL1Log> {
 fn convert_base_system_contracts_hashes(
     bootloader_code_hash: Option<Vec<u8>>,
     default_aa_code_hash: Option<Vec<u8>>,
+    evm_emulator_code_hash: Option<Vec<u8>>,
 ) -> BaseSystemContractsHashes {
     BaseSystemContractsHashes {
         bootloader: bootloader_code_hash
@@ -111,6 +133,7 @@ fn convert_base_system_contracts_hashes(
         default_aa: default_aa_code_hash
             .map(|hash| H256::from_slice(&hash))
             .expect("should not be none"),
+        evm_emulator: evm_emulator_code_hash.map(|hash| H256::from_slice(&hash)),
     }
 }
 
@@ -134,6 +157,7 @@ pub(crate) struct StorageL1Batch {
     pub zkporter_is_available: Option<bool>,
     pub bootloader_code_hash: Option<Vec<u8>>,
     pub default_aa_code_hash: Option<Vec<u8>>,
+    pub evm_emulator_code_hash: Option<Vec<u8>>,
 
     pub l2_to_l1_messages: Vec<Vec<u8>>,
     pub l2_l1_merkle_root: Option<Vec<u8>>,
@@ -147,6 +171,17 @@ pub(crate) struct StorageL1Batch {
     pub events_queue_commitment: Option<Vec<u8>>,
     pub bootloader_initial_content_commitment: Option<Vec<u8>>,
     pub pubdata_input: Option<Vec<u8>>,
+    pub fee_address: Vec<u8>,
+    pub aggregation_root: Option<Vec<u8>>,
+    pub local_root: Option<Vec<u8>>,
+    pub state_diff_hash: Option<Vec<u8>>,
+    pub inclusion_data: Option<Vec<u8>>,
+
+    pub l1_gas_price: i64,
+    pub l2_fair_gas_price: i64,
+    pub fair_pubdata_price: Option<i64>,
+
+    pub pubdata_limit: Option<i64>,
 }
 
 impl StorageL1Batch {
@@ -161,6 +196,14 @@ impl StorageL1Batch {
             .collect();
 
         let system_logs = convert_l2_to_l1_logs(self.system_logs);
+
+        let batch_fee_input = BatchFeeInput::from_protocol_version(
+            self.protocol_version
+                .map(|v| (v as u16).try_into().unwrap()),
+            self.l1_gas_price as u64,
+            self.l2_fair_gas_price as u64,
+            self.fair_pubdata_price.map(|p| p as u64),
+        );
 
         L1BatchHeader {
             number: L1BatchNumber(self.number as u32),
@@ -177,12 +220,16 @@ impl StorageL1Batch {
             base_system_contracts_hashes: convert_base_system_contracts_hashes(
                 self.bootloader_code_hash,
                 self.default_aa_code_hash,
+                self.evm_emulator_code_hash,
             ),
             system_logs: system_logs.into_iter().map(SystemL2ToL1Log).collect(),
             protocol_version: self
                 .protocol_version
                 .map(|v| (v as u16).try_into().unwrap()),
             pubdata_input: self.pubdata_input,
+            fee_address: Address::from_slice(&self.fee_address),
+            batch_fee_input,
+            pubdata_limit: self.pubdata_limit.map(|l| l as u64),
         }
     }
 }
@@ -240,6 +287,10 @@ impl TryFrom<StorageL1Batch> for L1BatchMetadata {
                         .default_aa_code_hash
                         .ok_or(L1BatchMetadataError::Incomplete("default_aa_code_hash"))?,
                 ),
+                evm_emulator_code_hash: batch
+                    .evm_emulator_code_hash
+                    .as_deref()
+                    .map(H256::from_slice),
                 protocol_version: batch
                     .protocol_version
                     .map(|v| (v as u16).try_into().unwrap()),
@@ -249,7 +300,80 @@ impl TryFrom<StorageL1Batch> for L1BatchMetadata {
             bootloader_initial_content_commitment: batch
                 .bootloader_initial_content_commitment
                 .map(|v| H256::from_slice(&v)),
+            state_diff_hash: batch.state_diff_hash.map(|v| H256::from_slice(&v)),
+            local_root: batch.local_root.map(|v| H256::from_slice(&v)),
+            aggregation_root: batch.aggregation_root.map(|v| H256::from_slice(&v)),
+            da_inclusion_data: batch.inclusion_data,
         })
+    }
+}
+
+/// Partial projection of the columns corresponding to an unsealed [`L1BatchHeader`].
+#[derive(Debug, Clone)]
+pub(crate) struct UnsealedStorageL1Batch {
+    pub number: i64,
+    pub timestamp: i64,
+    pub protocol_version: Option<i32>,
+    pub fee_address: Vec<u8>,
+    pub l1_gas_price: i64,
+    pub l2_fair_gas_price: i64,
+    pub fair_pubdata_price: Option<i64>,
+    pub pubdata_limit: Option<i64>,
+}
+
+impl From<UnsealedStorageL1Batch> for UnsealedL1BatchHeader {
+    fn from(batch: UnsealedStorageL1Batch) -> Self {
+        let protocol_version: Option<ProtocolVersionId> = batch
+            .protocol_version
+            .map(|v| (v as u16).try_into().unwrap());
+        Self {
+            number: L1BatchNumber(batch.number as u32),
+            timestamp: batch.timestamp as u64,
+            protocol_version,
+            fee_address: Address::from_slice(&batch.fee_address),
+            fee_input: BatchFeeInput::for_protocol_version(
+                protocol_version.unwrap_or_else(ProtocolVersionId::last_potentially_undefined),
+                batch.l2_fair_gas_price as u64,
+                batch.fair_pubdata_price.map(|p| p as u64),
+                batch.l1_gas_price as u64,
+            ),
+            pubdata_limit: batch.pubdata_limit.map(|l| l as u64),
+        }
+    }
+}
+
+/// Partial projection of the columns common to both [`L1BatchHeader`] and [`UnsealedL1BatchHeader`].
+pub(crate) struct CommonStorageL1BatchHeader {
+    pub number: i64,
+    pub is_sealed: bool,
+    pub timestamp: i64,
+    pub protocol_version: Option<i32>,
+    pub fee_address: Vec<u8>,
+    pub l1_gas_price: i64,
+    pub l2_fair_gas_price: i64,
+    pub fair_pubdata_price: Option<i64>,
+    pub pubdata_limit: Option<i64>,
+}
+
+impl From<CommonStorageL1BatchHeader> for CommonL1BatchHeader {
+    fn from(batch: CommonStorageL1BatchHeader) -> Self {
+        let protocol_version: Option<ProtocolVersionId> = batch
+            .protocol_version
+            .map(|v| (v as u16).try_into().unwrap());
+        Self {
+            number: L1BatchNumber(batch.number as u32),
+            is_sealed: batch.is_sealed,
+            timestamp: batch.timestamp as u64,
+            protocol_version,
+            fee_address: Address::from_slice(&batch.fee_address),
+            fee_input: BatchFeeInput::for_protocol_version(
+                protocol_version.unwrap_or_else(ProtocolVersionId::last_potentially_undefined),
+                batch.l2_fair_gas_price as u64,
+                batch.fair_pubdata_price.map(|p| p as u64),
+                batch.l1_gas_price as u64,
+            ),
+            pubdata_limit: batch.pubdata_limit.map(|l| l as u64),
+        }
     }
 }
 
@@ -262,11 +386,21 @@ pub(crate) struct StorageBlockDetails {
     pub l2_tx_count: i32,
     pub root_hash: Option<Vec<u8>>,
     pub commit_tx_hash: Option<String>,
+    pub commit_tx_finality_status: Option<String>,
     pub committed_at: Option<NaiveDateTime>,
+    pub commit_chain_id: Option<i64>,
     pub prove_tx_hash: Option<String>,
+    pub prove_tx_finality_status: Option<String>,
     pub proven_at: Option<NaiveDateTime>,
+    pub prove_chain_id: Option<i64>,
     pub execute_tx_hash: Option<String>,
+    pub execute_tx_finality_status: Option<String>,
     pub executed_at: Option<NaiveDateTime>,
+    pub execute_chain_id: Option<i64>,
+    pub precommit_tx_hash: Option<String>,
+    pub precommit_tx_finality_status: Option<String>,
+    pub precommitted_at: Option<NaiveDateTime>,
+    pub precommit_chain_id: Option<i64>,
     // L1 gas price assumed in the corresponding batch
     pub l1_gas_price: i64,
     // L2 gas price assumed in the corresponding batch
@@ -275,18 +409,24 @@ pub(crate) struct StorageBlockDetails {
     pub fair_pubdata_price: Option<i64>,
     pub bootloader_code_hash: Option<Vec<u8>>,
     pub default_aa_code_hash: Option<Vec<u8>>,
+    pub evm_emulator_code_hash: Option<Vec<u8>>,
     pub fee_account_address: Vec<u8>,
     pub protocol_version: Option<i32>,
 }
 
 impl From<StorageBlockDetails> for api::BlockDetails {
     fn from(details: StorageBlockDetails) -> Self {
-        let status = if details.number == 0 || details.execute_tx_hash.is_some() {
-            api::BlockStatus::Verified
-        } else {
-            api::BlockStatus::Sealed
-        };
-
+        let execute_tx_finality = details
+            .execute_tx_finality_status
+            .and_then(|a| EthTxFinalityStatus::from_str(a.as_str()).ok());
+        let status =
+            if details.number == 0 || execute_tx_finality == Some(EthTxFinalityStatus::Finalized) {
+                api::BlockStatus::Verified
+            } else if execute_tx_finality == Some(EthTxFinalityStatus::FastFinalized) {
+                api::BlockStatus::FastFinalized
+            } else {
+                api::BlockStatus::Sealed
+            };
         let base = api::BlockDetailsBase {
             timestamp: details.timestamp as u64,
             l1_tx_count: details.l1_tx_count as usize,
@@ -300,26 +440,48 @@ impl From<StorageBlockDetails> for api::BlockDetails {
             committed_at: details
                 .committed_at
                 .map(|committed_at| DateTime::from_naive_utc_and_offset(committed_at, Utc)),
+            commit_tx_finality: details
+                .commit_tx_finality_status
+                .and_then(|a| EthTxFinalityStatus::from_str(a.as_str()).ok()),
+            commit_chain_id: details.commit_chain_id.map(|id| SLChainId(id as u64)),
             prove_tx_hash: details
                 .prove_tx_hash
                 .as_deref()
                 .map(|hash| H256::from_str(hash).expect("Incorrect prove_tx hash")),
+            prove_tx_finality: details
+                .prove_tx_finality_status
+                .and_then(|a| EthTxFinalityStatus::from_str(a.as_str()).ok()),
             proven_at: details
                 .proven_at
                 .map(|proven_at| DateTime::<Utc>::from_naive_utc_and_offset(proven_at, Utc)),
+            prove_chain_id: details.prove_chain_id.map(|id| SLChainId(id as u64)),
             execute_tx_hash: details
                 .execute_tx_hash
                 .as_deref()
                 .map(|hash| H256::from_str(hash).expect("Incorrect execute_tx hash")),
+            execute_tx_finality,
             executed_at: details
                 .executed_at
                 .map(|executed_at| DateTime::<Utc>::from_naive_utc_and_offset(executed_at, Utc)),
+            execute_chain_id: details.execute_chain_id.map(|id| SLChainId(id as u64)),
+            precommit_tx_hash: details
+                .precommit_tx_hash
+                .as_deref()
+                .map(|hash| H256::from_str(hash).expect("Incorrect precommit_tx hash")),
+            precommit_tx_finality: details
+                .precommit_tx_finality_status
+                .and_then(|a| EthTxFinalityStatus::from_str(a.as_str()).ok()),
+            precommitted_at: details.precommitted_at.map(|precommitted_at| {
+                DateTime::<Utc>::from_naive_utc_and_offset(precommitted_at, Utc)
+            }),
+            precommit_chain_id: details.precommit_chain_id.map(|id| SLChainId(id as u64)),
             l1_gas_price: details.l1_gas_price as u64,
             l2_fair_gas_price: details.l2_fair_gas_price as u64,
             fair_pubdata_price: details.fair_pubdata_price.map(|x| x as u64),
             base_system_contracts_hashes: convert_base_system_contracts_hashes(
                 details.bootloader_code_hash,
                 details.default_aa_code_hash,
+                details.evm_emulator_code_hash,
             ),
         };
         api::BlockDetails {
@@ -342,25 +504,41 @@ pub(crate) struct StorageL1BatchDetails {
     pub l2_tx_count: i32,
     pub root_hash: Option<Vec<u8>>,
     pub commit_tx_hash: Option<String>,
+    pub commit_tx_finality_status: Option<String>,
     pub committed_at: Option<NaiveDateTime>,
+    pub commit_chain_id: Option<i64>,
     pub prove_tx_hash: Option<String>,
+    pub prove_tx_finality_status: Option<String>,
     pub proven_at: Option<NaiveDateTime>,
+    pub prove_chain_id: Option<i64>,
     pub execute_tx_hash: Option<String>,
+    pub execute_tx_finality_status: Option<String>,
     pub executed_at: Option<NaiveDateTime>,
+    pub execute_chain_id: Option<i64>,
+    pub precommit_tx_hash: Option<String>,
+    pub precommit_tx_finality_status: Option<String>,
+    pub precommitted_at: Option<NaiveDateTime>,
+    pub precommit_chain_id: Option<i64>,
     pub l1_gas_price: i64,
     pub l2_fair_gas_price: i64,
     pub fair_pubdata_price: Option<i64>,
     pub bootloader_code_hash: Option<Vec<u8>>,
     pub default_aa_code_hash: Option<Vec<u8>>,
+    pub evm_emulator_code_hash: Option<Vec<u8>>,
+    pub commitment: Option<Vec<u8>>,
 }
 
 impl From<StorageL1BatchDetails> for api::L1BatchDetails {
     fn from(details: StorageL1BatchDetails) -> Self {
-        let status = if details.number == 0 || details.execute_tx_hash.is_some() {
-            api::BlockStatus::Verified
-        } else {
-            api::BlockStatus::Sealed
-        };
+        let execute_tx_finality = details
+            .execute_tx_finality_status
+            .and_then(|a| EthTxFinalityStatus::from_str(a.as_str()).ok());
+        let status =
+            if details.number == 0 || execute_tx_finality == Some(EthTxFinalityStatus::Finalized) {
+                api::BlockStatus::Verified
+            } else {
+                api::BlockStatus::Sealed
+            };
 
         let base = api::BlockDetailsBase {
             timestamp: details.timestamp as u64,
@@ -375,30 +553,53 @@ impl From<StorageL1BatchDetails> for api::L1BatchDetails {
             committed_at: details
                 .committed_at
                 .map(|committed_at| DateTime::<Utc>::from_naive_utc_and_offset(committed_at, Utc)),
+            commit_chain_id: details.commit_chain_id.map(|id| SLChainId(id as u64)),
+            commit_tx_finality: details
+                .commit_tx_finality_status
+                .and_then(|a| EthTxFinalityStatus::from_str(a.as_str()).ok()),
             prove_tx_hash: details
                 .prove_tx_hash
                 .as_deref()
                 .map(|hash| H256::from_str(hash).expect("Incorrect prove_tx hash")),
+            prove_tx_finality: details
+                .prove_tx_finality_status
+                .and_then(|a| EthTxFinalityStatus::from_str(a.as_str()).ok()),
             proven_at: details
                 .proven_at
                 .map(|proven_at| DateTime::<Utc>::from_naive_utc_and_offset(proven_at, Utc)),
+            prove_chain_id: details.prove_chain_id.map(|id| SLChainId(id as u64)),
             execute_tx_hash: details
                 .execute_tx_hash
                 .as_deref()
                 .map(|hash| H256::from_str(hash).expect("Incorrect execute_tx hash")),
+            execute_tx_finality,
             executed_at: details
                 .executed_at
                 .map(|executed_at| DateTime::<Utc>::from_naive_utc_and_offset(executed_at, Utc)),
+            execute_chain_id: details.execute_chain_id.map(|id| SLChainId(id as u64)),
+            precommit_tx_hash: details
+                .precommit_tx_hash
+                .as_deref()
+                .map(|hash| H256::from_str(hash).expect("Incorrect precommit_tx hash")),
+            precommitted_at: details.precommitted_at.map(|precommitted_at| {
+                DateTime::<Utc>::from_naive_utc_and_offset(precommitted_at, Utc)
+            }),
+            precommit_tx_finality: details
+                .precommit_tx_finality_status
+                .and_then(|a| EthTxFinalityStatus::from_str(a.as_str()).ok()),
+            precommit_chain_id: details.precommit_chain_id.map(|id| SLChainId(id as u64)),
             l1_gas_price: details.l1_gas_price as u64,
             l2_fair_gas_price: details.l2_fair_gas_price as u64,
             fair_pubdata_price: details.fair_pubdata_price.map(|x| x as u64),
             base_system_contracts_hashes: convert_base_system_contracts_hashes(
                 details.bootloader_code_hash,
                 details.default_aa_code_hash,
+                details.evm_emulator_code_hash,
             ),
         };
         api::L1BatchDetails {
             base,
+            commitment: details.commitment.map(|c| H256::from_slice(&c)),
             number: L1BatchNumber(details.number as u32),
         }
     }
@@ -418,6 +619,7 @@ pub(crate) struct StorageL2BlockHeader {
     // L2 gas price assumed in the corresponding batch
     pub bootloader_code_hash: Option<Vec<u8>>,
     pub default_aa_code_hash: Option<Vec<u8>>,
+    pub evm_emulator_code_hash: Option<Vec<u8>>,
     pub protocol_version: Option<i32>,
 
     pub fair_pubdata_price: Option<i64>,
@@ -434,30 +636,20 @@ pub(crate) struct StorageL2BlockHeader {
     /// This value should bound the maximal amount of gas that can be spent by transactions in the miniblock.
     pub gas_limit: Option<i64>,
     pub logs_bloom: Option<Vec<u8>>,
+    pub l2_da_validator_address: Vec<u8>,
+    pub pubdata_type: String,
+    pub rolling_txs_hash: Option<Vec<u8>>,
 }
 
 impl From<StorageL2BlockHeader> for L2BlockHeader {
     fn from(row: StorageL2BlockHeader) -> Self {
         let protocol_version = row.protocol_version.map(|v| (v as u16).try_into().unwrap());
-
-        let fee_input = protocol_version
-            .filter(|version: &ProtocolVersionId| version.is_post_1_4_1())
-            .map(|_| {
-                BatchFeeInput::PubdataIndependent(PubdataIndependentBatchFeeModelInput {
-                    fair_pubdata_price: row
-                        .fair_pubdata_price
-                        .expect("No fair pubdata price for 1.4.1 miniblock")
-                        as u64,
-                    fair_l2_gas_price: row.l2_fair_gas_price as u64,
-                    l1_gas_price: row.l1_gas_price as u64,
-                })
-            })
-            .unwrap_or_else(|| {
-                BatchFeeInput::L1Pegged(L1PeggedBatchFeeModelInput {
-                    fair_l2_gas_price: row.l2_fair_gas_price as u64,
-                    l1_gas_price: row.l1_gas_price as u64,
-                })
-            });
+        let batch_fee_input = BatchFeeInput::from_protocol_version(
+            protocol_version,
+            row.l1_gas_price as u64,
+            row.l2_fair_gas_price as u64,
+            row.fair_pubdata_price.map(|p| p as u64),
+        );
 
         L2BlockHeader {
             number: L2BlockNumber(row.number as u32),
@@ -467,10 +659,11 @@ impl From<StorageL2BlockHeader> for L2BlockHeader {
             l2_tx_count: row.l2_tx_count as u16,
             fee_account_address: Address::from_slice(&row.fee_account_address),
             base_fee_per_gas: row.base_fee_per_gas.to_u64().unwrap(),
-            batch_fee_input: fee_input,
+            batch_fee_input,
             base_system_contracts_hashes: convert_base_system_contracts_hashes(
                 row.bootloader_code_hash,
                 row.default_aa_code_hash,
+                row.evm_emulator_code_hash,
             ),
             gas_per_pubdata_limit: row.gas_per_pubdata_limit as u64,
             protocol_version,
@@ -480,6 +673,11 @@ impl From<StorageL2BlockHeader> for L2BlockHeader {
                 .logs_bloom
                 .map(|b| Bloom::from_slice(&b))
                 .unwrap_or_default(),
+            pubdata_params: PubdataParams {
+                l2_da_validator_address: Address::from_slice(&row.l2_da_validator_address),
+                pubdata_type: PubdataType::from_str(&row.pubdata_type).unwrap(),
+            },
+            rolling_txs_hash: row.rolling_txs_hash.as_deref().map(H256::from_slice),
         }
     }
 }
@@ -499,5 +697,19 @@ impl ResolvedL1BatchForL2Block {
     /// that the node will operate correctly).
     pub fn expected_l1_batch(&self) -> L1BatchNumber {
         self.block_l1_batch.unwrap_or(self.pending_l1_batch)
+    }
+}
+
+pub(crate) struct StoragePubdataParams {
+    pub l2_da_validator_address: Vec<u8>,
+    pub pubdata_type: String,
+}
+
+impl From<StoragePubdataParams> for PubdataParams {
+    fn from(row: StoragePubdataParams) -> Self {
+        Self {
+            l2_da_validator_address: Address::from_slice(&row.l2_da_validator_address),
+            pubdata_type: PubdataType::from_str(&row.pubdata_type).unwrap(),
+        }
     }
 }
