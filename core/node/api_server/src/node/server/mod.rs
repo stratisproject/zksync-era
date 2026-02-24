@@ -98,6 +98,7 @@ enum Transport {
 #[derive(Debug)]
 pub struct Web3ServerLayer {
     transport: Transport,
+    host: String,
     port: u16,
     optional_config: Web3ServerOptionalConfig,
     internal_api_config_base: InternalApiConfigBase,
@@ -139,12 +140,14 @@ pub struct Output {
 
 impl Web3ServerLayer {
     pub fn http(
+        host: String,
         port: u16,
         internal_api_config_base: InternalApiConfigBase,
         optional_config: Web3ServerOptionalConfig,
     ) -> Self {
         Self {
             transport: Transport::Http,
+            host,
             port,
             optional_config,
             internal_api_config_base,
@@ -152,12 +155,14 @@ impl Web3ServerLayer {
     }
 
     pub fn ws(
+        host: String,
         port: u16,
         internal_api_config_base: InternalApiConfigBase,
         optional_config: Web3ServerOptionalConfig,
     ) -> Self {
         Self {
             transport: Transport::Ws,
+            host,
             port,
             optional_config,
             internal_api_config_base,
@@ -236,10 +241,10 @@ impl WiringLayer for Web3ServerLayer {
         }
         match self.transport {
             Transport::Http => {
-                api_builder = api_builder.http(self.port);
+                api_builder = api_builder.http(self.host, self.port);
             }
             Transport::Ws => {
-                api_builder = api_builder.ws(self.port);
+                api_builder = api_builder.ws(self.host, self.port);
             }
         }
         if let Some(sync_state) = sync_state {

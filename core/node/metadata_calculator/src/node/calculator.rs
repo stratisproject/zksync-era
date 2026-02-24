@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use zksync_config::configs::{api::MerkleTreeApiConfig, database::MerkleTreeMode};
@@ -115,7 +115,8 @@ impl WiringLayer for MetadataCalculatorLayer {
             .map_err(WiringError::internal)?;
 
         let tree_api_task = self.tree_api_config.map(|tree_api_config| {
-            let bind_addr = (Ipv4Addr::UNSPECIFIED, tree_api_config.port).into();
+            let bind_addr =
+                SocketAddr::new(tree_api_config.host.parse().unwrap(), tree_api_config.port);
             let tree_reader = metadata_calculator.tree_reader();
             TreeApiTask {
                 bind_addr,

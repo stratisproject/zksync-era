@@ -162,13 +162,19 @@ impl ApiBuilder {
         }
     }
 
-    pub fn ws(mut self, port: u16) -> Self {
-        self.transport = Some(ApiTransport::WebSocket(([0, 0, 0, 0], port).into()));
+    pub fn ws(mut self, host: String, port: u16) -> Self {
+        self.transport = Some(ApiTransport::WebSocket(SocketAddr::new(
+            host.parse().unwrap(),
+            port,
+        )));
         self
     }
 
-    pub fn http(mut self, port: u16) -> Self {
-        self.transport = Some(ApiTransport::Http(([0, 0, 0, 0], port).into()));
+    pub fn http(mut self, host: String, port: u16) -> Self {
+        self.transport = Some(ApiTransport::Http(SocketAddr::new(
+            host.parse().unwrap(),
+            port,
+        )));
         self
     }
 
