@@ -1,7 +1,4 @@
-use std::{
-    net::{Ipv4Addr, SocketAddr},
-    sync::Arc,
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use zksync_config::configs::api::MerkleTreeApiConfig;
 use zksync_node_framework::{

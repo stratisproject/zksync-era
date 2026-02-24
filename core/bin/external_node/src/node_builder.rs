@@ -376,7 +376,7 @@ impl ExternalNodeBuilder {
         // Add tree API if needed.
         if with_tree_api {
             let merkle_tree_api_config = MerkleTreeApiConfig {
-                host: self.config.local.api.merkle_tree.host.to_owned(),
+                host: self.config.local.api.merkle_tree.host.clone(),
                 port: self.config.local.api.merkle_tree.port,
             };
             layer = layer.with_tree_api_config(merkle_tree_api_config);
@@ -414,7 +414,7 @@ impl ExternalNodeBuilder {
                 .include_indices_and_filters_in_block_cache,
         };
         let api_config = MerkleTreeApiConfig {
-            host: self.config.local.api.merkle_tree.host.to_owned(),
+            host: self.config.local.api.merkle_tree.host.clone(),
             port: self.config.local.api.merkle_tree.port,
         };
         self.node
@@ -580,6 +580,7 @@ impl ExternalNodeBuilder {
         let internal_api_config_base: InternalApiConfigBase = (&self.config.local).into();
 
         self.node.add_layer(Web3ServerLayer::http(
+            self.config.local.api.web3_json_rpc.http_host.clone(),
             self.config.local.api.web3_json_rpc.http_port,
             internal_api_config_base,
             optional_config,
@@ -594,6 +595,7 @@ impl ExternalNodeBuilder {
         let internal_api_config_base: InternalApiConfigBase = (&self.config.local).into();
 
         self.node.add_layer(Web3ServerLayer::ws(
+            self.config.local.api.web3_json_rpc.ws_host.clone(),
             self.config.local.api.web3_json_rpc.ws_port,
             internal_api_config_base,
             optional_config,

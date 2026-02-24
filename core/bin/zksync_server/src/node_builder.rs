@@ -479,7 +479,7 @@ impl MainNodeBuilder {
             .as_ref()
             .context("self.configs.api_config")?;
         self.node.add_layer(Web3ServerLayer::http(
-            api.web3_json_rpc.http_host,
+            api.web3_json_rpc.http_host.clone(),
             api.web3_json_rpc.http_port,
             internal_config_base,
             optional_config,
@@ -496,7 +496,7 @@ impl MainNodeBuilder {
             .as_ref()
             .context("self.configs.api_config")?;
         self.node.add_layer(Web3ServerLayer::ws(
-            api.web3_json_rpc.ws_host,
+            api.web3_json_rpc.ws_host.clone(),
             api.web3_json_rpc.ws_port,
             internal_config_base,
             optional_config,

@@ -207,14 +207,17 @@ impl TestServerBuilder {
 
         let mut server_tasks = vec![];
         let (pub_sub, server_builder) = match transport {
-            ApiTransportLabel::Http => (None, ApiBuilder::new(api_config, pool).http(0)),
+            ApiTransportLabel::Http => (
+                None,
+                ApiBuilder::new(api_config, pool).http("0.0.0.0".to_string(), 0),
+            ),
             ApiTransportLabel::Ws => {
                 let mut pub_sub = EthSubscribe::new(POLL_INTERVAL);
                 pub_sub.set_events_sender(pub_sub_events_sender);
                 server_tasks.extend(pub_sub.spawn_notifiers(pool.clone(), &stop_receiver));
 
                 let mut builder = ApiBuilder::new(api_config, pool)
-                    .ws(0)
+                    .ws("0.0.0.0".to_string(), 0)
                     .with_subscriptions_limit(100);
                 if let Some(websocket_requests_per_minute_limit) =
                     websocket_requests_per_minute_limit

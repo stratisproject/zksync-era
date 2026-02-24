@@ -1,7 +1,4 @@
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    time::Duration,
-};
+use std::{net::SocketAddr, time::Duration};
 
 use smart_config::{metadata::TimeUnit, DescribeConfig, DeserializeConfig};
 
