@@ -16,6 +16,9 @@ pub struct ContractVerifierConfig {
     /// Port to which the Prometheus exporter server is listening.
     #[config(default_t = 3_318)]
     pub prometheus_port: u16,
+    /// Host to bind the contract verifier API to.
+    #[config(default_t = "0.0.0.0".to_string())]
+    pub host: String,
     /// Port to bind the contract verifier API to.
     #[config(default_t = 3_070)]
     pub port: u16,
@@ -26,7 +29,7 @@ pub struct ContractVerifierConfig {
 
 impl ContractVerifierConfig {
     pub fn bind_addr(&self) -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), self.port)
+        SocketAddr::new(self.host.parse().unwrap(), self.port)
     }
 }
 
@@ -40,6 +43,7 @@ mod tests {
         ContractVerifierConfig {
             compilation_timeout: Duration::from_secs(30),
             prometheus_port: 3314,
+            host: "0.0.0.0".to_string(),
             port: 3070,
             etherscan_api_url: Some("https://api.etherscan.io/".to_owned()),
         }
@@ -50,6 +54,7 @@ mod tests {
         let env = r#"
             CONTRACT_VERIFIER_COMPILATION_TIMEOUT=30
             CONTRACT_VERIFIER_PROMETHEUS_PORT=3314
+            CONTRACT_VERIFIER_HOST=0.0.0.0
             CONTRACT_VERIFIER_PORT=3070
             CONTRACT_VERIFIER_ETHERSCAN_API_URL="https://api.etherscan.io/"
         "#;
@@ -64,6 +69,7 @@ mod tests {
     #[test]
     fn parsing_from_yaml() {
         let yaml = r#"
+          host: 0.0.0.0
           port: 3070
           compilation_timeout: 30
           prometheus_port: 3314
@@ -77,6 +83,7 @@ mod tests {
     #[test]
     fn parsing_from_idiomatic_yaml() {
         let yaml = r#"
+          host: 0.0.0.0
           port: 3070
           compilation_timeout: 30s
           prometheus_port: 3314

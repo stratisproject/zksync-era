@@ -107,7 +107,10 @@ async fn main() -> anyhow::Result<()> {
     )?);
     let mut tasks = ManagedTasks::new(tasks);
 
-    let bind_address = SocketAddr::from(([0, 0, 0, 0], prover_job_monitor_config.http_port));
+    let bind_address = SocketAddr::new(
+        prover_job_monitor_config.http_host.parse().unwrap(),
+        prover_job_monitor_config.http_port,
+    );
 
     tracing::info!("Starting PJM server on {bind_address}");
 

@@ -581,10 +581,22 @@ impl StorageApiTransaction {
             gas_price: Some(bigdecimal_to_u256(gas_price)),
             gas: bigdecimal_to_u256(self.gas_limit.unwrap_or_else(BigDecimal::zero)),
             input: serde_json::from_value(self.calldata).expect("incorrect calldata in Postgres"),
-            y_parity,
-            v: signature.as_ref().map(|s| U64::from(s.v())),
-            r: signature.as_ref().map(|s| U256::from(s.r())),
-            s: signature.as_ref().map(|s| U256::from(s.s())),
+            y_parity: match y_parity {
+                None => Some(U64::zero()),
+                _ => y_parity,
+            },
+            v: match signature {
+                None => Some(U64::zero()),
+                _ => signature.as_ref().map(|s| U64::from(s.v())),
+            },
+            r: match signature {
+                None => Some(U256::zero()),
+                _ => signature.as_ref().map(|s| U256::from(s.r())),
+            },
+            s: match signature {
+                None => Some(U256::zero()),
+                _ => signature.as_ref().map(|s| U256::from(s.s())),
+            },
             raw: None,
             transaction_type: self.tx_format.map(|format| U64::from(format as u32)),
             access_list: None,

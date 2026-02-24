@@ -19,12 +19,15 @@ db:
 
 api:
   healthcheck:
-    port: 3071
+    port: 127.0.0.1:3071
   merkle_tree:
+    host: 127.0.0.1
     port: 3072
   web3_json_rpc:
+    http_host: 127.0.0.1
     http_port: 3050
     http_url: http://127.0.0.1:3050
+    ws_host: 127.0.0.1
     ws_port: 3051
     ws_url: ws://127.0.0.1:3051
     req_entities_limit: 10000
@@ -76,6 +79,7 @@ operations_manager:
 contract_verifier:
   compilation_timeout: 240
   prometheus_port: 3318
+  host: 127.0.0.1
   port: 3070
 
 circuit_breaker:
@@ -157,6 +161,7 @@ prover_gateway:
   prometheus_listener_port: 3310
   prometheus_pushgateway_url: http://127.0.0.1:9091
   prometheus_push_interval_ms: 100
+  host: 127.0.0.1
   port: 3322
 proof_compressor:
   compression_mode: 5
@@ -183,6 +188,7 @@ prover_job_monitor:
   prover_queue_reporter_run_interval_ms: 10000
   witness_generator_queue_reporter_run_interval_ms: 10000
   witness_job_queuer_run_interval_ms: 10000
+  http_host: 127.0.0.1
   http_port: 3074
 
 base_token_adjuster:

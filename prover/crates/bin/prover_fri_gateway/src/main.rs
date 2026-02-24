@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
 
     let processor = ProofDataManager::new(store_factory.create_store().await?, pool);
 
-    let api = server::Api::new(processor.clone(), port);
+    let api = server::Api::new(processor.clone(), config.host, port);
 
     let tasks = vec![
         tokio::spawn(prometheus_exporter_config.run(stop_receiver.clone())),

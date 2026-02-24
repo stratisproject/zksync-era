@@ -41,7 +41,10 @@ impl ApiConfig {
                 hard_time_limit: None,
                 expose_config: false,
             },
-            merkle_tree: MerkleTreeApiConfig { port: 3053 },
+            merkle_tree: MerkleTreeApiConfig {
+                host: "0.0.0.0".to_string(),
+                port: 3053,
+            },
         }
     }
 }
@@ -283,9 +286,15 @@ pub struct MaxResponseSize {
 #[derive(Debug, Clone, PartialEq, DescribeConfig, DeserializeConfig)]
 #[config(derive(Default))]
 pub struct Web3JsonRpcConfig {
+    /// Host to which the HTTP RPC server is listening.
+    #[config(default_t = "0.0.0.0".to_string())]
+    pub http_host: String,
     /// Port to which the HTTP RPC server is listening.
     #[config(default_t = 3_050)]
     pub http_port: u16,
+    /// Host to which the WebSocket RPC server is listening.
+    #[config(default_t = "0.0.0.0".to_string())]
+    pub ws_host: String,
     /// Port to which the WebSocket RPC server is listening.
     #[config(default_t = 3_051)]
     pub ws_port: u16,
@@ -424,11 +433,11 @@ impl Web3JsonRpcConfig {
     }
 
     pub fn http_bind_addr(&self) -> SocketAddr {
-        SocketAddr::new("0.0.0.0".parse().unwrap(), self.http_port)
+        SocketAddr::new(self.http_host.parse().unwrap(), self.http_port)
     }
 
     pub fn ws_bind_addr(&self) -> SocketAddr {
-        SocketAddr::new("0.0.0.0".parse().unwrap(), self.ws_port)
+        SocketAddr::new(self.ws_host.parse().unwrap(), self.ws_port)
     }
 
     pub fn max_response_body_size(&self) -> MaxResponseSize {
@@ -458,6 +467,8 @@ pub struct HealthCheckConfig {
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct ContractVerificationApiConfig {
+    /// Host to which the REST server is listening.
+    pub host: String,
     /// Port to which the REST server is listening.
     pub port: u16,
     /// URL to access REST server.
@@ -466,13 +477,16 @@ pub struct ContractVerificationApiConfig {
 
 impl ContractVerificationApiConfig {
     pub fn bind_addr(&self) -> SocketAddr {
-        SocketAddr::new("0.0.0.0".parse().unwrap(), self.port)
+        SocketAddr::new(self.host.parse().unwrap(), self.port)
     }
 }
 
 /// Configuration for the Merkle tree API.
 #[derive(Debug, Clone, PartialEq, DescribeConfig, DeserializeConfig)]
 pub struct MerkleTreeApiConfig {
+    /// Host to bind the Merkle tree API server to.
+    #[config(default_t = "0.0.0.0".to_string())]
+    pub host: String,
     /// Port to bind the Merkle tree API server to.
     #[config(default_t = 3_072)]
     pub port: u16,
@@ -510,7 +524,9 @@ mod tests {
     fn expected_config() -> ApiConfig {
         ApiConfig {
             web3_json_rpc: Web3JsonRpcConfig {
+                http_host: "0.0.0.0".to_string(),
                 http_port: 3050,
+                ws_host: "0.0.0.0".to_string(),
                 ws_port: 3051,
                 req_entities_limit: 10000,
                 filters_disabled: false,
@@ -561,15 +577,20 @@ mod tests {
                 hard_time_limit: Some(Duration::from_millis(2_000)),
                 expose_config: true,
             },
-            merkle_tree: MerkleTreeApiConfig { port: 8082 },
+            merkle_tree: MerkleTreeApiConfig {
+                host: "0.0.0.0".to_string(),
+                port: 8082,
+            },
         }
     }
 
     #[test]
     fn parsing_api_config() {
         let env = r#"
+            API_WEB3_JSON_RPC_HTTP_HOST="0.0.0.0"
             API_WEB3_JSON_RPC_HTTP_PORT="3050"
             API_WEB3_JSON_RPC_HTTP_URL="http://127.0.0.1:3050"
+            API_WEB3_JSON_RPC_WS_HOST="0.0.0.0"
             API_WEB3_JSON_RPC_WS_PORT="3051"
             API_WEB3_JSON_RPC_WS_URL="ws://127.0.0.1:3051"
             API_WEB3_JSON_RPC_REQ_ENTITIES_LIMIT=10000
@@ -602,6 +623,7 @@ mod tests {
             API_WEB3_JSON_RPC_MEMPOOL_CACHE_UPDATE_INTERVAL=50
             API_WEB3_JSON_RPC_SEND_RAW_TX_SYNC_MAX_TIMEOUT_MS=10000
             API_WEB3_JSON_RPC_SEND_RAW_TX_SYNC_DEFAULT_TIMEOUT_MS=2000
+            API_CONTRACT_VERIFICATION_HOST="0.0.0.0"
             API_CONTRACT_VERIFICATION_PORT="3070"
             API_CONTRACT_VERIFICATION_URL="http://127.0.0.1:3070"
             API_WEB3_JSON_RPC_TREE_API_URL="http://tree/"
@@ -614,6 +636,7 @@ mod tests {
             API_HEALTHCHECK_SLOW_TIME_LIMIT_MS=250
             API_HEALTHCHECK_HARD_TIME_LIMIT_MS=2000
             API_HEALTHCHECK_EXPOSE_CONFIG=true
+            API_MERKLE_TREE_HOST=0.0.0.0
             API_MERKLE_TREE_PORT=8082
         "#;
         let env = Environment::from_dotenv("test.env", env)
@@ -627,8 +650,10 @@ mod tests {
     fn parsing_from_yaml() {
         let yaml = r#"
           web3_json_rpc:
+            http_host: 0.0.0.0
             http_port: 3050
             http_url: http://127.0.0.1:3050/
+            ws_host: 0.0.0.0
             ws_port: 3051
             ws_url: ws://127.0.0.1:3051/
             req_entities_limit: 10000
@@ -680,6 +705,7 @@ mod tests {
             hard_time_limit_ms: 2000
             expose_config: true
           merkle_tree:
+            host: 0.0.0.0
             port: 8082
         "#;
 
@@ -692,8 +718,10 @@ mod tests {
     fn parsing_from_idiomatic_yaml() {
         let yaml = r#"
           web3_json_rpc:
+            http_host: 0.0.0.0
             http_port: 3050
             http_url: http://127.0.0.1:3050/
+            ws_host: 0.0.0.0
             ws_port: 3051
             ws_url: ws://127.0.0.1:3051/
             req_entities_limit: 10000
@@ -745,6 +773,7 @@ mod tests {
             hard_time_limit: 2s
             expose_config: true
           merkle_tree:
+            host: 0.0.0.0
             port: 8082
         "#;
 

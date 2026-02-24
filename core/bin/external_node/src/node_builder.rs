@@ -376,6 +376,7 @@ impl ExternalNodeBuilder {
         // Add tree API if needed.
         if with_tree_api {
             let merkle_tree_api_config = MerkleTreeApiConfig {
+                host: self.config.local.api.merkle_tree.host.to_owned(),
                 port: self.config.local.api.merkle_tree.port,
             };
             layer = layer.with_tree_api_config(merkle_tree_api_config);
@@ -413,6 +414,7 @@ impl ExternalNodeBuilder {
                 .include_indices_and_filters_in_block_cache,
         };
         let api_config = MerkleTreeApiConfig {
+            host: self.config.local.api.merkle_tree.host.to_owned(),
             port: self.config.local.api.merkle_tree.port,
         };
         self.node

@@ -50,6 +50,9 @@ pub struct ProverJobMonitorConfig {
     /// The interval between runs for Witness Job Queuer.
     #[config(default_t = Duration::from_secs(10))]
     pub witness_job_queuer_run_interval: Duration,
+    /// HTTP host of the ProverJobMonitor to send requests to.
+    #[config(default_t = "0.0.0.0".to_string())]
+    pub http_host: String,
     /// HTTP port of the ProverJobMonitor to send requests to.
     pub http_port: u16,
 }
@@ -76,6 +79,7 @@ mod tests {
             prover_queue_reporter_run_interval: Duration::from_secs(10),
             witness_generator_queue_reporter_run_interval: Duration::from_secs(10),
             witness_job_queuer_run_interval: Duration::from_secs(10),
+            http_host: "0.0.0.0".to_string(),
             http_port: 3074,
         }
     }
@@ -97,6 +101,7 @@ mod tests {
             PROVER_JOB_MONITOR_PROVER_QUEUE_REPORTER_RUN_INTERVAL_MS=10000
             PROVER_JOB_MONITOR_WITNESS_GENERATOR_QUEUE_REPORTER_RUN_INTERVAL_MS=10000
             PROVER_JOB_MONITOR_WITNESS_JOB_QUEUER_RUN_INTERVAL_MS=10000
+            PROVER_JOB_MONITOR_HTTP_HOST=0.0.0.0
             PROVER_JOB_MONITOR_HTTP_PORT=3074
         "#;
         let env = Environment::from_dotenv("test.env", env)
@@ -124,6 +129,7 @@ mod tests {
           prover_queue_reporter_run_interval_ms: 10000
           witness_generator_queue_reporter_run_interval_ms: 10000
           witness_job_queuer_run_interval_ms: 10000
+          http_host: 0.0.0.0
           http_port: 3074
         "#;
         let yaml = Yaml::new("test.yml", serde_yaml::from_str(yaml).unwrap()).unwrap();
@@ -148,6 +154,7 @@ mod tests {
           prover_queue_reporter_run_interval: '10 sec'
           witness_generator_queue_reporter_run_interval: '10s'
           witness_job_queuer_run_interval: '10s'
+          http_host: 0.0.0.0
           http_port: 3074
         "#;
         let yaml = Yaml::new("test.yml", serde_yaml::from_str(yaml).unwrap()).unwrap();

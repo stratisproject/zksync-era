@@ -7,6 +7,8 @@ pub struct FriProverGatewayConfig {
     pub api_url: String,
     #[config(default_t = Duration::from_secs(1000))]
     pub api_poll_duration: Duration,
+    #[config(default_t = "0.0.0.0".to_string())]
+    pub host: String,
     pub port: Option<u16>,
     // Configurations for prometheus
     pub prometheus_listener_port: Option<u16>,
@@ -22,6 +24,7 @@ mod tests {
         FriProverGatewayConfig {
             api_url: "http://private-dns-for-server".to_string(),
             api_poll_duration: Duration::from_secs(100),
+            host: "0.0.0.0".to_string(),
             port: Some(8080),
             prometheus_listener_port: Some(3316),
         }
@@ -32,6 +35,7 @@ mod tests {
         let env = r#"
             FRI_PROVER_GATEWAY_API_URL="http://private-dns-for-server"
             FRI_PROVER_GATEWAY_API_POLL_DURATION_SECS="100"
+            FRI_PROVER_GATEWAY_HOST=0.0.0.0
             FRI_PROVER_GATEWAY_PORT=8080
             FRI_PROVER_GATEWAY_PROMETHEUS_LISTENER_PORT=3316
         "#;
@@ -48,6 +52,7 @@ mod tests {
         let yaml = r#"
           api_url: http://private-dns-for-server
           api_poll_duration_secs: 100
+          host: 0.0.0.0
           port: 8080
           prometheus_listener_port: 3316
         "#;

@@ -69,7 +69,8 @@ impl WiringLayer for TreeApiServerLayer {
 
     async fn wire(self, (): Self::Input) -> Result<Self::Output, WiringError> {
         let tree_reader_task = TreeReaderTask::new(self.config);
-        let bind_addr = (Ipv4Addr::UNSPECIFIED, self.api_config.port).into();
+        let bind_addr =
+            SocketAddr::new(self.api_config.host.parse().unwrap(), self.api_config.port);
         let tree_api_task = TreeApiTask {
             bind_addr,
             tree_reader: tree_reader_task.tree_reader(),

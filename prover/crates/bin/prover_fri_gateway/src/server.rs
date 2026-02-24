@@ -17,11 +17,12 @@ use crate::{error::ProcessorError, proof_data_manager::ProofDataManager};
 
 pub struct Api {
     router: Router,
+    host: String,
     port: u16,
 }
 
 impl Api {
-    pub fn new(processor: ProofDataManager, port: u16) -> Self {
+    pub fn new(processor: ProofDataManager, host: String, port: u16) -> Self {
         let router = Router::new()
             .route("/poll_generated_proofs", post(Api::get_generated_proofs))
             .route(
@@ -32,11 +33,11 @@ impl Api {
             .layer(DefaultBodyLimit::disable())
             .with_state(processor);
 
-        Self { router, port }
+        Self { router, host, port }
     }
 
     pub async fn run(self, mut stop_receiver: watch::Receiver<bool>) -> anyhow::Result<()> {
-        let bind_address = SocketAddr::from(([0, 0, 0, 0], self.port));
+        let bind_address = SocketAddr::new(self.host.parse().unwrap(), self.port);
         tracing::info!("Starting prover gateway API server on {bind_address}");
 
         let listener = tokio::net::TcpListener::bind(bind_address)

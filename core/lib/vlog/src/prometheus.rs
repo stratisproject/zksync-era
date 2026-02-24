@@ -61,7 +61,7 @@ impl PrometheusExporterConfig {
 
         match self.transport {
             PrometheusTransport::Pull { port } => {
-                let prom_bind_address = (Ipv4Addr::UNSPECIFIED, port).into();
+                let prom_bind_address = (Ipv4Addr::LOCALHOST, port).into();
                 metrics_exporter
                     .start(prom_bind_address)
                     .await
