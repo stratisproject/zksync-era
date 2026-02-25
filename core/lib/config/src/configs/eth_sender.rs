@@ -187,7 +187,7 @@ pub struct SenderConfig {
     pub fusaka_upgrade_safety_margin: u64,
     /// Use fusaka blob tx format if  the timestamp has passed. Default is mainnet upgrade.
     /// Use this value if block is not set
-    #[config(default_t = Some(1764798551))]
+    #[config(default)]
     pub fusaka_upgrade_timestamp: Option<u64>,
 }
 
